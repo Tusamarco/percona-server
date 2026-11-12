@@ -1,6 +1,6 @@
 # DWL#2: Plugin infrastructure, configuration and DuckLake storage
 
-Affects: Percona Server 9.7 — Status: Design, under review
+Affects: Percona Server 9.7 — Status: implemented (2a and executor pool), under test; MTR tests in DWL#3 step 3b
 
 ## Description
 
@@ -31,6 +31,8 @@ All are plugin variables of `duckdb`, so the server adds the `duckdb_` prefix.
 | `duckdb_memory_limit` | size | none, mandatory | global | yes |
 | `duckdb_threads` | int | none, mandatory | global | yes |
 | `duckdb_encryption` | BOOL | OFF | global | no (not in the POC: ON fails with "not supported") |
+| `duckdb_executor_threads` | int | 4 (1 to cores; above cores at startup: lowered with a warning) | global | yes |
+| `duckdb_executor_stack_size` | size | 8 MiB (2 to 64 MiB) | global | no |
 
 Variables of later worklogs (`duckdb_history_scope`,
 `duckdb_avoid_purge_gtid_tag`, `duckdb_apply_*`) are declared in this plugin but
@@ -66,7 +68,9 @@ loose-duckdb_threads      = 8
 2. `duckdb_memory_limit` and `duckdb_threads` must be set; if either is missing,
    plugin initialization fails with an error naming the variable and the plugin
    is not loaded. This applies also when `duckdb_enable=FALSE`.
-3. Setting `duckdb_memory_limit` or `duckdb_threads` to 0 at runtime is rejected.
+3. `duckdb_memory_limit` is at least 256 MiB; `duckdb_threads` is between 1 and the
+   number of cores. Values outside these ranges, including 0, are
+   rejected at startup (plugin not loaded) and at runtime (SET fails).
 4. `duckdb_data_path` empty means `<datadir>/duckdb_data`; a relative value is
    resolved against the datadir; an absolute value is used as is.
 5. At startup, missing `duckdb_data/`, `data/` and `tmp/` are created with mode
@@ -157,11 +161,51 @@ A singleton that owns the DuckDB database handle and the attach state, and gives
 out connections. Opened by `Init()` or by `duckdb_enable=TRUE`; closed by
 `Deinit()` or `duckdb_enable=FALSE` after running offloaded statements finish.
 
+### DuckDB executor threads
+
+DuckDB plans and binds statements recursively on the calling thread. On a MySQL
+connection thread (`thread_stack`, 256 KiB on the test server) this overflowed
+the stack during SECONDARY_LOAD. Rule: no DuckDB call runs on a MySQL thread.
+
+- The plugin owns a pool of executor threads (`duckdb_executor_threads`,
+  default 4, 1 to the number of cores, dynamic; a value above the cores at
+  startup is lowered with a warning) with their own stack
+  (`duckdb_executor_stack_size`, default 8 MiB, 2 to 64 MiB, read-only). They are
+  created with `mysql_thread_create()` and registered with the Performance
+  Schema (`thread/duckdb/executor`); no core change.
+- Pool threads have no THD and run only DuckDB C API calls: open, attach,
+  settings, connect, statements, chunk appends, close. MySQL work (InnoDB reads,
+  `my_error`, warnings) stays on the session thread.
+- Tasks are short (one call or a few). A session submits a task and waits; while
+  waiting it checks KILL every 100 ms: a queued task is dropped, a running one
+  is interrupted with `duckdb_interrupt()`. When all threads are busy, tasks wait
+  in a FIFO queue. The pool limits concurrent DuckDB calls, not sessions; inside
+  each call DuckDB parallelizes with its own `duckdb_threads` workers.
+- The load reads InnoDB on the session thread and fills DuckDB data chunks
+  (2048 rows, memory writes only); each full chunk is appended on the pool.
+- The pool starts when the lake opens and stops when it closes
+  (`duckdb_enable=OFF`, shutdown), after running operations finish.
+- Status: `duckdb_executor_threads_busy`, `duckdb_executor_queue_length`,
+  `duckdb_executor_tasks`.
+
+### Stability rules (review of 2026-11-10)
+
+- Every entry point the server calls (handler methods, variable check
+  callbacks, status functions, observers, init, deinit) is guarded: a C++
+  exception becomes an error, never reaches the server. A failed init undoes
+  what it had set up.
+- Executor tasks catch exceptions; the caller sees an error and the executor
+  thread keeps running.
+- Cleanup work (ROLLBACK, destroying an appender) runs through
+  `Lake::Connection::execute_cleanup()`, which a KILL cannot drop or
+  interrupt; otherwise an appender could keep a DuckDB transaction alive.
+
 ### Session connections
 
-A per-THD structure in the handlerton THD slot (`thd_get_ha_data` /
-`thd_set_ha_data`) holds the DuckDB connection, created on first use and closed
-in `hton->close_connection`.
+Each operation of a session (a load, later an offloaded query) opens a
+`Lake::Connection` bound to the session's THD for KILL checks; all its calls run
+on the executor. A per-THD connection cached in the handlerton THD slot is a
+later optimization (DWL#6).
 
 ### duckdb_enable
 
@@ -173,7 +217,9 @@ not the handlerton state (for example `plugin_is_ready()` in
 ### Status variables
 
 Framework for `SHOW STATUS LIKE 'duckdb_%'`; this worklog adds `duckdb_enabled`
-(effective state), `duckdb_lake_path`, `duckdb_memory_used`.
+(effective state), `duckdb_lake_path`, and the executor counters
+`duckdb_executor_threads_busy`, `duckdb_executor_queue_length`,
+`duckdb_executor_tasks`.
 
 ## Low Level Design
 
@@ -243,6 +289,9 @@ code is not added (no core change).
 - Two ICU copies in one process: to test.
 
 ## Test Plan
+
+Manual commands until the MTR suite exists: `manual-test-plan.md`, sections 2,
+3, 4, 10 and 11.
 
 MTR suite `duckdb`:
 

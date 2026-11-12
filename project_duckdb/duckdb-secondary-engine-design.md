@@ -13,7 +13,7 @@ Changes from v0.2:
 - Query offload uses the server's external executor hook; SQL text is generated from the query block; joins are offloaded when all tables are DuckDB tables.
 - A guard plugin in the same library makes FULL scope never fall back to InnoDB.
 - Full list of plugin variables, startup sequence and directory checks.
-- Build integration verified: DuckDB v2.0.0, DuckLake and CRoaring built as C++20 inside one CMake run (ExternalProject), with a smoke test.
+- Build integration verified: DuckDB v2.0.0, DuckLake and CRoaring built inside one CMake run (ExternalProject) with the server's C++ standard (C++23), verified with C++20 and a smoke test.
 - New section: POC scope. The phased plan is updated accordingly.
 
 ## Summary
@@ -82,7 +82,7 @@ The secondary engine is the approach that best matches how DuckDB works and the 
  +---------------------------------------------------------------+
 ```
 
-One DuckDB instance lives inside mysqld, in memory, with one DuckLake attached as `lake`. Each MySQL session that touches DuckDB gets its own DuckDB connection. DuckDB, its extensions, DuckLake and CRoaring are linked statically into the plugin library; DuckDB and DuckLake are MIT licensed, compatible with GPL-2.0 (third-party licenses to be confirmed for the SBOM).
+One DuckDB instance lives inside mysqld, in memory, with one DuckLake attached as `lake`. Each MySQL session that touches DuckDB gets its own DuckDB connection. No DuckDB call runs on a MySQL thread: DuckDB plans statements recursively and overflows the small stack of connection threads, so every DuckDB call runs on a plugin-owned executor pool (`duckdb_executor_threads`, `duckdb_executor_stack_size`) while MySQL work stays on the session thread (DWL#2, DuckDB executor threads). DuckDB, its extensions, DuckLake and CRoaring are linked statically into the plugin library; DuckDB and DuckLake are MIT licensed, compatible with GPL-2.0 (third-party licenses to be confirmed for the SBOM).
 
 The library `ha_duckdb.so` contains two plugins:
 
@@ -143,9 +143,11 @@ All variables are plugin variables of the `duckdb` plugin, so the server adds th
 |---|---|---|---|---|---|
 | `duckdb_enable` | BOOL | TRUE | global | yes | FALSE: the server behaves as if the plugin were not loaded |
 | `duckdb_data_path` | string | empty = `<datadir>/duckdb_data` | global | no | Relative values are resolved against the datadir |
-| `duckdb_memory_limit` | size | none, mandatory | global | yes | Plugin init fails if not set |
-| `duckdb_threads` | int | none, mandatory | global | yes | Plugin init fails if not set; range 1 to number of CPUs |
+| `duckdb_memory_limit` | size | none, mandatory | global | yes | Plugin init fails if not set; minimum 256 MiB |
+| `duckdb_threads` | int | none, mandatory | global | yes | Plugin init fails if not set; range 1 to the number of cores |
 | `duckdb_encryption` | BOOL | OFF | global | no | Fixed when the catalog is created; not in the POC |
+| `duckdb_executor_threads` | int | 4 | global | yes | Threads that run DuckDB calls; 1 to the number of cores; above the cores at startup it is lowered with a warning |
+| `duckdb_executor_stack_size` | size | 8 MiB | global | no | Stack of the executor threads; 2 to 64 MiB |
 | `duckdb_history_scope` | enum LIVE, FULL | LIVE | global, session, SET_VAR hint | yes | Affects only tables with retain_history |
 | `duckdb_avoid_purge_gtid_tag` | string | `duckdb_avoid_purge` | global | yes | GTID tag that marks purge transactions |
 | `duckdb_apply_workers` | int | 1 | global | proposal: no in the POC | Prepare workers of the applier |
@@ -310,7 +312,7 @@ On each READ event the guard:
 The same query must return the same result on both engines. Areas to cover:
 
 - Type mapping: DECIMAL precision and scale, unsigned integers, DATETIME and TIMESTAMP with time zones, BIT, ENUM, SET, JSON.
-- Collations. GROUP BY, DISTINCT, ORDER BY and comparisons on strings must follow the column collation. Under utf8mb4_0900_ai_ci, "José" and "jose" are equal; under the DuckDB default comparison they are not. This is the largest source of silent wrong results.
+- Collations. GROUP BY, DISTINCT, ORDER BY and comparisons on strings must follow the column collation. Under utf8mb4_0900_ai_ci, "José" and "jose" are equal; under the DuckDB default comparison they are not. This is the largest source of silent wrong results. POC rule: every character set and collation is loaded (text stored as UTF-8, binary strings as BLOB), and the offload rejects comparisons, GROUP BY, ORDER BY, DISTINCT and joins on string columns with a non-binary collation (reason `collation`); string operations on `_bin` collations are offloaded. Phase 2 design: for each string column with a non-binary collation we also store a hidden weight-string column computed with the server's own `strnxfrm` at load and apply time; the translator uses the weights for equality, ordering, grouping and DISTINCT, which gives exactly the MySQL semantics of any collation. LIKE and regular expressions cannot use weights and stay rejected under non-binary collations.
 - NULL handling and MySQL implicit type conversions.
 - Function mapping, one function at a time, with an allow list. Anything not on the list causes rejection.
 
@@ -349,8 +351,8 @@ With history retention, DuckDB is no longer a disposable copy: it holds the only
 
 - Backup: Percona XtraBackup must capture `catalog.ducklake`, the Parquet files it references and the applied position consistently with InnoDB. Parquet files are immutable, which simplifies copying.
 - Replicas: a new replica built from a backup needs the DuckDB history too; it cannot be rebuilt from binlogs that have been purged. The avoid-purge tag replicates, so a replica's applier archives the same rows.
-- DDL: ALTER TABLE on the base table can no longer mean unload and reload. We apply the change to the DuckDB table in place, with archived rows taking the column default.
-- Unload: SECONDARY_UNLOAD on a table with history must require an explicit confirmation option, because it destroys data that exists nowhere else.
+- DDL: the server refuses RENAME TABLE and ALTER TABLE on tables with a secondary engine (we do not set `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`). DROP TABLE and `SECONDARY_ENGINE = NULL` keep the history in the lake and mark it stale. SECONDARY_LOAD reattaches a stale copy automatically: archived rows kept, live rows replaced with the current InnoDB rows, new columns added in place (archived rows get NULL); incompatible changes are refused. A rename goes through `SECONDARY_ENGINE = NULL`, RENAME TABLE, and the attribute key `adopt_history_from` (DWL#3).
+- Unload: discarding history (SECONDARY_UNLOAD of a history table, or removing a stale copy) requires `SET SESSION duckdb_unload_history_confirm = ON`, because it destroys data that exists nowhere else. Lake data is never deleted implicitly.
 - Binlog retention: if binlog files are purged before the applier has read them, the copy has a gap. The plugin cannot block binlog purge without core changes, so it detects the gap, marks the affected tables stale and logs an error.
 
 ## Operations
@@ -362,7 +364,7 @@ With history retention, DuckDB is no longer a disposable copy: it holds the only
 
 ## Build and source integration
 
-The whole feature builds in one CMake run together with the server, with the same compiler and C++ standard (C++20). This was verified on 2026-11-05 with GCC 15.3 on Fedora 43: all 480 C++ files of DuckDB, its extensions and DuckLake compiled with `-std=c++20` and no errors, and a statically linked C++20 smoke test passed (Appendix B). Clang is not yet verified.
+The whole feature builds in one CMake run together with the server, with the same compiler and C++ standard as the server (C++23, top-level CMakeLists.txt). DuckDB accepts 17, 20, 23 and 26. The setup was verified with C++20 on 2026-11-05 with GCC 15.3 on Fedora 43: all 480 C++ files of DuckDB, its extensions and DuckLake compiled with `-std=c++20` and no errors, and a statically linked C++20 smoke test passed (Appendix B). On 2026-11-07 the first in-tree build compiled all 480 C++ files with clang++-21 and `-std=c++23`, and the build smoke test passed.
 
 ### Upstream sources (git submodules)
 
@@ -379,16 +381,16 @@ The whole feature builds in one CMake run together with the server, with the sam
 
 ### Files we write (not from upstream)
 
-- `extra/duckdb/extension_config.cmake`: loads the five extensions, DuckLake from our submodule, links them statically, forces C++20 on every target (DuckLake sets `CMAKE_CXX_STANDARD 17` and DuckDB's bundled re2 adds `-std=c++17`; at the end of configuration we set the standard on all targets and drop those flags, without touching upstream files), and keeps DuckDB's `clangd_cache` helper out of the build.
+- `extra/duckdb/extension_config.cmake`: loads the five extensions, DuckLake from our submodule, links them statically, forces the server's C++ standard on every target (DuckLake sets `CMAKE_CXX_STANDARD 17` and DuckDB's bundled re2 adds `-std=c++17`; at the end of configuration we set the standard on all targets and drop those flags, without touching upstream files), and keeps DuckDB's `clangd_cache` helper out of the build.
 - `cmake/duckdb.cmake` and `extra/duckdb/CMakeLists.txt`: two ExternalProjects, `croaring_ext` then `duckdb_ext`, and imported static targets.
 - `storage/duckdb/`: the plugin.
 
 ### ExternalProject wiring
 
-- At configure time nothing is built; at build time the plugin target depends on `duckdb_ext`, which depends on `croaring_ext`, so everything builds in the same `make` or `ninja` run. `BUILD_ALWAYS ON` makes edits in the submodules picked up incrementally.
-- Forwarded from the MySQL build: C and C++ compilers, `CMAKE_CXX_STANDARD=20`, build type (cache variable `DUCKDB_BUILD_TYPE`, default the MySQL build type, overridable because DuckDB debug assertions are slow), sanitizer flags (DuckDB's `ENABLE_SANITIZER` and `ENABLE_UBSAN` follow `WITH_ASAN` and `WITH_UBSAN`; they default to ON upstream), PIC, the compiler launcher (ccache).
+- At configure time nothing is built; at build time the plugin target depends on `duckdb_ext`, which depends on `croaring_ext`, so everything builds in the same `make` or `ninja` run. DuckDB is not rebuilt on every build: it is reconfigured and rebuilt incrementally when a submodule pin moves, when our extension config changes, or when the forwarded CMake arguments change. Hand edits inside the DuckDB sources are not tracked (we do not patch DuckDB); deleting the `duckdb_ext-build` stamp forces a rebuild.
+- Forwarded from the MySQL build: C and C++ compilers, `CMAKE_CXX_STANDARD` of the server (23), build type (cache variable `DUCKDB_BUILD_TYPE`, default the MySQL build type, overridable because DuckDB debug assertions are slow), sanitizer flags (DuckDB's `ENABLE_SANITIZER` and `ENABLE_UBSAN` follow `WITH_ASAN` and `WITH_UBSAN`; they default to ON upstream), PIC, the compiler launcher (ccache).
 - DuckDB options: `BUILD_SHELL=OFF`, `BUILD_UNITTESTS=OFF`, `ENABLE_UNITTEST_CPP_TESTS=OFF`, `BUILD_BENCHMARKS=OFF`, `ENABLE_JEMALLOC=OFF` (no second allocator in mysqld), `ENABLE_EXTENSION_LOAD=OFF`, `ENABLE_BUILTIN_HTTPLIB=OFF`, `DUCKDB_EXTENSION_CONFIGS=<our config>` (the CMake name in DuckDB 2.0; `EXTENSION_CONFIGS` is the Makefile name and is ignored by CMake), `DUCKLAKE_SOURCE_DIR`, `CMAKE_PREFIX_PATH=<croaring install>`.
-- DuckDB warnings stay DuckDB's own: the server's `-Werror` maintainer flags do not apply to DuckDB sources. C++20 gives deprecation warnings in DuckDB headers (for example `std::atomic_load` on `shared_ptr`), warnings only.
+- DuckDB warnings stay DuckDB's own: the server's `-Werror` maintainer flags do not apply to DuckDB sources. C++20 and later give deprecation warnings in DuckDB headers (for example `std::atomic_load` on `shared_ptr`), warnings only.
 - The installed DuckDB CMake package exists only after the build, so we declare imported targets ourselves. Link set verified in the smoke test: `libducklake_extension.a`, `libparquet_extension.a`, `libjson_extension.a`, `libicu_extension.a`, `libcore_functions_extension.a`, `libduckdb_static.a` (contains fmt, re2, zstd, mbedtls, utf8proc and the other bundled libraries), `libroaring.a`, `-ldl`, `-lpthread`. Headers: `duckdb.h`, `duckdb_static_extension.h`. CRoaring installs into `lib64/` on Fedora.
 - The plugin is `MYSQL_ADD_PLUGIN(duckdb ... STORAGE_ENGINE MODULE_ONLY LINK_LIBRARIES ...)`, built with `-fvisibility=hidden` and a version script that exports only the plugin entry points, so DuckDB's bundled libraries do not clash with the server's.
 - The plugin uses the DuckDB C API (`duckdb.h`) only: a small stable header, and DuckDB exceptions never cross into server code.
@@ -438,7 +440,7 @@ Exit criterion: the five features work end to end in MTR, and a reference analyt
 | Phase | Scope | Exit criterion |
 |---|---|---|
 | 1. POC | See POC scope | Features work end to end in MTR; measured speedup on a reference analytical workload versus InnoDB |
-| 2. Correctness | Type and collation mapping, function allow list, rejection and fallback, MTR result comparison, Clang build | Identical results with use_secondary_engine OFF and FORCED across the test suite |
+| 2. Correctness | Type mapping, collation weight-string columns, function allow list, rejection and fallback, MTR result comparison, Clang build | Identical results with use_secondary_engine OFF and FORCED across the test suite |
 | 3. Propagation hardening | Crash tests, binlog gap detection, catch-up after duckdb_enable=FALSE, compaction and snapshot expiry, batch tuning, freshness policy | Copy stays consistent through crash tests; measured apply lag under write load |
 | 4. History retention complete | DROP PARTITION as purge, DUCKDB_HISTORY_READER privilege, in-place DDL, confirmed SECONDARY_UNLOAD, backup integration, encryption | Purged rows remain queryable in FULL scope; LIVE results still identical to InnoDB; backup and restore preserve history |
 | 5. Production readiness | Wider plan translation, resource governance, observability, packaging | Agreed workload runs on a staging environment within lag and memory targets |
@@ -477,7 +479,7 @@ AliSQL integrates DuckDB as a storage engine (ENGINE=DUCKDB) with data stored on
 
 ## Appendix B: Verified standalone build commands
 
-These are the commands of the verification run (scripts in /opt/duckdb_tmp: `build.sh`, `extension_config.cmake`, `smoke/`). Inside the MySQL build the same options are passed by the ExternalProjects, with the MySQL compiler, build type and sanitizer settings instead of the fixed values below, and `<bld>`, `<inst>` under `${CMAKE_BINARY_DIR}/extra/duckdb`.
+These are the commands of the verification run (scripts in /opt/duckdb_tmp: `build.sh`, `extension_config.cmake`, `smoke/`). Inside the MySQL build the same options are passed by the ExternalProjects, with the MySQL compiler, C++ standard (23), build type and sanitizer settings instead of the fixed values below, and `<bld>`, `<inst>` under `${CMAKE_BINARY_DIR}/extra/duckdb`.
 
 Add the submodules:
 

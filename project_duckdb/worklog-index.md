@@ -11,17 +11,23 @@ MySQL WL numbers.
 
 | ID | Title | Status | Depends on |
 |---|---|---|---|
-| [DWL#1](DWL-01-build-integration.md) | Build integration of DuckDB, DuckLake and CRoaring | Design, under review | none |
-| [DWL#2](DWL-02-plugin-infrastructure.md) | Plugin infrastructure, configuration and DuckLake storage | Design, under review | DWL#1 |
-| [DWL#3](DWL-03-secondary-load-unload.md) | Secondary tables: SECONDARY_LOAD and SECONDARY_UNLOAD | Design, under review | DWL#2 |
-| [DWL#4](DWL-04-binlog-applier.md) | Change propagation: binlog applier | Design, under review | DWL#3 |
+| [DWL#1](DWL-01-build-integration.md) | Build integration of DuckDB, DuckLake and CRoaring | Implemented, verified | none |
+| [DWL#2](DWL-02-plugin-infrastructure.md) | Plugin infrastructure, configuration and DuckLake storage | Implemented (2a, executor pool), under test | DWL#1 |
+| [DWL#3](DWL-03-secondary-load-unload.md) | Secondary tables: SECONDARY_LOAD and SECONDARY_UNLOAD | 3a implemented, under test; 3b (reattach, resync, adopt_history_from, structure check, confirmed discard, two-transaction load) implemented, verified on a throwaway instance; MTR postponed | DWL#2 |
+| [DWL#4](DWL-04-binlog-applier.md) | Change propagation: binlog applier | 4a verified; 4b implemented, under test; 4c-1 implemented, under test (gaps and repoint verified); 4c-2 implemented, under test; 4d (DDL refresh, compressed payloads) implemented, verified on a throwaway instance; MTR postponed | DWL#3 |
 | [DWL#5](DWL-05-history-retention.md) | History retention: purge marker and archive marks | Design, under review | DWL#4 |
-| [DWL#6](DWL-06-query-offload.md) | Query offload through the external executor | Design, under review | DWL#3, DWL#5 |
+| [DWL#6](DWL-06-query-offload.md) | Query offload through the external executor | Design, under review | DWL#3, DWL#4, DWL#5 |
 | [DWL#7](DWL-07-full-scope-guard.md) | FULL scope guard plugin | Design, under review | DWL#6 |
 
-Development order follows the table. DWL#6 can start in parallel with DWL#4 and
-DWL#5 for LIVE scope on static data; the history scope predicate is added when
-DWL#5 is done.
+Development order follows the table. DWL#6 must not be enabled before DWL#4:
+without the applier, DML on InnoDB does not reach DuckDB and offloaded queries
+would return stale data. Its translation code can be developed earlier, with
+offload kept off.
+
+How to build, configure and use what is implemented: `HOWTO.md`.
+
+Manual test commands for what is implemented: `manual-test-plan.md` (until the
+MTR suite of step 3b exists).
 
 Outside the POC, to be written later: encryption, DROP PARTITION as purge,
 in-place DDL for history tables, backup integration, compaction and snapshot

@@ -10,3 +10,13 @@
 [submodule "extra/jwt-cpp"]
 	path = extra/jwt-cpp
 	url = https://github.com/Thalhammer/jwt-cpp
+[submodule "extra/duckdb/duckdb"]
+	path = extra/duckdb/duckdb
+	url = ../../duckdb/duckdb.git
+	shallow = true
+[submodule "extra/duckdb/ducklake"]
+	path = extra/duckdb/ducklake
+	url = ../../duckdb/ducklake.git
+[submodule "extra/duckdb/croaring"]
+	path = extra/duckdb/croaring
+	url = ../../RoaringBitmap/CRoaring.git

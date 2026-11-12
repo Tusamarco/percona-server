@@ -49,6 +49,14 @@ scope the predicate is omitted, and fallback is forbidden (DWL#7).
    InnoDB.
 5. In LIVE scope the predicate `__archived_at IS NULL` is added for each
    retain_history table; in FULL scope it is not.
+5a. Collations: comparisons (`=`, `<`, `IN`, `BETWEEN`, `LIKE`), `GROUP BY`,
+   `ORDER BY`, `DISTINCT`, `MIN`/`MAX` and joins on string columns whose
+   collation is not binary (`_bin` or `binary`) reject the offload with the
+   reason `collation`; in LIVE scope the query runs on InnoDB, in FULL scope it
+   fails. String operations on binary collations, and all non-string
+   operations, are offloaded. Results are converted back to the character set
+   of each select-list item. Phase 2 lifts the restriction with weight-string
+   columns (design doc, Semantic equivalence).
 6. INSERT ... SELECT, CREATE ... SELECT, SELECT ... INTO, and subqueries inside
    DML are not offloaded (POC).
 7. A query in a transaction that has already written is not offloaded (LIVE) or
@@ -72,6 +80,8 @@ scope the predicate is omitted, and fallback is forbidden (DWL#7).
 ## Dependent Tasks
 
 - DWL#3: Secondary tables: SECONDARY_LOAD and SECONDARY_UNLOAD.
+- DWL#4: Change propagation (offload on a copy that does not follow DML would
+  return stale data).
 - DWL#5: History retention (scope variable and `__archived_at`).
 
 ## High Level Architecture
@@ -152,7 +162,7 @@ the connection.
 
 Enumerated and counted: `not_loaded`, `unsupported_item:<name>`,
 `unsupported_statement`, `written_in_transaction`, `scope_full_not_allowed`,
-`duckdb_disabled`, `below_cost_threshold`.
+`duckdb_disabled`, `below_cost_threshold`, `collation:<column>`.
 
 ### Type conversion back to MySQL
 
@@ -167,11 +177,17 @@ Enumerated and counted: `not_loaded`, `unsupported_item:<name>`,
 
 ### Open points
 
+- Registry entries and cached tables: from this worklog the server may keep
+  secondary `TABLE` objects cached, holding a pointer to the registry entry's
+  THR_LOCK. `Registry::reload()` must then mark entries absent instead of
+  erasing them (today it erases entries no longer in the lake, which is safe
+  only because no secondary table stays open).
+
 - Value holder Items versus protocol: to verify.
 - Behaviour of `override_executor_func` for UNION and set operations: to verify.
 - Exact list of date functions and their DuckDB equivalents: to define.
-- Collations: string comparison and grouping follow DuckDB in the POC; Phase 2
-  makes them follow MySQL collations or rejects.
+- Collations: the POC rejects collation-dependent operations on non-binary
+  collations (FR 5a); Phase 2 adds weight-string columns for exact semantics.
 
 ## Test Plan
 

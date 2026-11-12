@@ -1,6 +1,6 @@
 # DWL#1: Build integration of DuckDB, DuckLake and CRoaring
 
-Affects: Percona Server 9.7 — Status: Design, under review
+Affects: Percona Server 9.7 — Status: implemented, verified (clang-21, C++23)
 
 ## Description
 
@@ -9,7 +9,7 @@ Affects: Percona Server 9.7 — Status: Design, under review
 We build DuckDB, its extensions, the DuckLake extension and the CRoaring library
 from their upstream sources as part of the normal Percona Server build: one
 `cmake` and one `make` or `ninja` run, with the same compiler and the same C++
-standard (C++20) as the server. The result is a set of static libraries and
+standard as the server (C++23, `CMAKE_CXX_STANDARD` in the top-level CMakeLists.txt). The result is a set of static libraries and
 headers that the plugin (DWL#2) links into `ha_duckdb.so`.
 
 ### UPSTREAM SOURCES
@@ -43,7 +43,10 @@ On 2026-11-05, with GCC 15.3 on Fedora 43, outside the tree (/opt/duckdb_tmp):
 all 480 C++ files compiled with `-std=c++20` and no errors, and a statically
 linked C++20 smoke test attached a DuckLake, appended 100,000 rows through the
 Appender and read them back. Commands and results are in the design document,
-Appendix B.
+Appendix B. The server builds with C++23, which DuckDB accepts (17, 20, 23, 26);
+On 2026-11-07 the first build in the tree (DWL#1 step 1) compiled all 480 C++
+files with `clang++-21 -std=c++23` and the `duckdb_build_smoke` ctest passed
+(`DuckDB v2.0.0: live=50000 full=100000 archived=50000`).
 
 ## Requirements
 
@@ -52,7 +55,7 @@ Appendix B.
 1. DuckDB, DuckLake and CRoaring are built in the same CMake configure and build
    run as the server, as dependencies of the plugin target.
 2. All C++ sources of the three components are compiled with the C++ standard of
-   the server build (C++20), including components that force another standard in
+   the server build (C++23), including components that force another standard in
    their own CMake files (DuckLake, DuckDB's bundled re2).
 3. The components are built with the same C and C++ compilers, build type and
    sanitizer settings as the server. The DuckDB build type can be overridden with
@@ -62,7 +65,10 @@ Appendix B.
 5. The extensions core_functions, parquet, json, icu and ducklake are statically
    linked and available without runtime loading.
 6. Runtime extension loading and the built-in HTTP client are not compiled in.
-7. A change in a submodule source is picked up by the next incremental build.
+7. A change of a submodule pin, of our extension configuration, or of the
+   forwarded build settings is picked up by the next incremental build; when
+   none of them changed, the build does not run DuckDB's build at all. Our own
+   plugin code is rebuilt like any other server target.
 8. The build never accesses the network.
 9. The feature can be disabled at configure time with `-DWITH_DUCKDB=OFF`
    (proposal: default ON on this branch; to be decided).
@@ -144,7 +150,7 @@ so clangd and IDE navigation cover DuckDB sources.
 ### croaring_ext options
 
 `CMAKE_C_COMPILER`, `CMAKE_CXX_COMPILER`, `CMAKE_BUILD_TYPE` (from
-`DUCKDB_BUILD_TYPE`), `CMAKE_CXX_STANDARD=20`, `CMAKE_POSITION_INDEPENDENT_CODE=ON`,
+`DUCKDB_BUILD_TYPE`), `CMAKE_CXX_STANDARD` of the server (23), `CMAKE_POSITION_INDEPENDENT_CODE=ON`,
 `BUILD_SHARED_LIBS=OFF`, `ENABLE_ROARING_TESTS=OFF`, `ROARING_USE_CPM=OFF`,
 `CMAKE_INSTALL_PREFIX=<install>/croaring`, compiler launcher and sanitizer flags
 from the server build.
@@ -153,7 +159,7 @@ from the server build.
 
 | Option | Value | Reason |
 |---|---|---|
-| `CMAKE_CXX_STANDARD` | 20 (from the server build) | Same standard everywhere |
+| `CMAKE_CXX_STANDARD` | server value, 23 | Same standard everywhere |
 | `CMAKE_BUILD_TYPE` | `DUCKDB_BUILD_TYPE` | Default: server build type; DuckDB debug assertions are slow |
 | `CMAKE_POSITION_INDEPENDENT_CODE` | ON | Linked into a shared plugin |
 | `CMAKE_EXPORT_COMPILE_COMMANDS` | ON | IDE support |
@@ -166,7 +172,12 @@ from the server build.
 | `DUCKLAKE_SOURCE_DIR` | `extra/duckdb/ducklake` | Used by our config |
 | `CMAKE_PREFIX_PATH` | CRoaring install directory | DuckLake's `find_package(roaring)` |
 
-`BUILD_ALWAYS ON` so DuckDB's own incremental build runs on every build.
+No `BUILD_ALWAYS`: the configure step of each ExternalProject depends on the
+submodule HEAD file (`.git/modules/extra/duckdb/<sub>/HEAD`, only in a git
+checkout) and, for `duckdb_ext`, on `extension_config.cmake`. To force a rebuild
+after editing DuckDB sources by hand, delete
+`storage/duckdb/duckdb_ext-prefix/src/duckdb_ext-stamp/duckdb_ext-build` in the
+build directory.
 
 ### Link set
 
@@ -179,17 +190,20 @@ Headers: `duckdb.h`, `duckdb_static_extension.h`.
 
 ### Open points
 
-- Clang build not yet verified (Phase 2).
+- Clang 21 with C++23 verified in the tree on 2026-11-07; GCC with C++23 not yet
+  verified in the tree.
 - Two ICU copies (server ICU 77 and DuckDB's icu extension) in one process: to
   test with hidden visibility (DWL#2).
 - `WITH_DUCKDB` default and packaging: to be decided.
 
 ## Test Plan
 
+Manual commands: `manual-test-plan.md`, section 1.
+
 1. Configure and build the server from a clean build directory with GCC; the
    plugin target builds DuckDB, DuckLake and CRoaring first.
 2. Check `compile_commands.json`: every C++ file of the three components has
-   `-std=c++20` and no other `-std` option.
+   `-std=c++23` and no other `-std` option.
 3. Touch a DuckDB source file; an incremental build recompiles it and relinks the
    plugin.
 4. Build with `WITH_ASAN=ON`; DuckDB objects carry `-fsanitize=address`.
