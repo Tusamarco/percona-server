@@ -84,10 +84,14 @@ struct CommitStats {
   unsigned long long deleted{0};
   unsigned long long archived{0};
   unsigned long long inserted{0};
+  /** Rows kept as archived rows (DWL#5): archive marks on existing rows plus
+      archived rows inserted (inserted and purged in the same batch). */
+  unsigned long long archived_rows{0};
 };
 
 /** Creates lake.__mysql.applied_position. */
 const char *applied_position_create_sql();
+
 
 /**
   A DuckLake transaction that may stay open across several writes: one batch

@@ -1,9 +1,11 @@
 # DuckDB secondary engine: manual test plan
 
-Manual checks for what is implemented so far: DWL#1 (build), DWL#2 (plugin,
-lake, variables, executor pool) and DWL#3 step 3a (SECONDARY_LOAD and
-SECONDARY_UNLOAD). They become the MTR suite `duckdb` in step 3b. Update this
-file whenever a step adds behavior.
+Lines marked `-- EXPECTED ERROR` must fail with that error: it is the result
+the test checks, not a problem.
+
+Manual checks for what is implemented so far: DWL#1 to DWL#5 and DWL#6
+steps 6a and 6b (sections 1 to 22). They will become the MTR suite `duckdb`
+(postponed, 2026-11-11). Update this file whenever a step adds behavior.
 
 Reference instance: `/opt/mysql_instances/master96`, schema `windmills_small`,
 test tables `mill1`..`mill10` (see DWL-03, Reference test tables).
@@ -117,9 +119,9 @@ SET GLOBAL duckdb_executor_threads = 6;     -- 6 rows
 SELECT COUNT(*) FROM performance_schema.threads WHERE NAME LIKE 'thread/duckdb/%';
 SET GLOBAL duckdb_executor_threads = 2;     -- 2 rows (idle threads exit)
 SELECT COUNT(*) FROM performance_schema.threads WHERE NAME LIKE 'thread/duckdb/%';
-SET GLOBAL duckdb_executor_threads = 0;     -- ERROR wrong value
-SET GLOBAL duckdb_executor_threads = 999;   -- ERROR wrong value (above cores)
-SET GLOBAL duckdb_executor_stack_size = 16777216;   -- ERROR read-only
+SET GLOBAL duckdb_executor_threads = 0;     -- EXPECTED ERROR: wrong value
+SET GLOBAL duckdb_executor_threads = 999;   -- EXPECTED ERROR: wrong value (above cores)
+SET GLOBAL duckdb_executor_stack_size = 16777216;   -- EXPECTED ERROR: read-only
 SET GLOBAL duckdb_executor_threads = 4;
 ```
 
@@ -127,12 +129,12 @@ SET GLOBAL duckdb_executor_threads = 4;
 
 ```sql
 SET GLOBAL duckdb_memory_limit = 2147483648;        -- ok (2 GiB, applied to DuckDB)
-SET GLOBAL duckdb_memory_limit = 134217728;         -- ERROR (below 256 MiB)
+SET GLOBAL duckdb_memory_limit = 134217728;         -- EXPECTED ERROR: (below 256 MiB)
 SET GLOBAL duckdb_threads = 4;                      -- ok
-SET GLOBAL duckdb_threads = 0;                      -- ERROR
-SET GLOBAL duckdb_threads = 999;                    -- ERROR (above cores)
-SET GLOBAL duckdb_data_path = '/tmp/x';             -- ERROR read-only
-SET GLOBAL duckdb_encryption = ON;                  -- ERROR read-only
+SET GLOBAL duckdb_threads = 0;                      -- EXPECTED ERROR
+SET GLOBAL duckdb_threads = 999;                    -- EXPECTED ERROR: (above cores)
+SET GLOBAL duckdb_data_path = '/tmp/x';             -- EXPECTED ERROR: read-only
+SET GLOBAL duckdb_encryption = ON;                  -- EXPECTED ERROR: read-only
 SET GLOBAL duckdb_memory_limit = 1073741824;
 SET GLOBAL duckdb_threads = 2;
 ```
@@ -147,9 +149,9 @@ ALTER TABLE mill1 SECONDARY_UNLOAD;              -- only if loaded earlier
 SHOW STATUS LIKE 'duckdb_executor_tasks';        -- note the value
 ALTER TABLE mill1 SECONDARY_LOAD;                -- ok
 SHOW STATUS LIKE 'duckdb_executor_tasks';        -- grew by about rows/2048 + a few
-ALTER TABLE mill1 SECONDARY_LOAD;                -- ERROR: already in the lake, run SECONDARY_UNLOAD first
+ALTER TABLE mill1 SECONDARY_LOAD;                -- EXPECTED ERROR: already in the lake, run SECONDARY_UNLOAD first
 ALTER TABLE mill1 SECONDARY_UNLOAD;              -- ok
-ALTER TABLE mill1 SECONDARY_UNLOAD;              -- ERROR: not loaded in secondary engine
+ALTER TABLE mill1 SECONDARY_UNLOAD;              -- EXPECTED ERROR: not loaded in secondary engine
 ALTER TABLE mill1 SECONDARY_LOAD;                -- ok again
 SELECT COUNT(*) FROM mill1;                      -- still InnoDB (no offload yet)
 ```
@@ -165,10 +167,9 @@ find $DATADIR/duckdb_data/data/windmills_small/mill1 -name '*.parquet' | head
 ```sql
 ALTER TABLE mill6 SECONDARY_ENGINE = duckdb, SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
 ALTER TABLE mill6 SECONDARY_LOAD;                -- ok, log says "(retain_history)"
-ALTER TABLE mill6 SECONDARY_LOAD;                -- ERROR: retain_history, loaded only once
-ALTER TABLE mill6 SECONDARY_UNLOAD;              -- ERROR: not supported yet (archived rows)
-RENAME TABLE mill6 TO mill6x;                    -- ERROR: cannot perform DDLs on a table that has a secondary engine
-ALTER TABLE mill6 ADD COLUMN x INT;              -- same ERROR
+ALTER TABLE mill6 SECONDARY_LOAD;                -- since 3b: resync, warning; archived rows kept
+ALTER TABLE mill6 SECONDARY_UNLOAD;              -- EXPECTED ERROR: ... SET SESSION duckdb_unload_history_confirm = ON first
+-- RENAME TABLE and ALTER are allowed since 4d (the copy follows): section 17
 
 -- DROP keeps the history: we test it on a copy, not on mill6
 CREATE TABLE tmp_hist_drop LIKE mill6;               -- copies SECONDARY_ENGINE and attribute
@@ -177,29 +178,29 @@ ALTER TABLE tmp_hist_drop SECONDARY_LOAD;
 DROP TABLE tmp_hist_drop;                            -- ok, WARNING: DuckDB copy kept and marked stale
 SHOW WARNINGS;
 CREATE TABLE tmp_hist_drop LIKE mill6;
-ALTER TABLE tmp_hist_drop SECONDARY_LOAD;            -- ERROR: already in the lake (reattach comes in 3b)
-DROP TABLE tmp_hist_drop;
+ALTER TABLE tmp_hist_drop SECONDARY_LOAD;            -- since 3b: reattached (same structure), archived rows kept
+DROP TABLE tmp_hist_drop;                            -- stale again; discard: section 19 case 7
 ```
 
 ## 7. Preconditions and attributes (DWL#3)
 
 ```sql
 CREATE TABLE t_nopk (a INT) SECONDARY_ENGINE = duckdb;
-ALTER TABLE t_nopk SECONDARY_LOAD;               -- ERROR: requires a primary key
+ALTER TABLE t_nopk SECONDARY_LOAD;               -- EXPECTED ERROR: requires a primary key
 
 CREATE TABLE t_parent (id INT PRIMARY KEY);
 CREATE TABLE t_fk (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES t_parent(id)) SECONDARY_ENGINE = duckdb;
-ALTER TABLE t_fk SECONDARY_LOAD;                 -- ERROR: foreign keys not supported
+ALTER TABLE t_fk SECONDARY_LOAD;                 -- EXPECTED ERROR: foreign keys not supported
 
 CREATE TABLE t_enum (id INT PRIMARY KEY, e ENUM('a','b')) SECONDARY_ENGINE = duckdb;
-ALTER TABLE t_enum SECONDARY_LOAD;               -- ERROR: column e: type not supported
+ALTER TABLE t_enum SECONDARY_LOAD;               -- EXPECTED ERROR: column e: type not supported
 
 CREATE TABLE t_attr (id INT PRIMARY KEY) SECONDARY_ENGINE = duckdb SECONDARY_ENGINE_ATTRIBUTE = '{"retain_hist": true}';
-ALTER TABLE t_attr SECONDARY_LOAD;               -- ERROR: unknown SECONDARY_ENGINE_ATTRIBUTE key 'retain_hist'
+ALTER TABLE t_attr SECONDARY_LOAD;               -- EXPECTED ERROR: unknown SECONDARY_ENGINE_ATTRIBUTE key 'retain_hist'
 
 SET GLOBAL binlog_row_metadata = MINIMAL;
 ALTER TABLE mill2 SECONDARY_ENGINE = duckdb;
-ALTER TABLE mill2 SECONDARY_LOAD;                -- ERROR: requires binlog_row_metadata=FULL
+ALTER TABLE mill2 SECONDARY_LOAD;                -- EXPECTED ERROR: requires binlog_row_metadata=FULL
 SET GLOBAL binlog_row_metadata = FULL;
 ALTER TABLE mill2 SECONDARY_LOAD;                -- ok
 
@@ -224,7 +225,7 @@ ALTER TABLE t_types SECONDARY_LOAD;              -- ok (latin1 converted, binary
 SET SESSION sql_mode = '';
 CREATE TABLE t_zero (id INT PRIMARY KEY, d DATE) SECONDARY_ENGINE = duckdb;
 INSERT INTO t_zero VALUES (1, '0000-00-00');
-ALTER TABLE t_zero SECONDARY_LOAD;               -- ERROR: column d: zero dates cannot be loaded
+ALTER TABLE t_zero SECONDARY_LOAD;               -- EXPECTED ERROR: column d: zero dates cannot be loaded
 SET SESSION sql_mode = DEFAULT;
 DROP TABLE t_zero;
 ALTER TABLE t_types SECONDARY_UNLOAD;
@@ -242,7 +243,7 @@ ALTER TABLE mill1 SECONDARY_LOAD;
 -- session 2, while session 1 runs
 SHOW PROCESSLIST;                    -- find the id
 KILL QUERY <id>;
--- session 1: ERROR ... failed: interrupted
+-- session 1: EXPECTED ERROR ... failed: interrupted
 -- then:
 ALTER TABLE mill1 SECONDARY_LOAD;    -- ok (nothing was left behind)
 ```
@@ -258,7 +259,7 @@ ALTER TABLE mill3 SECONDARY_LOAD;                -- WARNING Unknown storage engi
 SHOW WARNINGS;
 ALTER TABLE mill1 SECONDARY_UNLOAD;              -- no error, lake untouched
 SET GLOBAL duckdb_enable = ON;                   -- log: "DuckDB lake: ... created=no"
-ALTER TABLE mill1 SECONDARY_LOAD;                -- ERROR already in the lake (not removed while OFF)
+ALTER TABLE mill1 SECONDARY_LOAD;                -- EXPECTED ERROR: already in the lake (not removed while OFF)
 ```
 
 `OFF` waits for running operations: start the one-million-row
@@ -332,16 +333,13 @@ Load rules added in 4a:
 SET GLOBAL sync_binlog = 0;
 CREATE TABLE tmp_hist_sync (id INT PRIMARY KEY) SECONDARY_ENGINE = duckdb
   SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
-ALTER TABLE tmp_hist_sync SECONDARY_LOAD;      -- ERROR: retain_history requires sync_binlog=1
+ALTER TABLE tmp_hist_sync SECONDARY_LOAD;      -- EXPECTED ERROR: retain_history requires sync_binlog=1
 ALTER TABLE mill5 SECONDARY_ENGINE = duckdb;
 ALTER TABLE mill5 SECONDARY_LOAD;    -- ok with WARNING about sync_binlog
 SET GLOBAL sync_binlog = 1;
 ALTER TABLE tmp_hist_sync SECONDARY_LOAD;      -- ok
 
-SET GLOBAL binlog_transaction_compression = ON;
-ALTER TABLE mill3 SECONDARY_ENGINE = duckdb;
-ALTER TABLE mill3 SECONDARY_LOAD;    -- ERROR: requires binlog_transaction_compression=OFF
-SET GLOBAL binlog_transaction_compression = OFF;
+-- binlog_transaction_compression=ON is supported since 4d (section 17 case 7)
 ```
 
 A reader error (for example compression turned on after a load) shows in
@@ -462,10 +460,10 @@ SHOW WARNINGS;                          -- the same tables
 SHOW STATUS LIKE 'duckdb_appl%';        -- reader idle, applied_file = first binlog
 
 -- Refusals
-SET GLOBAL duckdb_apply_start_position = 'binlog.999999';   -- not in the index
-SET GLOBAL duckdb_apply_start_position = '<older than applied>';  -- refused: applied twice
+SET GLOBAL duckdb_apply_start_position = 'binlog.999999';   -- EXPECTED ERROR: not in the index
+SET GLOBAL duckdb_apply_start_position = '<older than applied>';  -- EXPECTED ERROR: refused: applied twice
 SET GLOBAL duckdb_enable = OFF;
-SET GLOBAL duckdb_apply_start_position = 'CURRENT';         -- refused: disabled
+SET GLOBAL duckdb_apply_start_position = 'CURRENT';         -- EXPECTED ERROR: refused: disabled
 SET GLOBAL duckdb_enable = ON;
 
 -- FIRST_AVAILABLE: same gap, the reader warns and continues by itself
@@ -650,7 +648,7 @@ INSERT INTO hr VALUES (1,1,'a'),(2,2,'b'),(3,3,'c');
 ALTER TABLE hr SECONDARY_LOAD;
 SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge'; DELETE FROM hr WHERE id = 1; SET gtid_next = 'AUTOMATIC';
 
--- 1. Check only, table without a copy: error "has no history copy to take over"
+-- 1. Check only, table without a copy: EXPECTED ERROR "has no history copy to take over"
 SET SESSION duckdb_history_check_only = ON;
 CREATE TABLE hx (id INT PRIMARY KEY) SECONDARY_ENGINE = duckdb
   SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
@@ -663,7 +661,7 @@ CREATE TABLE hr (id INT PRIMARY KEY, qty INT, note VARCHAR(20))
   SECONDARY_ENGINE = duckdb SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
 INSERT INTO hr VALUES (10,10,'x');
 SET SESSION duckdb_history_check_only = ON;
-ALTER TABLE hr SECONDARY_LOAD;     -- error "structure check passed: ... can reattach"
+ALTER TABLE hr SECONDARY_LOAD;     -- EXPECTED ERROR: "structure check passed: ... can reattach" (check only always ends with an error)
 SET SESSION duckdb_history_check_only = OFF;
 ALTER TABLE hr SECONDARY_LOAD;     -- log "reattached windmills_small.hr in the lake: 1 rows"
 
@@ -671,7 +669,7 @@ ALTER TABLE hr SECONDARY_LOAD;     -- log "reattached windmills_small.hr in the 
 DROP TABLE hr;
 CREATE TABLE hr (id BIGINT, qty INT, extra INT, PRIMARY KEY (id, qty))
   SECONDARY_ENGINE = duckdb SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
-ALTER TABLE hr SECONDARY_LOAD;     -- "the structure does not match ... (4 differences)"
+ALTER TABLE hr SECONDARY_LOAD;     -- EXPECTED ERROR: "the structure does not match ... (4 differences)"
 SHOW WARNINGS;                     -- type of id, extra not in the copy, note missing
                                    -- (1 archived value), primary key (id) vs (id, qty)
 DROP TABLE hr;
@@ -682,7 +680,7 @@ CREATE TABLE hr_new (id INT PRIMARY KEY, qty INT, note VARCHAR(20))
   '{"retain_history": true, "adopt_history_from": "windmills_small.hr"}';
 INSERT INTO hr_new VALUES (20,20,'y');
 ALTER TABLE hr_new SECONDARY_LOAD; -- log "loaded (adopting the history copy windmills_small.hr) ..."
--- from a copy still in use: refused, "rename the table with RENAME TABLE instead"
+-- from a copy still in use: EXPECTED ERROR "rename the table with RENAME TABLE instead"
 
 -- 5. Resync of a loaded history table, right after a purge
 SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge'; DELETE FROM hr_new WHERE id = 20; SET gtid_next = 'AUTOMATIC';
@@ -690,7 +688,7 @@ ALTER TABLE hr_new SECONDARY_LOAD; -- warning (purges in an unread range); log "
                                    -- the purge is kept: it is committed before the swap
 
 -- 6. History unload: refused, then confirmed
-ALTER TABLE hr_new SECONDARY_UNLOAD;   -- "SET SESSION duckdb_unload_history_confirm = ON first"
+ALTER TABLE hr_new SECONDARY_UNLOAD;   -- EXPECTED ERROR: "SET SESSION duckdb_unload_history_confirm = ON first"
 SET SESSION duckdb_unload_history_confirm = ON;
 ALTER TABLE hr_new SECONDARY_UNLOAD;   -- log "unloaded ... with its archived rows"
 
@@ -699,7 +697,7 @@ CREATE TABLE hs (id INT PRIMARY KEY) SECONDARY_ENGINE = duckdb
   SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
 ALTER TABLE hs SECONDARY_LOAD;
 ALTER TABLE hs SECONDARY_ENGINE = NULL;                      -- copy stale, table exists
-SET GLOBAL duckdb_discard_stale_copy = 'windmills_small.hs'; -- refused: the table exists
+SET GLOBAL duckdb_discard_stale_copy = 'windmills_small.hs'; -- EXPECTED ERROR: refused: the table exists
 DROP TABLE hs;
 SET GLOBAL duckdb_discard_stale_copy = 'windmills_small.hs'; -- log "discarded ... with its archived rows"
 SET SESSION duckdb_unload_history_confirm = OFF;
@@ -710,16 +708,225 @@ Concurrency (two sessions): while a large table loads (minutes), change a
 loaded table in session 2 and DROP a loaded history table. The load ends
 without "Transaction conflict"; the change is applied and the copy is stale.
 
+## 20. Purge and history scope, DWL#5
+
+Two scratch history tables. Wait for `duckdb_apply_reader_state = idle` and a
+few seconds (the batch commit) before checking counters.
+
+```sql
+SHOW VARIABLES LIKE 'duckdb_avoid%';                     -- empty: the tag is fixed
+CREATE TABLE at1 (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+CREATE TABLE bt1 LIKE at1;
+INSERT INTO at1 VALUES (1,1),(2,2); INSERT INTO bt1 VALUES (1,1),(2,2);
+ALTER TABLE at1 SECONDARY_LOAD; ALTER TABLE bt1 SECONDARY_LOAD;
+
+-- 1. A purge in session A does not affect session B (two sessions)
+-- session A:
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
+BEGIN; DELETE FROM at1 WHERE id = 1; DO SLEEP(10);
+-- session B, while A waits:
+DELETE FROM bt1 WHERE id = 1;                            -- a real delete
+-- session A:
+COMMIT; SET gtid_next = 'AUTOMATIC';
+SHOW GLOBAL STATUS LIKE 'duckdb_apply_purge_transactions';   -- 1
+SHOW GLOBAL STATUS LIKE 'duckdb_apply_archived_rows';        -- 1
+-- debug log or lake (server stopped): at1 id 1 archived; bt1 id 1 gone
+-- mysqlbinlog: only A's transaction has a GTID with :duckdb_avoid_purge:
+
+-- 2. History scope
+SET SESSION duckdb_history_scope = FULL;                 -- EXPECTED ERROR 1227: DUCKDB_HISTORY_READER
+SELECT /*+ SET_VAR(duckdb_history_scope = FULL) */ 1;    -- warning 1227, hint ignored
+GRANT DUCKDB_HISTORY_READER ON *.* TO CURRENT_USER;
+SET SESSION duckdb_history_scope = FULL;                 -- ok
+SET SESSION duckdb_history_scope = LIVE;
+
+DROP TABLE at1, bt1;                                     -- stale copies kept: discard them (section 19 case 7)
+```
+
+## 21. Query offload, step 6a (DWL#6)
+
+Scratch table `g` (200,000 rows, every result type), the query list
+`duckdb_offload_6a_queries.sql` and the comparison script
+`duckdb_offload_compare.sh` (each query with `use_secondary_engine=OFF` and
+`FORCED`; it stops if the server is lost).
+
+```sql
+-- with FORCED the INSERT ... SELECT below would fail (n has no secondary engine)
+SET SESSION use_secondary_engine = ON;
+CREATE TABLE n (n INT PRIMARY KEY);
+INSERT INTO n WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM s WHERE n < 999) SELECT n FROM s;
+CREATE TABLE g (id INT PRIMARY KEY, grp INT NOT NULL, amount DECIMAL(10,2), d DATE, dt DATETIME,
+  ts TIMESTAMP NULL, s VARCHAR(20) COLLATE utf8mb4_0900_bin, n INT NULL,
+  ci VARCHAR(20) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb;
+INSERT INTO g SELECT a.n*1000+b.n, (a.n*1000+b.n) % 7, ((a.n*1000+b.n) % 1000) / 7,
+  DATE '2024-01-01' + INTERVAL ((a.n*1000+b.n) % 365) DAY,
+  TIMESTAMP '2024-01-01 10:00:00' + INTERVAL ((a.n*1000+b.n) % 1000) MINUTE,
+  TIMESTAMP '2024-06-01 12:00:00' + INTERVAL ((a.n*1000+b.n) % 100) SECOND,
+  CONCAT('s', (a.n*1000+b.n) % 50), IF((a.n*1000+b.n) % 5 = 0, NULL, (a.n*1000+b.n) % 13),
+  CONCAT('Ci', (a.n*1000+b.n) % 3)
+  FROM n a, n b WHERE a.n < 200;
+ALTER TABLE g SECONDARY_LOAD;
+```
+
+```bash
+cd project_duckdb
+MYSQL="mysql -S /opt/mysql_instances/master96/mysql.sock -u dba -p<password> windmills_small" \
+  ./duckdb_offload_compare.sh duckdb_offload_6a_queries.sql
+# expected: every query "same, offloaded"; last line 19/19 identical and offloaded
+```
+
+```sql
+-- 1. Cost threshold: with ON a query is tried in DuckDB only above it
+SET SESSION use_secondary_engine = ON;
+SELECT * FROM g WHERE id = 5;                           -- cheap: InnoDB, counters unchanged
+SELECT ci, COUNT(*) FROM g GROUP BY ci;                 -- below 100000 too: InnoDB, not even refused
+SET SESSION secondary_engine_cost_threshold = 1000;
+SELECT grp, SUM(amount) FROM g GROUP BY grp;            -- queries +1
+
+-- 2. ON falls back to InnoDB for a refused query, without error
+SELECT ci, COUNT(*) FROM g GROUP BY ci;                 -- InnoDB result
+SHOW GLOBAL STATUS LIKE 'duckdb_offload%';              -- refused +1, last_refusal collation:ci ...
+EXPLAIN FORMAT=TREE SELECT grp, SUM(amount) FROM g GROUP BY grp;   -- "in secondary engine DUCKDB"
+SET optimizer_trace = 'enabled=on';
+SELECT grp, SUM(amount) FROM g GROUP BY grp;
+SELECT TRACE FROM information_schema.OPTIMIZER_TRACE\G -- "duckdb_offload": {"sql": "SELECT CAST(..."}
+SET optimizer_trace = 'enabled=off';
+
+-- 3. FORCED refusals
+SET SESSION use_secondary_engine = FORCED;
+SELECT ci, COUNT(*) FROM g GROUP BY ci;                 -- EXPECTED ERROR 3877: ... collation:ci (utf8mb4_0900_ai_ci)
+BEGIN; INSERT INTO g (id, grp) VALUES (900020, 1);
+SELECT COUNT(*) FROM g;                                 -- EXPECTED ERROR 3889: ... multi-statement transaction
+ROLLBACK;
+
+-- 4. Read your own writes (same connection, FORCED)
+SELECT COUNT(*) FROM g WHERE id >= 900000;              -- 0
+INSERT INTO g (id, grp) VALUES (900010, 1);
+SELECT COUNT(*) FROM g WHERE id >= 900000;              -- 1 at once (about 1 s: it waits for
+                                                        -- the applier; OFF does not wait)
+DELETE FROM g WHERE id >= 900000;
+SELECT COUNT(*) FROM g WHERE id >= 900000;              -- 0 at once
+
+-- 5. History scope on a history table (e.g. mill6): LIVE = InnoDB count,
+--    FULL = live + archived (needs DUCKDB_HISTORY_READER)
+SELECT COUNT(*) FROM mill6;                             -- with FORCED: equals InnoDB
+SET SESSION duckdb_history_scope = FULL;
+SELECT COUNT(*) FROM mill6;                             -- adds the archived rows
+SET SESSION duckdb_history_scope = LIVE;
+SET SESSION use_secondary_engine = ON;
+```
+
+## 22. Query offload, step 6b (DWL#6)
+
+Scratch table `p6` (20,000 rows): PAD SPACE strings with trailing spaces, a
+tab and an empty string (`b4` utf8mb4_bin, `b3` utf8mb3_bin), binary
+strings, NULLs in every column, DATE/DATETIME/TIMESTAMP, DECIMAL, DOUBLE,
+UNSIGNED. Query lists `duckdb_offload_6b_queries.sql` (must be identical and
+offloaded) and `duckdb_offload_6b_refusals.sql` (must be refused with a
+reason, and give the InnoDB rows with ON).
+
+`duckdb_offload_setup.sql` drops and re-creates n, g (section 21) and p6
+(this section) in the current database: `mysql ... windmills_small <
+duckdb_offload_setup.sql`.
+
+```sql
+-- with FORCED the INSERT ... SELECT below would fail
+SET SESSION use_secondary_engine = ON;
+DROP TABLE IF EXISTS p6;
+CREATE TABLE p6 (
+  id INT NOT NULL PRIMARY KEY,
+  grp INT NOT NULL,
+  amount DECIMAL(10,2),
+  qty INT,
+  price DOUBLE,
+  u INT UNSIGNED,
+  d DATE,
+  dt DATETIME,
+  ts TIMESTAMP NULL,
+  b4 VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+  b3 VARCHAR(20) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin,
+  raw VARBINARY(20),
+  s VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin,
+  ci VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
+) ENGINE=InnoDB;
+SET SESSION cte_max_recursion_depth = 30000;
+INSERT INTO p6
+WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 20000)
+SELECT i, i % 7,
+  IF(i % 13 = 0, NULL, ((i * 37) % 100000) / 100 - 300),
+  IF(i % 11 = 0, NULL, (i * 7919) % 2001 - 1000),
+  IF(i % 17 = 0, NULL, ((i * 31) % 1000) / 8),
+  (i * 104729) % 4000000000,
+  IF(i % 19 = 0, NULL, DATE '2020-01-01' + INTERVAL (i * 37) % 2000 DAY),
+  IF(i % 23 = 0, NULL, TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (i * 7919) % 100000000 SECOND),
+  IF(i % 29 = 0, NULL, FROM_UNIXTIME(1614556800 + (i * 6007) % 50000000)),
+  ELT(i % 12 + 1, 'a', 'a ', 'a  ', CONCAT('a', CHAR(9)), 'b', 'B', 'é', '', ' ', 'ab', 'a b', NULL),
+  ELT(i % 10 + 1, 'x', 'x ', CONCAT('x', CHAR(9)), 'y', 'Y ', 'ü', '', 'xy', NULL, 'x  '),
+  ELT(i % 5 + 1, 'k', 'k ', 'l', NULL, ''),
+  ELT(i % 6 + 1, 'p', 'q', 'pq', 'P', NULL, ''),
+  ELT(i % 4 + 1, 'm', 'M', 'n', NULL)
+FROM seq;
+ALTER TABLE p6 SECONDARY_ENGINE = duckdb;
+ALTER TABLE p6 SECONDARY_LOAD;
+SELECT COUNT(*), SUM(b4 = 'a') FROM p6;                -- 20000, 5000 ('a', 'a ', 'a  ')
+```
+
+```bash
+cd project_duckdb
+export MYSQL="mysql -S /opt/mysql_instances/master96/mysql.sock -u dba -p<password> windmills_small"
+./duckdb_offload_compare.sh duckdb_offload_6b_queries.sql
+# expected: 45/45 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6b_refusals.sql
+# expected: 14/14 refused as expected, each with its reason, e.g.
+#   Q6 refused (exact_division), ON = InnoDB
+#   Q12 refused (string_number_comparison), ON = InnoDB
+./duckdb_offload_compare.sh duckdb_offload_6a_queries.sql
+# regression: 19/19 identical and offloaded (table g of section 21)
+```
+
+```sql
+-- 1. TIMESTAMP constants follow the session time zone (each pair equal)
+SET SESSION time_zone = '+05:30';
+SET SESSION use_secondary_engine = OFF;
+SELECT COUNT(*), MIN(ts), MAX(ts) FROM p6 WHERE ts >= '2021-06-01 10:00:00' AND ts < '2021-10-31 02:30:00';
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*), MIN(ts), MAX(ts) FROM p6 WHERE ts >= '2021-06-01 10:00:00' AND ts < '2021-10-31 02:30:00';
+SET SESSION time_zone = SYSTEM;                         -- repeat both: other values, still equal
+
+-- 2. PAD SPACE in the generated SQL
+SET optimizer_trace = 'enabled=on';
+SELECT b4, COUNT(*) FROM p6 GROUP BY b4 ORDER BY b4;
+SELECT TRACE FROM information_schema.OPTIMIZER_TRACE\G -- GROUP BY rtrim(t."b4", ' '),
+                                                        -- arg_min(t."b4", t."id"), ORDER BY (rtrim(...) || repeat(' ', N))
+SET optimizer_trace = 'enabled=off';
+SET SESSION use_secondary_engine = ON;
+```
+
+Known difference (not a failure): `SELECT b4, COUNT(DISTINCT b3) FROM p6
+GROUP BY b4` may show `a` on InnoDB and `a ` in DuckDB (equal under
+utf8mb4_bin; MySQL groups by sorting there and does not define which value
+of the group is shown). DWL-06, Lessons from step 6b.
+
 ## Results log
 
 | Date | Build | Sections run | Result | Notes |
 |---|---|---|---|---|
+| 2026-11-13 | clang-21, C++23, debug | 22, step 6b (reference instance) | pass | setup with duckdb_offload_setup.sql; 45/45 identical and offloaded, 14/14 refused as expected, 6a regression 19/19 |
+| 2026-11-12 | clang-21, C++23, debug | 22, step 6b (throwaway instance) | pass after fixes | 45/45 identical and offloaded, 14/14 refused as expected, 6a 19/19; TIMESTAMP ranges and DST-ambiguous IN lists equal under +05:30, -08:00, SYSTEM. Fixed during the test: a server crash on GROUP BY DAYOFWEEK(dt) (holders typed from the select list instead of JOIN::fields, which the metadata used); YEAR() refused (result type YEAR); integer DIV refused as exact division; SUM of DECIMAL refused above 38 digits; MIN/MAX of utf8mb4_bin ties ('' and ' ') picked a different row; LIKE on a binary column failed in DuckDB's binder; b4 = 1 failed at execution instead of being refused. Accepted: representative of a PAD group under sort-based grouping |
 | 2026-11-07 | clang-21, C++23, debug | 1 | pass | smoke test, 480 files C++23 |
 | 2026-11-09 | clang-21, C++23, debug | 5 (`mill1` load) | pass | before the executor pool, with `thread_stack=8M` |
 | 2026-11-10 | clang-21, C++23, debug | 12 (first check) | pass | `UPDATE mill1` of 10 rows: transactions_read 1, row_events_read 1, last_gtid set, position 198 -> 2974 |
 | 2026-11-10 | clang-21, C++23, debug | 12 (rest) | pass | unloaded table and rollback not counted; purge tag read (`<uuid>:duckdb_avoid_purge:1`); rotation followed to the new file after the next commit (FLUSH BINARY LOGS alone does not notify) |
 | 2026-11-10 | clang-21, C++23, debug | 13 + stability fixes | pass | decoder and collapse on mill1/mill6; decoding at the start of a new binlog file after the format-description fix; duckdb_enable OFF/ON |
 | 2026-11-11 | clang-21, C++23, debug | 14 (batching, 2000 updates) | not concluded | about 5 commits/s (HDD fsync), no progress shown and info-level log lines dropped (`log_error_verbosity=2`); stopped by shutdown. Added the test helpers and the verbosity setting; batching step reduced to 250 updates |
+| 2026-11-12 | clang-21, C++23, debug | 19 (reference instance) | pass | through case 7: the discard refused while hs exists (expected error), then done after DROP TABLE |
+| 2026-11-12 | clang-21, C++23, debug | 21, step 6a, behaviour (reference instance) | pass | ON: GROUP BY ci answered by InnoDB (below the default threshold, so not even tried: step order fixed in the plan); EXPLAIN shows DUCKDB with threshold 1000; read your own writes 0-1-0 with FORCED (0.08 s without a pending commit, about 0.9 s right after one: the freshness wait) |
+| 2026-11-12 | clang-21, C++23, debug | 21, step 6a, comparison (reference instance) | pass | 19/19 identical and offloaded. First run invalid: table g missing, both sides failed with the same error and the script counted it as "same" (script fixed: an InnoDB error fails the test, a pass needs the FORCED run to reach DuckDB); setup failed once with use_secondary_engine=FORCED left in the session (setup now sets ON) |
+| 2026-11-12 | clang-21, C++23, debug | 21, step 6a (throwaway instance) | pass after fixes | 19/19 queries offloaded with results identical to InnoDB; ON falls back without error; cost threshold; EXPLAIN shows DUCKDB; trace has the SQL; FORCED refusals; read your own writes 2-3-4-0 in one connection; LIVE 2 / FULL 3 on a history table. Fixed during the test: a DECIMAL result read as text crashed the server (cast fixed, type check added); date literals refused; read your own writes did not wait (THD position reset per statement: transaction observer) |
+| 2026-11-12 | clang-21, C++23, debug | 20 after removing the configurable tag (throwaway instance) | pass | variable gone, old purge_tags table dropped at open; session A's tagged purge open 3 s and session B's untagged delete committed meanwhile: at1 id 1 archived, bt1 id 1 deleted, only A's GTID tagged; counters purge_transactions 1, archived_rows 1 |
+| 2026-11-12 | clang-21, C++23, debug | 20 with a configurable tag (removed the same day) (throwaway instance) | pass | invalid tags refused, NewTag stored as newtag; live change and change while OFF classified by position (lake: archived 1,2,4,5; 3 and 6 deleted; 'third' recorded at the SET position, not at the restart); counters 1 then 3 archived rows; history_scope FULL refused without DUCKDB_HISTORY_READER (hint: warning), allowed after GRANT. Seen: after a restart a SET GLOBAL tag reverts to the configured one (documented: use SET PERSIST) |
+| 2026-11-12 | clang-21, C++23, debug | fixes (throwaway instance) | pass | use_secondary_engine=FORCED: error 213 "query offload is not implemented in this version" instead of an empty result (COUNT(*) was 0); a stale history copy is no longer refreshed when the applier reads the ALTER that sets the engine back before the user's SECONDARY_LOAD (ddl_refreshes 0, then "reattached") |
 | 2026-11-11 | clang-21, C++23, debug | 19 (throwaway instance) | pass after a fix | check only, reattach, mismatch (4 differences), unknown PK, adopt, adopt of a copy in use refused, resync, confirmed unload, discard (not stale / not confirmed / table exists refused, then done), PK backfill by the applier. First reattach failed with a DuckLake conflict: the applier wrote the registry during the load's single transaction. Fixed with the two-transaction load; then a 1M-row load with a change and a DROP of a history table during it passed, a planted build table was dropped at open, and a resync right after a pending purge kept the archived row |
 | 2026-11-11 | clang-21, C++23, debug | 17 case 4b (reference instance, ddl_r) | pass | applier stopped during TRUNCATE + INSERT + RENAME + INSERT; at ON: deferred, renamed to ddl_r2, refreshed with 5 rows; lake: 5 rows, ddl_r2 loaded. The counters read in the same pasted block were still 0: the reader starts about 2 s after ON |
 | 2026-11-11 | clang-21, C++23, debug | 17 (throwaway instance): deferred refresh | pass | applier stopped (duckdb_enable=OFF) during TRUNCATE + RENAME and history RENAME COLUMN + RENAME TABLE: both deferred, renamed, refreshed (lake: 5 rows; 45 live + 5 archived with old values under the new column name); restart with a copy in refresh_pending: changes skipped, refreshed at its RENAME |

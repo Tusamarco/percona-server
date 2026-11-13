@@ -149,7 +149,6 @@ All variables are plugin variables of the `duckdb` plugin, so the server adds th
 | `duckdb_executor_threads` | int | 4 | global | yes | Threads that run DuckDB calls; 1 to the number of cores; above the cores at startup it is lowered with a warning |
 | `duckdb_executor_stack_size` | size | 8 MiB | global | no | Stack of the executor threads; 2 to 64 MiB |
 | `duckdb_history_scope` | enum LIVE, FULL | LIVE | global, session, SET_VAR hint | yes | Affects only tables with retain_history |
-| `duckdb_avoid_purge_gtid_tag` | string | `duckdb_avoid_purge` | global | yes | GTID tag that marks purge transactions |
 | `duckdb_apply_workers` | int | 1 | global | proposal: no in the POC | Prepare workers of the applier |
 | `duckdb_apply_batch_max_trx` | int | to be decided | global | yes | Batch closes at this many source transactions |
 | `duckdb_apply_batch_max_rows` | int | to be decided | global | yes | Batch closes at this many row changes |
@@ -165,7 +164,7 @@ The update callback of a plugin variable runs under `LOCK_global_system_variable
 
 - `duckdb_memory_limit`: lowering it below current usage makes DuckDB evict buffers; if that is not possible the SET fails with the DuckDB message and the old value stays.
 - `duckdb_threads`: applies to the shared DuckDB instance; running queries pick it up at their next task scheduling.
-- `duckdb_avoid_purge_gtid_tag`: validated as a GTID tag (letter or underscore first, then letters, digits, underscores, at most 32 characters), stored in lowercase, empty rejected. Because the applier is asynchronous, a change records the binlog position where it happened: transactions before it are matched against the old tag, transactions after it against the new one, and the switch is logged. The value must be the same on all servers of a replication topology.
+- The purge tag is fixed, `duckdb_avoid_purge` (decided 2026-11-12, DWL#5): a configurable tag lived in two places, the server variable and the purge job's SQL, and any mismatch silently turned purges into deletes.
 
 ### duckdb_enable
 
@@ -269,7 +268,7 @@ Lag is visible through status variables; queries see data up to the last applied
 
 For tables with history retention, the applier distinguishes two kinds of delete:
 
-- Purge delete: a delete in a transaction whose GTID carries the tag named by `duckdb_avoid_purge_gtid_tag` (default `duckdb_avoid_purge`). The row is kept in DuckDB and `__archived_at` is set to the commit time. The tag is written in the same transaction, it replicates to replicas, and setting it requires the server's existing `TRANSACTION_GTID_TAG` privilege, because a mistaken purge keeps data that was meant to disappear. `ALTER TABLE ... DROP PARTITION`, visible in the binlog as a DDL event, is a later addition.
+- Purge delete: a delete in a transaction whose GTID carries the fixed tag `duckdb_avoid_purge`. The tag belongs to that transaction only: `gtid_next` is a session variable. The row is kept in DuckDB and `__archived_at` is set to the commit time. The tag is written in the same transaction, it replicates to replicas, and setting it requires the server's existing `TRANSACTION_GTID_TAG` privilege, because a mistaken purge keeps data that was meant to disappear. `ALTER TABLE ... DROP PARTITION`, visible in the binlog as a DDL event, is a later addition.
 - Business delete: any other delete, including cancellations and legal erasure requests. The live row is removed from DuckDB (`WHERE pk = ? AND __archived_at IS NULL`).
 
 A primary key purged and inserted again gives one archived row and one live row with the same key; the key is unique only among live rows.
@@ -318,7 +317,7 @@ The same query must return the same result on both engines. Areas to cover:
 
 ### Freshness and consistency
 
-Propagation is asynchronous, so a query on DuckDB sees data up to the last applied transaction. In the POC we expose the lag through status variables. Later we need a policy, configurable per session: accept a bounded lag, wait until DuckDB has applied the GTID the session needs (similar to WAIT_FOR_EXECUTED_GTID_SET), or, in LIVE scope only, fall back to InnoDB when the lag is above a threshold.
+Propagation is asynchronous, so a query on DuckDB sees data up to the last applied transaction. In the POC we expose the lag through status variables. Later we need a policy, configurable per session: accept a bounded lag, wait until DuckDB has applied the GTID the session needs (similar to WAIT_FOR_EXECUTED_GTID_SET), or, in LIVE scope only, fall back to InnoDB when the lag is above a threshold. Implemented in the POC (DWL#6): read your own writes, `duckdb_offload_wait_applied` (session, default ON) waits until the applier has applied the connection's last commit, at most 5 s, then the query runs on InnoDB.
 
 ## History retention and query scope
 
@@ -420,7 +419,7 @@ Features:
 
 Also in the POC: build integration (Build and source integration), all variables except encryption, startup sequence and location checks, `duckdb_enable`, status variables for lag and offload.
 
-Out of the POC: encryption, `binlog_encryption`, DROP PARTITION as purge, the separate `orders_history` name, the freshness wait policy, in-place DDL for history tables, XtraBackup integration, compaction scheduling, write-and-read statements under FULL (rejected).
+Out of the POC: encryption, `binlog_encryption`, DROP PARTITION as purge, the separate `orders_history` name, XtraBackup integration, compaction scheduling, write-and-read statements under FULL (rejected). Added to the POC during development: the freshness wait (`duckdb_offload_wait_applied`) and DDL on history tables (refresh with archived rows kept).
 
 No core code changes: everything lives in `storage/duckdb/`, `extra/duckdb/` and `cmake/duckdb.cmake`.
 

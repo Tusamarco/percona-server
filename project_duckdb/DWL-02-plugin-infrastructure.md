@@ -34,9 +34,9 @@ All are plugin variables of `duckdb`, so the server adds the `duckdb_` prefix.
 | `duckdb_executor_threads` | int | 4 (1 to cores; above cores at startup: lowered with a warning) | global | yes |
 | `duckdb_executor_stack_size` | size | 8 MiB (2 to 64 MiB) | global | no |
 
-Variables of later worklogs (`duckdb_history_scope`,
-`duckdb_avoid_purge_gtid_tag`, `duckdb_apply_*`) are declared in this plugin but
-specified in DWL#4, DWL#5.
+Variables of later worklogs (`duckdb_history_scope`, `duckdb_apply_*`) are
+declared in this plugin but specified in DWL#4, DWL#5. (The purge tag is
+fixed, `duckdb_avoid_purge`: no variable.)
 
 ### DUCKLAKE STORAGE
 

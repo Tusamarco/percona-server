@@ -1,6 +1,6 @@
 # DWL#4: Change propagation: binlog applier
 
-Affects: Percona Server 9.7 — Status: 4a verified (2026-11-10); 4b implemented, under test; 4c-1 implemented, under test (2026-11-10); 4c-2 implemented, under test (2026-11-11); 4d implemented, verified on a throwaway instance (2026-11-11); MTR postponed
+Affects: Percona Server 9.7 — Status: 4a verified (2026-11-10); 4b implemented, under test; 4c-1 implemented, under test (2026-11-10); 4c-2 implemented, under test (2026-11-11); 4d implemented, verified on a throwaway instance and on the reference instance (2026-11-11, after the deferred-refresh fix); MTR postponed
 
 Step 4b: `duckdb_row_decoder.*` (packed row images to typed values, no THD,
 links with mysys and strings only), `duckdb_changes.*` (collapse per primary
@@ -447,7 +447,10 @@ log, in order.
    (written to the binary log by the server) are ignored. Column renames are
    taken from `RENAME COLUMN a TO b` and `CHANGE a b`.
 2. A table loaded or refreshed after the statement (load position after it)
-   is skipped. Otherwise the pending batch is committed first, then renames,
+   is skipped. A stale copy is renamed with its table but never refreshed: it
+   comes back only through an explicit SECONDARY_LOAD, which checks the
+   structure (DWL#3 step 3b; fixed 2026-11-12, the ALTER that sets the engine
+   back could otherwise revive it unchecked). Otherwise the pending batch is committed first, then renames,
    then refreshes; the reader waits for each.
 3. Rename (`rename_in_lake()`, under `apply_mutex`): `ALTER TABLE ... RENAME
    TO` in the same schema; across schemas `CREATE TABLE ... AS SELECT` and

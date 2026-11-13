@@ -1,6 +1,6 @@
 # DWL#3: Secondary tables: SECONDARY_LOAD and SECONDARY_UNLOAD
 
-Affects: Percona Server 9.7 — Status: step 3a implemented (under test), step 3b implemented, verified on a throwaway instance (2026-11-11); MTR postponed
+Affects: Percona Server 9.7 — Status: step 3a implemented (under test), step 3b implemented, verified on a throwaway instance (2026-11-11) and on the reference instance (2026-11-12); MTR postponed
 
 ## Description
 

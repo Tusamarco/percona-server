@@ -64,6 +64,9 @@ class FakePartitionHandler : public Partition_handler {
 */
 class ha_duckdb : public handler {
  public:
+  /** Handler error: a query cannot run in this engine yet (no offload). */
+  static constexpr int kErrNoOffload = HA_ERR_LAST + 1;
+
   ha_duckdb(handlerton *hton, TABLE_SHARE *table_share);
 
   Partition_handler *get_partition_handler() override {
@@ -77,8 +80,12 @@ class ha_duckdb : public handler {
   int open(const char *name, int mode, unsigned int test_if_locked,
            const dd::Table *table_def) override;
   int close() override { return 0; }
-  int rnd_init(bool) override { return 0; }
-  int rnd_next(unsigned char *) override { return HA_ERR_END_OF_FILE; }
+  // Query offload is DWL#6. Until then a query forced into this engine
+  // (use_secondary_engine=FORCED) fails with kErrNoOffload instead of
+  // returning an empty result.
+  int rnd_init(bool) override { return kErrNoOffload; }
+  int rnd_next(unsigned char *) override { return kErrNoOffload; }
+  bool get_error_message(int error, String *buf) override;
   int rnd_pos(unsigned char *, unsigned char *) override {
     return HA_ERR_WRONG_COMMAND;
   }

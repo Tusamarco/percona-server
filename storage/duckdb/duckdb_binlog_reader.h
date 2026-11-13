@@ -72,6 +72,8 @@ class BinlogReader {
     unsigned long long ddl_renames{0};
     unsigned long long ddl_failures{0};
     unsigned long long ddl_deferred{0};
+    unsigned long long archived_rows{0};
+    unsigned long long purge_transactions{0};
     BinlogPos applied;
     std::string applied_gtid;
   };
@@ -94,7 +96,8 @@ class BinlogReader {
     true on timeout (60 s) or KILL, with *err.
   */
   bool wait_applied(const BinlogPos &pos, THD *thd, bool *not_running,
-                    std::string *err);
+                    std::string *err, int timeout_seconds = 60);
+
   /**
     Called by the binlog storage observer (after_sync). It runs in the commit
     stage, so it only records the position and wakes the reader.
@@ -254,6 +257,8 @@ class BinlogReader {
   unsigned long long m_ddl_renames{0};
   unsigned long long m_ddl_failures{0};
   unsigned long long m_ddl_deferred{0};
+  unsigned long long m_archived_rows{0};
+  unsigned long long m_purge_transactions{0};
   BinlogPos m_applied;  // last committed (applied) position
   std::string m_applied_gtid;
   // Used only by the reader thread.

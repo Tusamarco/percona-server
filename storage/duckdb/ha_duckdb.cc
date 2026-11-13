@@ -32,6 +32,9 @@
 #include "mysqld_error.h"
 #include "sql/derror.h"
 #include "sql/handler.h"
+#include "mysql/components/my_service.h"
+#include "mysql/components/services/dynamic_privilege.h"
+#include "sql/auth/sql_security_ctx.h"
 #include "sql/sql_class.h"
 #include "sql/sql_error.h"
 #include "sql/table.h"
@@ -43,6 +46,7 @@
 #include "storage/duckdb/duckdb_lake.h"
 #include "storage/duckdb/duckdb_load.h"
 #include "storage/duckdb/duckdb_log.h"
+#include "storage/duckdb/duckdb_offload.h"
 #include "storage/duckdb/duckdb_registry.h"
 #include "storage/duckdb/duckdb_session.h"
 
@@ -69,6 +73,12 @@ unsigned long long srv_apply_batch_max_rows = 100000;
 unsigned long long srv_apply_batch_max_delay_ms = 1000;
 char *srv_apply_start_position = nullptr;
 char *srv_discard_stale_copy = nullptr;
+const char *history_scope_names[] = {"LIVE", "FULL", nullptr};
+TYPELIB history_scope_typelib = {2, "", history_scope_names, nullptr};
+// DWL#5: the dynamic privilege needed for duckdb_history_scope=FULL.
+constexpr char kHistoryReaderPrivilege[] = "DUCKDB_HISTORY_READER";
+SERVICE_TYPE(dynamic_privilege_register) *privilege_service = nullptr;
+bool privilege_registered = false;
 unsigned long srv_apply_gap_action = 0;  // STOP
 
 const char *gap_action_names[] = {"STOP", "FIRST_AVAILABLE", nullptr};
@@ -361,6 +371,47 @@ int check_discard_stale_copy(MYSQL_THD thd, SYS_VAR *var, void *save,
   });
 }
 
+// duckdb_history_scope=FULL (archived rows visible, DWL#5/DWL#6) requires
+// the DUCKDB_HISTORY_READER privilege, at session and global level and in a
+// SET_VAR hint.
+int check_history_scope_impl(MYSQL_THD thd, SYS_VAR *, void *save,
+                             st_mysql_value *value) {
+  long long index = -1;
+  if (value->value_type(value) == MYSQL_VALUE_TYPE_STRING) {
+    char buf[16];
+    int len = sizeof(buf);
+    const char *str = value->val_str(value, buf, &len);
+    if (str != nullptr) {
+      const std::string v(str, len);
+      for (int i = 0; history_scope_names[i] != nullptr; i++)
+        if (strcasecmp(v.c_str(), history_scope_names[i]) == 0) index = i;
+    }
+  } else if (value->val_int(value, &index) != 0) {
+    index = -1;
+  }
+  if (index != 0 && index != 1) {
+    my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "duckdb_history_scope", "?");
+    return 1;
+  }
+  if (index == 1 &&
+      !thd->security_context()
+           ->has_global_grant(STRING_WITH_LEN(kHistoryReaderPrivilege))
+           .first) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
+             kHistoryReaderPrivilege);
+    return 1;
+  }
+  *static_cast<unsigned long *>(save) = static_cast<unsigned long>(index);
+  return 0;
+}
+
+int check_history_scope(MYSQL_THD thd, SYS_VAR *var, void *save,
+                        st_mysql_value *value) {
+  return guarded(1, [&] {
+    return check_history_scope_impl(thd, var, save, value);
+  });
+}
+
 int check_enable(MYSQL_THD thd, SYS_VAR *var, void *save, st_mysql_value *value) {
   return guarded(1, [&] { return check_enable_impl(thd, var, save, value); });
 }
@@ -480,6 +531,21 @@ void update_apply_gap_action(MYSQL_THD, SYS_VAR *, void *var_ptr,
   BinlogReader::instance().set_gap_first_available(v == 1);
 }
 
+MYSQL_THDVAR_ENUM(history_scope,
+                  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
+                  "Which rows of history tables queries see once they run in "
+                  "DuckDB (DWL#6): LIVE (the rows InnoDB has) or FULL (also "
+                  "the archived rows). FULL requires the "
+                  "DUCKDB_HISTORY_READER privilege. Also a SET_VAR hint.",
+                  check_history_scope, nullptr, 0, &history_scope_typelib);
+
+MYSQL_THDVAR_BOOL(offload_wait_applied, PLUGIN_VAR_OPCMDARG,
+                  "Before a query runs in DuckDB, wait until the binlog "
+                  "applier has applied the session's last commit (at most 5 "
+                  "s; otherwise the query runs on InnoDB), so the session "
+                  "reads its own writes.",
+                  nullptr, nullptr, true);
+
 MYSQL_THDVAR_BOOL(history_check_only, PLUGIN_VAR_OPCMDARG,
                   "With ON, ALTER TABLE ... SECONDARY_LOAD of a history table "
                   "only checks that it can take over a history copy "
@@ -537,6 +603,8 @@ SYS_VAR *duckdb_system_variables[] = {MYSQL_SYSVAR(enable),
                                       MYSQL_SYSVAR(history_check_only),
                                       MYSQL_SYSVAR(unload_history_confirm),
                                       MYSQL_SYSVAR(discard_stale_copy),
+                                      MYSQL_SYSVAR(history_scope),
+                                      MYSQL_SYSVAR(offload_wait_applied),
                                       nullptr};
 
 int show_executor_busy(THD *, SHOW_VAR *var, char *buff) {
@@ -634,6 +702,26 @@ int show_ddl_failures(THD *, SHOW_VAR *var, char *buff) {
   return show_number(var, buff, safe_status().ddl_failures);
 }
 
+int show_archived_rows(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, safe_status().archived_rows);
+}
+
+int show_purge_transactions(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, safe_status().purge_transactions);
+}
+
+int show_offloaded(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, offload_status().offloaded);
+}
+
+int show_offload_refused(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, offload_status().refused);
+}
+
+int show_offload_last_refusal(THD *, SHOW_VAR *var, char *buff) {
+  return show_text(var, buff, offload_status().last_refusal);
+}
+
 int show_ddl_deferred(THD *, SHOW_VAR *var, char *buff) {
   return show_number(var, buff, safe_status().ddl_deferred);
 }
@@ -711,6 +799,20 @@ SHOW_VAR duckdb_status_variables[] = {
     {"duckdb_apply_ddl_deferred",
      reinterpret_cast<char *>(&show_ddl_deferred), SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"duckdb_offload_queries", reinterpret_cast<char *>(&show_offloaded),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_offload_refused", reinterpret_cast<char *>(&show_offload_refused),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_offload_last_refusal",
+     reinterpret_cast<char *>(&show_offload_last_refusal), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_apply_archived_rows",
+     reinterpret_cast<char *>(&show_archived_rows), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_apply_purge_transactions",
+     reinterpret_cast<char *>(&show_purge_transactions), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+
     {"duckdb_applied_file", reinterpret_cast<char *>(&show_applied_file),
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_applied_position",
@@ -733,8 +835,6 @@ int duckdb_binlog_func(handlerton *, THD *, enum_binlog_func fn, void *) {
   return 0;
 }
 
-// Step 2a: we never offload. DWL#6 replaces this hook.
-bool never_offload(THD *) { return false; }
 
 handler *create_handler(handlerton *hton, TABLE_SHARE *table_share, bool,
                         MEM_ROOT *mem_root) {
@@ -746,11 +846,28 @@ uint partition_flags() {
          HA_TRUNCATE_PARTITION_PRECLOSE;
 }
 
+// Unregisters DUCKDB_HISTORY_READER and releases the service; safe to call
+// when nothing was acquired.
+void release_privilege() {
+  if (privilege_service == nullptr) return;
+  if (privilege_registered)
+    privilege_service->unregister_privilege(
+        STRING_WITH_LEN(kHistoryReaderPrivilege));
+  privilege_registered = false;
+  if (reg_srv != nullptr)
+    reg_srv->release(reinterpret_cast<my_h_service>(
+        const_cast<SERVICE_TYPE_NO_CONST(dynamic_privilege_register) *>(
+            privilege_service)));
+  privilege_service = nullptr;
+}
+
 int duckdb_init_impl(MYSQL_PLUGIN p) {
   if (init_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs)) return 1;
   Executor::register_psi();
   BinlogReader::register_psi();
   auto fail = [] {
+    release_privilege();
+    unregister_offload_observer(plugin_handle);
     if (observer_registered) {
       unregister_binlog_storage_observer(&storage_observer, plugin_handle);
       observer_registered = false;
@@ -792,6 +909,23 @@ int duckdb_init_impl(MYSQL_PLUGIN p) {
         srv_executor_threads, max_threads());
     srv_executor_threads = max_threads();
   }
+  {
+    my_h_service handle = nullptr;
+    if (reg_srv->acquire("dynamic_privilege_register", &handle) != 0) {
+      DUCKDB_LOG_ERROR(
+          "cannot acquire the dynamic privilege service. Plugin not loaded.");
+      return fail();
+    }
+    privilege_service =
+        reinterpret_cast<SERVICE_TYPE(dynamic_privilege_register) *>(handle);
+    if (privilege_service->register_privilege(
+            STRING_WITH_LEN(kHistoryReaderPrivilege))) {
+      DUCKDB_LOG_ERROR("cannot register the %s privilege. Plugin not loaded.",
+                       kHistoryReaderPrivilege);
+      return fail();
+    }
+    privilege_registered = true;
+  }
   if (srv_encryption) {
     DUCKDB_LOG_ERROR(
         "duckdb_encryption=ON is not supported in this version. Plugin not "
@@ -806,7 +940,8 @@ int duckdb_init_impl(MYSQL_PLUGIN p) {
   // from replication: the binlog applier refreshes the copies (DWL#4 4d).
   hton->flags = HTON_IS_SECONDARY_ENGINE | HTON_SECONDARY_ENGINE_SUPPORTS_DDL;
   hton->db_type = DB_TYPE_UNKNOWN;
-  hton->secondary_engine_pre_prepare_hook = never_offload;
+  // Query offload (DWL#6): hooks and the external executor flag.
+  install_offload_hooks(hton);
   hton->partition_flags = partition_flags;
   hton->binlog_func = duckdb_binlog_func;
 
@@ -819,6 +954,11 @@ int duckdb_init_impl(MYSQL_PLUGIN p) {
     return fail();
   }
   observer_registered = true;
+  if (register_offload_observer(plugin_handle)) {
+    DUCKDB_LOG_ERROR(
+        "cannot register the transaction observer. Plugin not loaded.");
+    return fail();
+  }
   // The reader runs internal statements (refresh after DDL) as this plugin.
   set_session_plugin(plugin_handle);
 
@@ -845,10 +985,12 @@ int duckdb_deinit_impl(MYSQL_PLUGIN) {
     close_engine();
     refresh_status();
   }
+  unregister_offload_observer(plugin_handle);
   if (observer_registered) {
     unregister_binlog_storage_observer(&storage_observer, plugin_handle);
     observer_registered = false;
   }
+  release_privilege();
   deinit_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs);
   return 0;
 }
@@ -861,10 +1003,12 @@ void cleanup_failed_init() {
     close_engine();
   } catch (...) {
   }
+  unregister_offload_observer(plugin_handle);
   if (observer_registered) {
     unregister_binlog_storage_observer(&storage_observer, plugin_handle);
     observer_registered = false;
   }
+  release_privilege();
   if (log_bi != nullptr)
     deinit_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs);
 }
@@ -899,6 +1043,14 @@ bool history_check_only(THD *thd) {
   return thd != nullptr && THDVAR(thd, history_check_only);
 }
 
+bool offload_wait_applied(THD *thd) {
+  return thd != nullptr && THDVAR(thd, offload_wait_applied);
+}
+
+bool history_scope_full(THD *thd) {
+  return thd != nullptr && THDVAR(thd, history_scope) == 1;
+}
+
 bool unload_history_confirmed(THD *thd) {
   return thd != nullptr && THDVAR(thd, unload_history_confirm);
 }
@@ -922,6 +1074,17 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
     thr_lock_data_init(&t->lock, &m_lock, nullptr);
     return 0;
   });
+}
+
+bool ha_duckdb::get_error_message(int error, String *buf) {
+  if (error == kErrNoOffload) {
+    // ER_GET_ERRMSG shows at most 100 characters.
+    const char *msg =
+        "query offload is not implemented in this version: use "
+        "use_secondary_engine=ON or OFF";
+    buf->copy(msg, strlen(msg), system_charset_info);
+  }
+  return false;  // not a temporary error
 }
 
 int ha_duckdb::info(unsigned int flags) {

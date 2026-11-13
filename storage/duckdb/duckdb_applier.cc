@@ -249,9 +249,13 @@ bool apply_table(duckdb_connection c, const BatchTable &bt, bool debug_log,
     if (failed) return true;
   }
 
+  unsigned long long archived_inserts = 0;
+  for (const auto &[key, kc] : bt.changes.changes())
+    archived_inserts += kc.archived_rows.size();
   stats->deleted += deletes;
   stats->archived += archives;
   stats->inserted += inserts;
+  stats->archived_rows += archives + archived_inserts;
   if (debug_log) {
     // Counts inside the transaction, to compare with InnoDB.
     const std::string sql =
@@ -401,6 +405,7 @@ bool OpenTransaction::apply(Lake::Connection &con, const TableBatches &tables,
   m_stats.deleted += local.deleted;
   m_stats.archived += local.archived;
   m_stats.inserted += local.inserted;
+  m_stats.archived_rows += local.archived_rows;
   return false;
 }
 
@@ -418,6 +423,7 @@ bool OpenTransaction::commit(Lake::Connection &con, const BinlogPos &end,
   stats->deleted += m_stats.deleted;
   stats->archived += m_stats.archived;
   stats->inserted += m_stats.inserted;
+  stats->archived_rows += m_stats.archived_rows;
   m_stats = CommitStats();
   m_lock.unlock();
   return false;

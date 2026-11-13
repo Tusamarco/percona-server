@@ -1,11 +1,11 @@
 # DuckDB secondary engine: how-to
 
 How to build, configure and use the DuckDB secondary engine of Percona Server
-9.7 (POC, branch `9.7-duckdb`). It describes the code as it is on 2026-11-12:
-DWL#1 to DWL#4 and DWL#3 step 3b are implemented; **query offload (DWL#6) is
-not**, so queries still run on InnoDB (section 6 explains what that means
-today). Design and details: `duckdb-secondary-engine-design.md` and the
-worklogs `DWL-0*.md`; manual tests: `manual-test-plan.md`.
+9.7 (POC, branch `9.7-duckdb`). It describes the code as it is on 2026-11-13:
+DWL#1 to DWL#5 (with DWL#3 step 3b) are implemented, and **query offload
+(DWL#6) steps 6a and 6b**: single-table queries, with expressions, run in
+DuckDB (section 6). Design and details: `duckdb-secondary-engine-design.md`
+and the worklogs `DWL-0*.md`; manual tests: `manual-test-plan.md`.
 
 Contents:
 
@@ -356,44 +356,108 @@ long as the table has its own copy.
 
 ## 6. SELECT on a table with a DuckDB copy
 
-**Status: query offload is DWL#6 and is not implemented yet.** The engine
-declines every query, so queries run on InnoDB and return InnoDB's result. The
-DuckDB copy is kept current but not read by queries yet.
+**Status: DWL#6 steps 6a and 6b.** A query runs in DuckDB when all of this holds,
+otherwise it runs on InnoDB:
 
-The server variable that controls it (standard MySQL):
+- `use_secondary_engine` is ON (default) or FORCED;
+- with ON, its optimizer cost is above `secondary_engine_cost_threshold`
+  (default 100000; lower it per session to offload smaller queries);
+- it is a SELECT on **one** loaded table (joins, subqueries, UNION: step 6c);
+- it uses only: columns, literals, `= <> < <= > >=`, BETWEEN, IN (list),
+  LIKE (with ESCAPE), IS [NOT] NULL, AND, OR, NOT; `+ - *`, `/` on DOUBLE
+  values, DIV, MOD, ABS, ROUND (not of DOUBLE); CASE, IF, IFNULL, COALESCE,
+  NULLIF; YEAR, MONTH, DAYOFMONTH, DAYOFYEAR, QUARTER, DAYOFWEEK, WEEKDAY,
+  HOUR, MINUTE, SECOND, DATE of DATE and DATETIME columns; COUNT, COUNT
+  (DISTINCT), SUM, AVG (also DISTINCT), MIN, MAX; DISTINCT, GROUP BY, HAVING,
+  ORDER BY, LIMIT, OFFSET;
+- string comparisons, grouping, ordering and MIN/MAX are on binary strings
+  or `utf8mb4_0900_bin`, `utf8mb4_bin`, `utf8mb3_bin` columns (`_ci` and
+  other collations: later, with weight strings); selecting such columns is
+  fine. SELECT DISTINCT of a `utf8mb4_bin`/`utf8mb3_bin` column is refused;
+- not translated, so answered by InnoDB: exact division (`/` of integers or
+  decimals), arithmetic on UNSIGNED columns, TRUNCATE, other functions,
+  date functions on TIMESTAMP columns, comparing a string column with a
+  number;
+- it is not inside a transaction that has written.
 
 ```sql
-SET SESSION use_secondary_engine = ON;      -- default: the optimizer may use the
-                                            -- secondary engine; today: InnoDB
-SET SESSION use_secondary_engine = OFF;     -- never use it: InnoDB
-SELECT /*+ SET_VAR(use_secondary_engine = OFF) */ COUNT(*) FROM orders;
+SET SESSION use_secondary_engine = ON;                  -- default
+SET SESSION secondary_engine_cost_threshold = 1000;     -- offload smaller queries
+SELECT grp, SUM(amount) FROM g GROUP BY grp;            -- runs in DuckDB
+SHOW GLOBAL STATUS LIKE 'duckdb_offload%';              -- queries, refused, last_refusal
+
+SET SESSION use_secondary_engine = FORCED;              -- DuckDB or an error
+SELECT ci, COUNT(*) FROM g GROUP BY ci;
+-- ERROR 3877: the DuckDB secondary engine cannot run this query:
+--   collation:ci (utf8mb4_0900_ai_ci)
+SET SESSION use_secondary_engine = OFF;                 -- always InnoDB
 ```
 
-> **Do not use `use_secondary_engine = FORCED` in this version.** It sends the
-> query to the DuckDB engine, which cannot execute queries yet: it returns an
-> **empty result without an error** (for example `COUNT(*)` = 0). A fix that
-> makes it an error is proposed; until DWL#6 forcing is never correct.
+The result is the same as on InnoDB: types, NULL order, exact SUM and AVG,
+TIMESTAMP in the session time zone, trailing spaces ignored by
+`utf8mb4_bin`. One accepted difference: grouping by a `utf8mb4_bin` column
+shows one value per group, and when MySQL groups by sorting the value shown
+may differ in trailing spaces (`'a'` or `'a '`: MySQL does not define which).
 
-`secondary_engine_cost_threshold` (standard, default 100000) is the optimizer
-cost above which a query is considered for the secondary engine once DWL#6
-exists.
+Read your own writes: with `duckdb_offload_wait_applied = ON` (default), a
+query waits until the applier has applied this connection's last commit (at
+most 5 s, otherwise it runs on InnoDB). With OFF it may not see a commit made
+less than about a second earlier.
+
+### Live data or full history (`duckdb_history_scope`)
+
+`duckdb_history_scope` decides what queries run in DuckDB see in history
+tables: `LIVE` (default, the rows InnoDB has: archived rows are filtered out)
+or `FULL` (also the archived rows). `FULL` requires the
+`DUCKDB_HISTORY_READER` privilege, registered by the plugin; no account has
+it until granted, root included:
+
+```sql
+GRANT DUCKDB_HISTORY_READER ON *.* TO 'analyst'@'%';
+SET SESSION duckdb_history_scope = FULL;
+SELECT /*+ SET_VAR(duckdb_history_scope = FULL) */ ...;   -- per query
+```
+
+Without the privilege `SET` fails with error 1227; the hint gives a warning
+and is ignored.
+
+**Use FULL with `use_secondary_engine = FORCED`.** With ON, a FULL query that
+DuckDB cannot run (or that is below the cost threshold) runs on InnoDB, which
+has only the live rows, without an error. The guard that turns this into an
+error is DWL#7, not implemented yet.
+
+```sql
+SET SESSION use_secondary_engine = FORCED, duckdb_history_scope = FULL;
+SELECT COUNT(*) FROM orders_h;          -- live + archived, or an error
+```
 
 ---
 
 ## 7. Check the plan (EXPLAIN)
 
 ```sql
-EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM orders WHERE id > 10;
--- today, with ON or OFF: an InnoDB plan, e.g.
--- -> Covering index range scan on orders using PRIMARY over (10 < id)
+SET SESSION secondary_engine_cost_threshold = 1000;
+EXPLAIN FORMAT=TREE SELECT grp, SUM(amount) FROM g GROUP BY grp;
+-- -> ... in secondary engine DUCKDB          runs in DuckDB
 
--- a plan sent to the secondary engine (only with FORCED, see the warning above):
--- -> Table scan on orders in secondary engine DUCKDB
+EXPLAIN FORMAT=TREE SELECT ci, COUNT(*) FROM g GROUP BY ci;
+-- an InnoDB plan (no DUCKDB): refused (collation), runs on InnoDB
+-- with FORCED: EXPLAIN fails with the reason (error 3877)
 ```
 
 `in secondary engine DUCKDB` in the plan means the query runs in DuckDB. The
-session counter `SHOW SESSION STATUS LIKE 'Secondary_engine_execution_count'`
-counts the queries sent there.
+plan lines are MySQL's: DuckDB makes its own plan from the generated SQL. The
+generated DuckDB SQL (or the reason for refusing) is in the optimizer trace
+(the SQL in EXPLAIN itself is step 6d):
+
+```sql
+SET optimizer_trace = 'enabled=on';
+SELECT grp, SUM(amount) FROM g GROUP BY grp;
+SELECT TRACE FROM information_schema.OPTIMIZER_TRACE\G   -- "duckdb_offload": {"sql": ...}
+```
+
+The session counter `Secondary_engine_execution_count` also counts the
+queries sent there.
 
 ---
 
@@ -431,6 +495,18 @@ SET gtid_next = 'AUTOMATIC';
   archived, the new one is live.
 - Large purges are fine: transactions larger than `duckdb_apply_batch_max_rows`
   are applied in pieces inside one DuckDB transaction.
+- The tag is always `duckdb_avoid_purge` (fixed, not configurable).
+- The tag affects only the transactions of the session that set it: other
+  connections deleting at the same time are not purges (`gtid_next` is a
+  session variable, and every transaction has its own GTID in the binary
+  log).
+- It stays in effect in that session until `gtid_next` is set back to
+  `AUTOMATIC`: do that right after the purge, or a later business delete in
+  the same session would be archived instead of deleted.
+- A purge that forgets the tag is a plain delete: the rows are removed from
+  DuckDB too.
+
+Counters: `duckdb_apply_purge_transactions` and `duckdb_apply_archived_rows`.
 
 To see it applied (testing): `SET GLOBAL duckdb_apply_debug_log = ON;` and the
 error log shows `... deleted=0 archived=N ...; DuckDB now L live, A archived`.
@@ -470,6 +546,10 @@ Notes:
   marked stale, the error log says why, `duckdb_apply_ddl_failures` grows, and
   the applier goes on with the other tables. Removing `retain_history` by DDL
   is always refused (the archived rows would be lost).
+- A stale copy is detached: DDL never refreshes it (a RENAME still renames
+  it). It comes back only with an explicit SECONDARY_LOAD: a classic table
+  needs SECONDARY_UNLOAD first, a history table is reattached after the
+  structure check.
 - To give a history to a table under a new name when the old table is gone,
   see `adopt_history_from` (section 5).
 
@@ -499,6 +579,13 @@ ALTER TABLE <each named history table> SECONDARY_LOAD;   -- resync, history kept
 SET GLOBAL duckdb_apply_start_position = 'FIRST';        -- restart the applier
 ```
 
+A query that should run in DuckDB but does not: `SHOW GLOBAL STATUS LIKE
+'duckdb_offload_last_refusal'` gives the reason of the last refusal; run it
+with `use_secondary_engine = FORCED` to get the reason as an error, or look
+at the optimizer trace (section 7). Common reasons: `collation:<column>`,
+`unsupported_function:<name>`, `not_single_table`, `not_loaded:<table>`.
+Below `secondary_engine_cost_threshold` it is not even tried (no refusal).
+
 Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 
 ---
@@ -522,9 +609,14 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | `duckdb_apply_gap_action` | global | yes | STOP | STOP, FIRST_AVAILABLE | When binary logs the applier needs were purged and loaded tables miss changes: stop in error state, or warn and continue at the first available binary log. |
 | `duckdb_apply_start_position` | global | yes (command) | `""` | binary log name, FIRST, CURRENT | Setting it restarts the applier at the start of that binary log, which becomes the applied position. Positions before the applied position are refused. Not persisted. |
 | `duckdb_discard_stale_copy` | global | yes (command) | `""` | `'db.table'` | Setting it drops the stale copy of a table that no longer exists. History copies need `duckdb_unload_history_confirm=ON`. Not persisted. |
+| `duckdb_history_scope` | session, global, `SET_VAR` | yes | LIVE | LIVE, FULL | What queries run in DuckDB see in history tables: live rows only, or also archived rows. FULL requires `DUCKDB_HISTORY_READER`; use it with `use_secondary_engine=FORCED` (section 6). |
 | `duckdb_apply_debug_log` | global | yes | OFF | ON, OFF | Testing aid: one error log line per change and per table of each batch, with DuckDB row counts (needs `log_error_verbosity=3`). |
+| `duckdb_offload_wait_applied` | session | yes | ON | ON, OFF | Before a query runs in DuckDB, wait until the applier has applied this connection's last commit (at most 5 s, otherwise InnoDB). |
 | `duckdb_history_check_only` | session | yes | OFF | ON, OFF | SECONDARY_LOAD of a history table only checks that it can take over a history copy (adopt, reattach, resync) and always ends with an error giving the result. |
 | `duckdb_unload_history_confirm` | session | yes | OFF | ON, OFF | Allows SECONDARY_UNLOAD of a history table and `duckdb_discard_stale_copy` of a history copy (archived rows are deleted). |
+
+Privilege registered by the plugin: `DUCKDB_HISTORY_READER` (needed for
+`duckdb_history_scope = FULL`).
 
 Server variables the plugin depends on: `log_bin`, `binlog_format=ROW`,
 `binlog_row_image=FULL`, `binlog_row_metadata=FULL`, `gtid_mode=ON`,
@@ -548,6 +640,8 @@ Server variables the plugin depends on: `log_bin`, `binlog_format=ROW`,
 | `duckdb_apply_last_gtid` | Last transaction read. |
 | `duckdb_apply_batches` / `duckdb_apply_rows_written` | DuckDB commits with changes, rows written. |
 | `duckdb_apply_large_transactions` / `duckdb_apply_pieces` | Transactions applied in pieces, pieces written. |
+| `duckdb_offload_queries` / `duckdb_offload_refused` / `duckdb_offload_last_refusal` | Queries run in DuckDB, queries refused (then run on InnoDB, or an error with FORCED), reason of the last refusal. |
+| `duckdb_apply_purge_transactions` / `duckdb_apply_archived_rows` | Tagged purge transactions on loaded tables; rows kept as archived rows. |
 | `duckdb_apply_ddl_refreshes` / `duckdb_apply_ddl_renames` / `duckdb_apply_ddl_deferred` / `duckdb_apply_ddl_failures` | Copies refreshed or renamed after DDL, refreshes deferred to a later rename, copies marked stale by a DDL. |
 | `duckdb_applied_file` / `duckdb_applied_position` / `duckdb_applied_gtid` | Applied position: what DuckDB contains. |
 
@@ -557,8 +651,14 @@ Counters restart at 0 when the server starts.
 
 ## 12. Limitations of this version
 
-- Queries are not offloaded (DWL#6); `use_secondary_engine = FORCED` returns
-  empty results (section 6).
+- Offload covers single-table queries with the constructs in section 6
+  (DWL#6 steps 6a and 6b); everything else runs on InnoDB. Joins,
+  subqueries and UNION: step 6c. String operations on `_ci` and other
+  non-binary collations: after 6c (weight strings).
+- `duckdb_history_scope = FULL` with `use_secondary_engine = ON` can fall
+  back to InnoDB (live rows only) without an error: use FORCED (DWL#7).
+- KILL QUERY of a long query running in DuckDB is implemented but not yet
+  tested.
 - Not supported: `binlog_encryption=ON`, `duckdb_encryption`, XA transactions
   on loaded tables (the applier stops), partial JSON updates, the types listed
   in section 3.

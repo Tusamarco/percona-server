@@ -52,6 +52,9 @@ const char *const *Registry::migration_sql() {
       // DWL#3 step 3b: primary key, for the structure check of a takeover.
       "ALTER TABLE lake.__mysql.tables ADD COLUMN IF NOT EXISTS "
       "pk_columns VARCHAR",
+      // DWL#5 had a configurable purge tag for one day (2026-11-12); the
+      // tag is fixed now and its history table is not used.
+      "DROP TABLE IF EXISTS lake.__mysql.purge_tags",
       nullptr};
   return statements;
 }

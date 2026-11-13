@@ -17,6 +17,7 @@
 
 #include <strings.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
@@ -39,6 +40,10 @@
 #include "storage/duckdb/duckdb_session.h"
 
 namespace duckdb_se {
+
+// GTID tag of purge transactions on retain_history tables (DWL#5). Fixed: the
+// purge job's SQL is the only place it appears, so nothing can disagree.
+constexpr const char *kAvoidPurgeTag = "duckdb_avoid_purge";
 
 namespace bev = mysql::binlog::event;
 
@@ -69,10 +74,6 @@ struct RowsEventHeader : public bev::Rows_event {
   }
   const std::vector<uint8_t> &rows() const { return row; }
 };
-
-// The tag that marks purge transactions. It becomes the variable
-// duckdb_avoid_purge_gtid_tag in DWL#5.
-constexpr const char *kAvoidPurgeTag = "duckdb_avoid_purge";
 
 // At most this many debug log lines per transaction.
 constexpr unsigned kMaxDebugLines = 100;
@@ -358,11 +359,13 @@ void BinlogReader::binlog_end() {
 }
 
 bool BinlogReader::wait_applied(const BinlogPos &pos, THD *thd,
-                                bool *not_running, std::string *err) {
+                                bool *not_running, std::string *err,
+                                int timeout_seconds) {
   *not_running = false;
-  // At most a minute: the reader commits at once on request, so a longer
-  // wait means it is far behind.
-  const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  // The reader commits at once on request, so a long wait means it is far
+  // behind.
+  const auto limit = std::chrono::steady_clock::now() +
+                     std::chrono::seconds(timeout_seconds);
   std::unique_lock<std::mutex> lk(m_mutex);
   // Done when the applied position reaches pos, or when the reader has read
   // past pos and has nothing pending (only binlog headers after its last
@@ -380,7 +383,8 @@ bool BinlogReader::wait_applied(const BinlogPos &pos, THD *thd,
     if (std::chrono::steady_clock::now() >= limit) {
       *err = "the binlog applier has not reached the load position " +
              pos.file + ":" + std::to_string(pos.pos) +
-             " within 60 s (it is at " + m_applied.file + ":" +
+             " within " + std::to_string(timeout_seconds) +
+             " s (it is at " + m_applied.file + ":" +
              std::to_string(m_applied.pos) + "); try again";
       return true;
     }
@@ -427,6 +431,8 @@ BinlogReader::Status BinlogReader::status() {
   s.ddl_renames = m_ddl_renames;
   s.ddl_failures = m_ddl_failures;
   s.ddl_deferred = m_ddl_deferred;
+  s.archived_rows = m_archived_rows;
+  s.purge_transactions = m_purge_transactions;
   s.applied = m_applied;
   s.applied_gtid = m_applied_gtid;
   return s;
@@ -717,6 +723,8 @@ bool BinlogReader::handle_event(const unsigned char *data, const BinlogPos &at,
       m_trx = Trx();
       m_trx.gtid = tsid.to_string() + ":" + std::to_string(ev.get_gno());
       m_trx.tag = tsid.get_tag().to_string();
+      // A purge transaction (DWL#5) carries the fixed tag; the tag belongs
+      // to this transaction only (gtid_next is a session variable).
       m_trx.purge = m_trx.tag == kAvoidPurgeTag;
       m_trx.commit_time = ev.original_commit_timestamp;
       // 0 would mean "not archived": we never use it as an archive time.
@@ -950,9 +958,18 @@ bool BinlogReader::handle_ddl(const DdlStatement &ddl, const BinlogPos &at,
     return Registry::instance().snapshot(t.db, t.table, &state) &&
            (state.load_position.empty() || state.load_position < at);
   };
+  // A stale copy is detached: a DDL renames it with its table, but never
+  // refreshes it. It comes back only through an explicit SECONDARY_LOAD,
+  // which checks the structure (DWL#3 step 3b).
+  auto to_refresh = [&concerned](const TableName &t) {
+    TableState state;
+    return concerned(t) &&
+           Registry::instance().snapshot(t.db, t.table, &state) &&
+           !state.stale;
+  };
   bool any = false;
   for (const auto &[from, to] : ddl.renames) any = any || concerned(from);
-  for (const TableName &t : ddl.refresh) any = any || concerned(t);
+  for (const TableName &t : ddl.refresh) any = any || to_refresh(t);
   if (!any) return false;
   if (commit_pending(err)) return true;
 
@@ -980,7 +997,7 @@ bool BinlogReader::handle_ddl(const DdlStatement &ddl, const BinlogPos &at,
   for (const TableName &t : ddl.refresh) {
     // After a rename the target name is in the registry, with the old load
     // position: it is refreshed too.
-    if (concerned(t)) refresh_copy(t, ddl.column_renames);
+    if (to_refresh(t)) refresh_copy(t, ddl.column_renames);
   }
   std::lock_guard<std::mutex> lk(m_mutex);
   m_state = "reading";
@@ -1049,8 +1066,8 @@ void BinlogReader::ddl_failed(const TableName &t, const std::string &why) {
                        t.db.c_str(), t.table.c_str(), e.c_str());
   DUCKDB_LOG_ERROR(
       "binlog applier: %s.%s: %s. The DuckDB copy is stale: its changes are "
-      "no longer applied (reload it, or for a history table wait for its "
-      "next refresh)",
+      "no longer applied (classic table: SECONDARY_UNLOAD and SECONDARY_LOAD; "
+      "history table: SECONDARY_LOAD reattaches it)",
       t.db.c_str(), t.table.c_str(), why.c_str());
   std::lock_guard<std::mutex> lk(m_mutex);
   m_ddl_failures++;
@@ -1150,6 +1167,8 @@ bool BinlogReader::commit_large(const BinlogPos &at, std::string *err) {
     m_pieces++;
     m_batches++;
     m_rows_written += written;
+    m_archived_rows += stats.archived_rows;
+    if (m_trx.purge) m_purge_transactions++;
     m_applied = at;
     m_applied_gtid = gtid;
   }
@@ -1192,6 +1211,7 @@ bool BinlogReader::end_transaction(bool commit, const BinlogPos &at,
       m_transactions++;
       m_changes += changes;
       m_last_gtid = m_trx.gtid;
+      if (m_trx.purge) m_purge_transactions++;
     }
     // A table loaded again since its changes in the batch: those changes
     // belong to the old copy, so we commit (and skip) them first.
@@ -1229,6 +1249,7 @@ bool BinlogReader::commit_pending(std::string *err) {
     std::lock_guard<std::mutex> lk(m_mutex);
     if (m_batch.transactions > 0) m_batches++;
     m_rows_written += stats.deleted + stats.archived + stats.inserted;
+    m_archived_rows += stats.archived_rows;
     m_applied = m_batch.end;
     m_applied_gtid = m_batch.last_gtid;
   }

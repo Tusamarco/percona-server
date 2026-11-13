@@ -68,6 +68,8 @@ bool mark_refresh_pending_in_lake(Lake::Connection &con, const std::string &db,
     session (ha_duckdb.cc, DWL#3 step 3b). */
 bool history_check_only(THD *thd);
 bool unload_history_confirmed(THD *thd);
+/** duckdb_history_scope=FULL in this session (DWL#5; read by DWL#6). */
+bool history_scope_full(THD *thd);
 
 /**
   SET GLOBAL duckdb_discard_stale_copy = 'db.table' (DWL#3 step 3b): drops a
