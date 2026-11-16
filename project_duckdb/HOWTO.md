@@ -3,14 +3,15 @@
 How to build, configure and use the DuckDB secondary engine of Percona Server
 9.7 (POC, branch `9.7-duckdb`). It describes the code as it is on 2026-11-13:
 DWL#1 to DWL#5 (with DWL#3 step 3b) are implemented, and **query offload
-(DWL#6) steps 6a and 6b**: single-table queries, with expressions, run in
-DuckDB (section 6). Design and details: `duckdb-secondary-engine-design.md`
+(DWL#6) steps 6a, 6b and 6c**: queries with expressions, joins,
+subqueries, derived tables, views, CTEs and UNION / INTERSECT / EXCEPT run
+in DuckDB (section 6). Design and details: `duckdb-secondary-engine-design.md`
 and the worklogs `DWL-0*.md`; manual tests: `manual-test-plan.md`.
 
 Contents:
 
 1. Build
-2. Server configuration
+2. Server configuration (**on a replica, read "Replicas" first**)
 3. Create tables with a DuckDB copy
 4. Load, unload and drop
 5. Detach and reattach
@@ -58,11 +59,21 @@ cmake --build . --target duckdb duckdb_apply-t -j 8
 | `DUCKDB_BUILD_TYPE` | the server's `CMAKE_BUILD_TYPE` | Build type of DuckDB, DuckLake and CRoaring only. |
 | `WITH_UNIT_TESTS` | server default | Also builds `duckdb_apply-t` (row decoder, collapse, DDL parser). |
 
+### MTR suite
+
+```bash
+cd ../percona-server-9.7-build/mysql-test
+MTR_SHUTDOWN_TIMEOUT=120 ./mtr --suite=/opt/mysql_source/percona-server/storage/duckdb/mysql-test/duckdb --parallel=2
+```
+
+16 tests (about 1.5 hours with a debug build); see
+`storage/duckdb/mysql-test/duckdb/README.md`.
+
 ### Results and checks
 
 ```bash
 ls -l plugin_output_directory/ha_duckdb.so          # the plugin
-./runtime_output_directory/duckdb_apply-t | tail -1  # [  PASSED  ] 38 tests.
+./runtime_output_directory/duckdb_apply-t | tail -1  # [  PASSED  ] 39 tests.
 ctest -R duckdb_build_smoke --output-on-failure      # DuckDB libraries alone
 ```
 
@@ -95,7 +106,9 @@ binlog_row_image          = FULL
 binlog_row_metadata       = FULL
 gtid_mode                 = ON
 enforce_gtid_consistency  = ON
-sync_binlog               = 1        # required for tables with retain_history
+binlog_order_commits      = ON       # required (the default)
+sync_binlog               = 1        # required for tables with retain_history,
+innodb_flush_log_at_trx_commit = 1   # and recommended for all tables: see below
 binlog_encryption         = OFF      # encrypted binary logs are not supported
 # binlog_transaction_compression = ON  is supported
 
@@ -108,12 +121,130 @@ log_error_verbosity        = 3       # the plugin's progress messages are notes
 Use the `loose-` prefix for every `duckdb_*` option: without it the server
 refuses to start when the plugin is not loaded.
 
+**Durability.** The copy follows the binary log, so after an operating
+system crash or power loss it matches InnoDB only if both are durable:
+`sync_binlog=1` (else the copy can keep transactions InnoDB rolled back) and
+`innodb_flush_log_at_trx_commit=1` (else InnoDB can lose transactions the
+copy has). A crash of mysqld alone loses nothing either way. With other
+settings, after an operating system crash, reload classic tables
+(SECONDARY_UNLOAD + SECONDARY_LOAD); history tables require `sync_binlog=1`
+because their archived rows exist only in DuckDB.
+
+DuckDB never shows a transaction before InnoDB does: the applier reads a
+transaction only after its InnoDB commit. With semi-sync replication
+(AFTER_SYNC) that is after the replica's acknowledgement.
+
 `duckdb_memory_limit` and `duckdb_threads` have no default on purpose: if one
 is missing the plugin logs `... is not set ... Plugin not loaded` and the
 server starts without it.
 
-On a **replica** the plugin reads the replica's own binary log: set the same
-options there, plus `log_replica_updates = ON` (the default).
+### Replicas: read this before loading anything on a replica
+
+> [!WARNING]
+> **On a replica, run `SECONDARY_LOAD`, `SECONDARY_UNLOAD`,
+> `ALTER TABLE ... SECONDARY_ENGINE=...` and `GRANT DUCKDB_HISTORY_READER`
+> with `SET sql_log_bin = 0`.** Otherwise each of them creates an **errant
+> GTID** on the replica, which can break a later failover.
+>
+> ```sql
+> -- on the replica
+> SET sql_log_bin = 0;
+> ALTER TABLE orders SECONDARY_LOAD;
+> GRANT DUCKDB_HISTORY_READER ON *.* TO 'analyst'@'%';
+> SET sql_log_bin = 1;
+> ```
+
+**How a replica works with the plugin.** The plugin reads the replica's own
+binary log, so set the same options there as on a source (section 2), plus
+`log_replica_updates = ON` (the default). The source does not need the
+plugin. Create the tables on the source with `SECONDARY_ENGINE = duckdb` (and
+`retain_history` if needed): the server accepts the clause without the
+plugin, and the definition reaches the replica through replication. Then
+load the copy on the replica. Replicated DML, DDL, large transactions, the
+multi-threaded applier, restarts and tagged purges all work (test plan
+section 18).
+
+**Why `sql_log_bin = 0` is needed for loads.** This is server behaviour, not
+a choice of the plugin: MySQL writes `ALTER TABLE ... SECONDARY_LOAD`,
+`SECONDARY_UNLOAD` and `SECONDARY_ENGINE=...` to the binary log so that its
+replicas stay consistent with it (sql/sql_table.cc). On a replica the
+statement is written to the replica's binary log with a GTID that carries the
+replica's own `server_uuid`: a transaction the source never had, an *errant
+GTID*. The plugin cannot suppress it without a change to the server. Its own
+internal statements (the refresh after DDL) already run with
+`sql_log_bin = 0`.
+
+**Why the GRANT is needed on every replica.** `DUCKDB_HISTORY_READER` is a
+privilege registered by the plugin. A source without the plugin does not
+know it and refuses the GRANT, so it cannot arrive through replication. It
+must be granted on each replica that serves `duckdb_history_scope=FULL`
+queries, and for the same reason as above with `sql_log_bin = 0`. The
+accounts themselves can still be created on the source.
+
+**What an errant GTID breaks.** Nothing at first: replication continues.
+The problem comes when the topology changes. If this replica is promoted or
+another replica is pointed to it, the other servers ask for the errant
+transaction: it is replayed there (a `SECONDARY_LOAD` or a GRANT of an
+unknown privilege fails on a server without the plugin and stops
+replication), or, if its binary log has been purged, replication fails with
+error 1236 (the source has purged binary logs containing GTIDs the replica
+requires). Failover tools (Orchestrator and others) report errant GTIDs and
+may refuse to promote the replica.
+
+**Check and repair.** Compare the replica with the source:
+
+```sql
+-- on the replica: should be empty
+SELECT GTID_SUBTRACT(@@gtid_executed, '<gtid_executed of the source>');
+```
+
+If it is not empty, commit an empty transaction with each errant GTID on the
+source, which then replicates to all servers:
+
+```sql
+-- on the source, for each errant GTID
+SET gtid_next = '<replica server_uuid>:<n>';
+BEGIN; COMMIT;
+SET gtid_next = 'AUTOMATIC';
+```
+
+**Replicas with `super_read_only = ON`** (recommended, it prevents local
+writes and so errant GTIDs): `SECONDARY_LOAD`, `SECONDARY_UNLOAD` and the
+GRANT are refused with error 1290, even with `sql_log_bin = 0` (verified).
+Switch it off only for the operation:
+
+```sql
+SET GLOBAL super_read_only = OFF;
+SET sql_log_bin = 0;
+ALTER TABLE orders SECONDARY_LOAD;
+SET sql_log_bin = 1;
+SET GLOBAL super_read_only = ON;
+```
+
+The plugin itself is not blocked by `super_read_only`: the applier writes
+only to DuckDB, and its refresh after a replicated DDL (an internal
+`ALTER TABLE ... SECONDARY_LOAD`, run with `sql_log_bin = 0`) passes the
+read-only check as the replication applier does. Only your own statements
+need the sequence above.
+
+> [!IMPORTANT]
+> **The refresh after DDL under `super_read_only` needs the `duckdb_guard`
+> plugin active** (it is loaded with the engine, on by default). The server
+> clears the read-only exemption at the start of every statement; the guard
+> sets it again for the plugin's internal session only, at the pre-parse
+> event. With `--duckdb-guard=OFF` on a replica with `super_read_only = ON`,
+> every replicated DDL on a loaded table fails to refresh its copy: the copy
+> becomes **stale** (error log: `refresh after DDL failed ...
+> super-read-only`). A stale classic copy is recovered with
+> `SECONDARY_UNLOAD` + `SECONDARY_LOAD`; a stale **history** copy can be
+> reattached only while the table still has the copy's structure, which a
+> DDL usually changed: its archived rows are then lost. Keep the guard on.
+>
+> Side effect: the internal session is audited like any connection, so an
+> audit plugin (e.g. `audit_log`) records the plugin's internal
+> `ALTER TABLE ... SECONDARY_LOAD` statements.
+
+Not tested: a source with the plugin and copies loaded on both servers.
 
 ### Check that it runs
 
@@ -128,6 +259,17 @@ SHOW GLOBAL STATUS LIKE 'duckdb_apply_reader_state';  -- idle
 
 The error log shows `DuckDB lake: catalog=..., data=..., created=yes|no` and
 `binlog reader started at ...`.
+
+### Move the lake (duckdb_data_path)
+
+DuckLake stores the data path in its catalog. After moving or restoring the
+lake directory elsewhere, set `duckdb_data_path` to the new place and start
+the server: with `duckdb_lake_relocate = ON` (default) the plugin checks that
+every file of the catalog is there, stores the new path and logs
+`DuckDB lake moved: the catalog's data path ... is now ...`. If a file is
+missing (or with OFF) the plugin is not loaded and the error log says why.
+The binary log index lists absolute paths too: when moving a whole
+instance, fix `my.cnf` and the `*.index` files.
 
 ### Turn it off and on at runtime
 
@@ -149,7 +291,13 @@ Requirements for a table:
   BLOB types, DATE, DATETIME, TIMESTAMP. Other types (JSON, ENUM, SET, BIT,
   TIME, YEAR, spatial, VECTOR) make the load fail, naming the column;
 - no zero dates or zero timestamps in the data;
-- columns marked `NOT SECONDARY` are not copied.
+- columns marked `NOT SECONDARY` are not copied;
+- string columns whose collation DuckDB cannot compare natively (`_ci`,
+  `_as_cs`, `general_ci`, latin1 and other non-UTF-8 collations) get a
+  hidden weight column in the copy (MySQL's sort weight of each value), so
+  queries in DuckDB follow the MySQL collation. Copies loaded before
+  2026-11-14 have none: SECONDARY_UNLOAD + SECONDARY_LOAD a classic table,
+  SECONDARY_LOAD (resync) a history table.
 
 ### Without history (classic copy)
 
@@ -204,6 +352,11 @@ Any other key is an error at load time.
 ```sql
 ALTER TABLE orders SECONDARY_LOAD;
 ```
+
+> [!WARNING]
+> **On a replica: `SET sql_log_bin = 0` first** (and `super_read_only = OFF`
+> for the operation if it is set), or the load creates an errant GTID. The
+> same for `SECONDARY_UNLOAD`. Why: section 2, "Replicas".
 
 The load copies the current InnoDB rows into the lake in one operation and
 records the binary log position; from then on the applier applies every change
@@ -356,26 +509,51 @@ long as the table has its own copy.
 
 ## 6. SELECT on a table with a DuckDB copy
 
-**Status: DWL#6 steps 6a and 6b.** A query runs in DuckDB when all of this holds,
+**Status: DWL#6 steps 6a, 6b and 6c (6c-1, 6c-2, 6c-3).** A query runs in DuckDB when all of this holds,
 otherwise it runs on InnoDB:
 
 - `use_secondary_engine` is ON (default) or FORCED;
 - with ON, its optimizer cost is above `secondary_engine_cost_threshold`
-  (default 100000; lower it per session to offload smaller queries);
-- it is a SELECT on **one** loaded table (joins, subqueries, UNION: step 6c);
+  (default 100000; lower it per session to offload smaller queries), or
+  MySQL's plan scans a loaded table of at least `duckdb_offload_min_rows`
+  rows (default 1,000,000) by a full scan, full index scan or non-unique
+  index lookup (InnoDB's row estimates for those can be far too low).
+  Primary key lookups and index ranges stay on InnoDB;
+- it is a SELECT whose tables all have a loaded DuckDB copy: joins (inner,
+  CROSS, LEFT, RIGHT), `IN (SELECT ...)`, `EXISTS`, `NOT EXISTS`, `NOT IN`
+  on non-nullable columns, derived tables, views, `WITH` (not recursive),
+  scalar subqueries the server turns into joins, and UNION, INTERSECT,
+  EXCEPT (DISTINCT or ALL, nested, with ORDER BY / LIMIT). The columns of a
+  set operation must not mix kinds (number with string, TIMESTAMP with
+  DATETIME: refused), and UNION DISTINCT, INTERSECT and EXCEPT need
+  binary or `_0900_bin` strings. Subqueries: IN, NOT IN (with NULLs),
+  EXISTS, scalar subqueries in any clause, correlated or not, ANY / ALL.
+  Not offloaded: LATERAL, recursive CTEs, row subqueries `(a, b) IN (...)`,
+  IN on `_bin` / `_ci` strings, a correlated scalar subquery without an
+  aggregate; A table without a copy anywhere in the query:
+  InnoDB (with FORCED the server's error 3889);
 - it uses only: columns, literals, `= <> < <= > >=`, BETWEEN, IN (list),
   LIKE (with ESCAPE), IS [NOT] NULL, AND, OR, NOT; `+ - *`, `/` on DOUBLE
-  values, DIV, MOD, ABS, ROUND (not of DOUBLE); CASE, IF, IFNULL, COALESCE,
+  values and exact division of integers and decimals (as MySQL, with
+  div_precision_increment), DIV, MOD, ABS, ROUND (not of DOUBLE); CASE, IF,
+  IFNULL, COALESCE,
   NULLIF; YEAR, MONTH, DAYOFMONTH, DAYOFYEAR, QUARTER, DAYOFWEEK, WEEKDAY,
   HOUR, MINUTE, SECOND, DATE of DATE and DATETIME columns; COUNT, COUNT
   (DISTINCT), SUM, AVG (also DISTINCT), MIN, MAX; DISTINCT, GROUP BY, HAVING,
   ORDER BY, LIMIT, OFFSET;
-- string comparisons, grouping, ordering and MIN/MAX are on binary strings
-  or `utf8mb4_0900_bin`, `utf8mb4_bin`, `utf8mb3_bin` columns (`_ci` and
-  other collations: later, with weight strings); selecting such columns is
-  fine. SELECT DISTINCT of a `utf8mb4_bin`/`utf8mb3_bin` column is refused;
-- not translated, so answered by InnoDB: exact division (`/` of integers or
-  decimals), arithmetic on UNSIGNED columns, TRUNCATE, other functions,
+- string comparisons, joins, GROUP BY, ORDER BY, COUNT(DISTINCT) and
+  MIN/MAX follow the column's collation for every collation (`_bin`
+  directly, `_ci`, `_as_cs`, `general_ci`, latin1 ... through the weight
+  columns of the copy). Not offloaded on non-`_bin` strings: LIKE, SELECT
+  DISTINCT, UNION DISTINCT / INTERSECT / EXCEPT, IN subqueries, functions
+  over them in comparisons or GROUP BY (UPPER(c) = ...). A grouped string
+  column shown in a join needs the table's primary key in GROUP BY (as
+  `GROUP BY s.id, s.name`): otherwise the value InnoDB shows depends on its
+  join order and the query runs on InnoDB; MIN/MAX of such strings in a
+  join likewise. SELECT DISTINCT of `utf8mb4_bin`/`utf8mb3_bin` columns is
+  refused;
+- not translated, so answered by InnoDB: arithmetic on UNSIGNED columns,
+  TRUNCATE, other functions,
   date functions on TIMESTAMP columns, comparing a string column with a
   number;
 - it is not inside a transaction that has written.
@@ -392,6 +570,18 @@ SELECT ci, COUNT(*) FROM g GROUP BY ci;
 --   collation:ci (utf8mb4_0900_ai_ci)
 SET SESSION use_secondary_engine = OFF;                 -- always InnoDB
 ```
+
+Errors: when DuckDB fails with an error MySQL has too, the client gets
+MySQL's code with DuckDB's message: a scalar subquery with more than one
+row `ERROR 1242: Subquery returns more than 1 row (DuckDB error: ...)`,
+KILL QUERY `ERROR 1317: Query execution was interrupted (DuckDB error:
+...)`, `max_execution_time` `ERROR 3024`. Other DuckDB errors during
+execution are error 3877 `DuckDB error: ...`. KILL QUERY and
+max_execution_time stop the DuckDB query within about a second.
+
+After RENAME TABLE the copy follows once the applier has read the RENAME
+(usually within a second): a query in between runs on InnoDB (FORCED:
+"Table has not been loaded").
 
 The result is the same as on InnoDB: types, NULL order, exact SUM and AVG,
 TIMESTAMP in the session time zone, trailing spaces ignored by
@@ -421,14 +611,27 @@ SELECT /*+ SET_VAR(duckdb_history_scope = FULL) */ ...;   -- per query
 Without the privilege `SET` fails with error 1227; the hint gives a warning
 and is ignored.
 
-**Use FULL with `use_secondary_engine = FORCED`.** With ON, a FULL query that
-DuckDB cannot run (or that is below the cost threshold) runs on InnoDB, which
-has only the live rows, without an error. The guard that turns this into an
-error is DWL#7, not implemented yet.
+> [!WARNING]
+> **On a replica the GRANT must run on the replica itself, with
+> `SET sql_log_bin = 0`.** A source without the plugin does not know the
+> privilege, so it cannot come through replication, and a GRANT written to
+> the replica's binary log is an errant GTID. Why: section 2, "Replicas".
+
+Under FULL a query that reads a history table never runs on InnoDB (which
+has only the live rows): the `duckdb_guard` plugin, loaded with the engine,
+sends it to DuckDB whatever its cost, or stops it with an error: with
+`use_secondary_engine=OFF`, for a statement that is not a SELECT (INSERT ...
+SELECT, CREATE ... SELECT, and every UPDATE, DELETE or TRUNCATE of a history
+table or reading one: they first read the rows to change, and InnoDB has
+only the live ones; FULL is a read scope, change rows under LIVE; a plain
+INSERT is not affected), when DuckDB cannot
+run it (the error gives the reason), with `duckdb_enable=OFF`, or when the
+copy is stale. FULL cannot be set while the guard is disabled.
 
 ```sql
-SET SESSION use_secondary_engine = FORCED, duckdb_history_scope = FULL;
+SET SESSION duckdb_history_scope = FULL;
 SELECT COUNT(*) FROM orders_h;          -- live + archived, or an error
+SHOW GLOBAL STATUS LIKE 'duckdb_guard%';   -- forced, rejected
 ```
 
 ---
@@ -439,6 +642,10 @@ SELECT COUNT(*) FROM orders_h;          -- live + archived, or an error
 SET SESSION secondary_engine_cost_threshold = 1000;
 EXPLAIN FORMAT=TREE SELECT grp, SUM(amount) FROM g GROUP BY grp;
 -- -> ... in secondary engine DUCKDB          runs in DuckDB
+SHOW WARNINGS;
+-- Note 1003  Query is executed in secondary engine; the actual query plan may diverge ...
+-- Note 3877  DuckDB SQL: SELECT CAST(t0."grp" AS BIGINT), ... FROM lake."db"."g" AS t0 GROUP BY t0."grp"
+-- Note 3877  DuckDB plan (1/4): ╭─ Hash Group By ...   (DuckDB's own plan, the one that runs)
 
 EXPLAIN FORMAT=TREE SELECT ci, COUNT(*) FROM g GROUP BY ci;
 -- an InnoDB plan (no DUCKDB): refused (collation), runs on InnoDB
@@ -446,9 +653,10 @@ EXPLAIN FORMAT=TREE SELECT ci, COUNT(*) FROM g GROUP BY ci;
 ```
 
 `in secondary engine DUCKDB` in the plan means the query runs in DuckDB. The
-plan lines are MySQL's: DuckDB makes its own plan from the generated SQL. The
-generated DuckDB SQL (or the reason for refusing) is in the optimizer trace
-(the SQL in EXPLAIN itself is step 6d):
+plan lines are MySQL's; DuckDB makes its own plan from the generated SQL,
+shown in the notes (`SHOW WARNINGS`, long text split in numbered notes).
+EXPLAIN ANALYZE is not available for secondary engines (error 1235). The
+generated SQL (or the reason for refusing) is also in the optimizer trace:
 
 ```sql
 SET optimizer_trace = 'enabled=on';
@@ -561,8 +769,9 @@ Notes:
 SHOW GLOBAL STATUS LIKE 'duckdb%';
 ```
 
-- `duckdb_apply_reader_state`: `idle`, `reading`, `committing`,
-  `refreshing db.t`, or `error: <reason>`.
+- `duckdb_apply_reader_state`: `idle` (everything read is committed in
+  DuckDB), `reading`, `waiting to commit` (a batch waits for its commit
+  deadline), `committing`, `refreshing db.t`, or `error: <reason>`.
 - Applied position: `duckdb_applied_file` / `duckdb_applied_position` /
   `duckdb_applied_gtid` (what DuckDB contains) against the reader position
   `duckdb_apply_reader_file` / `duckdb_apply_reader_position`.
@@ -597,6 +806,7 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | Variable | Scope | Dynamic | Default | Range / values | Description |
 |---|---|---|---|---|---|
 | `duckdb_enable` | global | yes | ON | ON, OFF | Opens or closes the lake and starts or stops the applier. OFF behaves as if the plugin were not loaded; no data is deleted. |
+| `duckdb_lake_relocate` | global | yes | ON | ON, OFF | When the lake catalog stores another data path (lake moved or restored elsewhere): ON accepts it if all its files are under `duckdb_data_path` and updates the stored path; OFF refuses to open the lake. Used when the lake opens. |
 | `duckdb_data_path` | global | no | `""` | path | Lake directory. Empty: `<datadir>/duckdb_data`; a relative path is resolved against the datadir. Must not be the datadir or inside a schema directory, must not be world-writable. |
 | `duckdb_memory_limit` | global | yes | none (mandatory) | ≥ 256 MiB | Memory limit of DuckDB, applied at once. |
 | `duckdb_threads` | global | yes | none (mandatory) | 1 .. cores | DuckDB worker threads, applied at once. |
@@ -607,10 +817,11 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | `duckdb_apply_batch_max_rows` | global | yes | 100000 | 1000 .. 100,000,000 | The applier commits a batch after this many changed rows. A larger transaction is applied in pieces of this size inside one DuckDB transaction. |
 | `duckdb_apply_batch_max_delay_ms` | global | yes | 1000 | 10 .. 60000 | A batch is committed at most this long after its first change (bounds the lag under light load). |
 | `duckdb_apply_gap_action` | global | yes | STOP | STOP, FIRST_AVAILABLE | When binary logs the applier needs were purged and loaded tables miss changes: stop in error state, or warn and continue at the first available binary log. |
-| `duckdb_apply_start_position` | global | yes (command) | `""` | binary log name, FIRST, CURRENT | Setting it restarts the applier at the start of that binary log, which becomes the applied position. Positions before the applied position are refused. Not persisted. |
-| `duckdb_discard_stale_copy` | global | yes (command) | `""` | `'db.table'` | Setting it drops the stale copy of a table that no longer exists. History copies need `duckdb_unload_history_confirm=ON`. Not persisted. |
-| `duckdb_history_scope` | session, global, `SET_VAR` | yes | LIVE | LIVE, FULL | What queries run in DuckDB see in history tables: live rows only, or also archived rows. FULL requires `DUCKDB_HISTORY_READER`; use it with `use_secondary_engine=FORCED` (section 6). |
+| `duckdb_apply_start_position` | global | yes (command) | `""` | binary log name, FIRST, CURRENT | Setting it restarts the applier at the start of that binary log, which becomes the applied position. Positions before the applied position are refused. A command: the variable stays empty afterwards. Not persisted. |
+| `duckdb_discard_stale_copy` | global | yes (command) | `""` | `'db.table'` | Setting it drops the stale copy of a table that no longer exists. History copies need `duckdb_unload_history_confirm=ON`. A command: the variable stays empty afterwards. Not persisted. |
+| `duckdb_history_scope` | session, global, `SET_VAR` | yes | LIVE | LIVE, FULL | What queries see in history tables: live rows only, or also archived rows. FULL requires `DUCKDB_HISTORY_READER` and the `duckdb_guard` plugin, and always runs in DuckDB (or fails with the reason). |
 | `duckdb_apply_debug_log` | global | yes | OFF | ON, OFF | Testing aid: one error log line per change and per table of each batch, with DuckDB row counts (needs `log_error_verbosity=3`). |
+| `duckdb_offload_min_rows` | session, global | yes | 1000000 | 0 .. 2^64-1 | Also try a query in DuckDB when MySQL's plan reads a loaded table of at least this many rows by a full scan, full index scan or non-unique index lookup, whatever its estimated cost. 0: only `secondary_engine_cost_threshold` decides. |
 | `duckdb_offload_wait_applied` | session | yes | ON | ON, OFF | Before a query runs in DuckDB, wait until the applier has applied this connection's last commit (at most 5 s, otherwise InnoDB). |
 | `duckdb_history_check_only` | session | yes | OFF | ON, OFF | SECONDARY_LOAD of a history table only checks that it can take over a history copy (adopt, reattach, resync) and always ends with an error giving the result. |
 | `duckdb_unload_history_confirm` | session | yes | OFF | ON, OFF | Allows SECONDARY_UNLOAD of a history table and `duckdb_discard_stale_copy` of a history copy (archived rows are deleted). |
@@ -620,7 +831,8 @@ Privilege registered by the plugin: `DUCKDB_HISTORY_READER` (needed for
 
 Server variables the plugin depends on: `log_bin`, `binlog_format=ROW`,
 `binlog_row_image=FULL`, `binlog_row_metadata=FULL`, `gtid_mode=ON`,
-`sync_binlog=1` (history tables), `binlog_encryption=OFF`,
+`binlog_order_commits=ON`, `sync_binlog=1` (history tables; recommended for
+all), `innodb_flush_log_at_trx_commit=1` (recommended), `binlog_encryption=OFF`,
 `binlog_expire_logs_seconds` (a warning below one day),
 `use_secondary_engine`, `secondary_engine_cost_threshold`,
 `log_error_verbosity` (3 to see the plugin's notes).
@@ -640,6 +852,7 @@ Server variables the plugin depends on: `log_bin`, `binlog_format=ROW`,
 | `duckdb_apply_last_gtid` | Last transaction read. |
 | `duckdb_apply_batches` / `duckdb_apply_rows_written` | DuckDB commits with changes, rows written. |
 | `duckdb_apply_large_transactions` / `duckdb_apply_pieces` | Transactions applied in pieces, pieces written. |
+| `duckdb_guard_forced` / `duckdb_guard_rejected` | FULL scope statements on history tables sent to DuckDB only / stopped with an error (DWL#7). |
 | `duckdb_offload_queries` / `duckdb_offload_refused` / `duckdb_offload_last_refusal` | Queries run in DuckDB, queries refused (then run on InnoDB, or an error with FORCED), reason of the last refusal. |
 | `duckdb_apply_purge_transactions` / `duckdb_apply_archived_rows` | Tagged purge transactions on loaded tables; rows kept as archived rows. |
 | `duckdb_apply_ddl_refreshes` / `duckdb_apply_ddl_renames` / `duckdb_apply_ddl_deferred` / `duckdb_apply_ddl_failures` | Copies refreshed or renamed after DDL, refreshes deferred to a later rename, copies marked stale by a DDL. |
@@ -651,12 +864,9 @@ Counters restart at 0 when the server starts.
 
 ## 12. Limitations of this version
 
-- Offload covers single-table queries with the constructs in section 6
-  (DWL#6 steps 6a and 6b); everything else runs on InnoDB. Joins,
-  subqueries and UNION: step 6c. String operations on `_ci` and other
+- Offload covers the queries and constructs in section 6 (DWL#6 steps 6a,
+  6b, 6c); everything else runs on InnoDB. String operations on `_ci` and other
   non-binary collations: after 6c (weight strings).
-- `duckdb_history_scope = FULL` with `use_secondary_engine = ON` can fall
-  back to InnoDB (live rows only) without an error: use FORCED (DWL#7).
 - KILL QUERY of a long query running in DuckDB is implemented but not yet
   tested.
 - Not supported: `binlog_encryption=ON`, `duckdb_encryption`, XA transactions
@@ -666,6 +876,10 @@ Counters restart at 0 when the server starts.
   expiry, Phase 3).
 - A refresh after DDL reloads the whole table and pauses the applier for all
   tables while it runs.
-- The MTR test suite is postponed; tests are manual (`manual-test-plan.md`).
-- Replicas: the design reads the replica's binary log, but it has not been
-  tested on a replica yet.
+- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 16 tests) covers the
+  features; restarts with special options, replica, semi-sync, relocation
+  and performance stay in `manual-test-plan.md`.
+- Replicas: tested with a source without the plugin (section 2, Replicas).
+  Loads, unloads and the history privilege need `sql_log_bin = 0` on the
+  replica (server behaviour). With `super_read_only = ON` the refresh after a
+  replicated DDL works only while `duckdb_guard` is active.

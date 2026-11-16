@@ -99,10 +99,12 @@ class BinlogReader {
                     std::string *err, int timeout_seconds = 60);
 
   /**
-    Called by the binlog storage observer (after_sync). It runs in the commit
-    stage, so it only records the position and wakes the reader.
+    Called by the transaction observer (after_commit) after the InnoDB
+    commit of each transaction, in binary log order with
+    binlog_order_commits=ON: the reader never reads past what InnoDB has
+    committed. It only records the position and wakes the reader.
   */
-  void notify_synced(const char *file, my_off_t pos);
+  void notify_committed(const char *file, my_off_t pos);
   Status status();
   /** duckdb_apply_debug_log: one error log line per collapsed change. */
   void set_debug_log(bool on) { m_debug_log = on; }
@@ -241,7 +243,7 @@ class BinlogReader {
   std::atomic<bool> m_gap_first_available{false};
   size_t m_stack_size{0};
   my_thread_handle m_thread;
-  BinlogPos m_synced;    // last synced position, from the observer
+  BinlogPos m_committed;  // last committed position, from the observer
   BinlogPos m_position;  // next position to read
   std::string m_state{"stopped"};
   unsigned long long m_transactions{0};

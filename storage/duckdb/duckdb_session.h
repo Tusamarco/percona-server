@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 
+class THD;
+
 namespace duckdb_se {
 
 /** The plugin's st_plugin_int, needed to attach threads to the session
@@ -54,6 +56,17 @@ void session_thread_end(bool attached);
 */
 bool run_internal_statements(const std::vector<std::string> &statements,
                              std::string *err, unsigned *sql_errno);
+
+/**
+  The THD is one of our internal sessions while run_internal_statements()
+  runs. Used by the duckdb_guard plugin to let these statements pass
+  read_only / super_read_only (they write only to DuckDB, never to the binary
+  log): the server clears THD::skip_readonly_check at the start of every
+  statement, so the guard sets it again at the pre-parse event, which comes
+  after that reset and before the read-only check. One atomic load when no
+  internal session is open.
+*/
+bool is_internal_session(const THD *thd);
 
 }  // namespace duckdb_se
 

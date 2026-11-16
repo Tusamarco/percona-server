@@ -1,0 +1,97 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#6 step 6c-1: joins, semi/anti joins, derived tables, views, CTEs (section 23).
+--source ../include/have_duckdb.inc
+--source ../include/tables_g.inc
+--source ../include/tables_p6.inc
+--source ../include/tables_6c.inc
+
+--let $query= SELECT d.name, COUNT(*), SUM(p.amount) FROM p6 p JOIN dim d ON p.grp = d.grp GROUP BY d.name ORDER BY d.name
+--source ../include/duckdb_compare.inc
+--let $query= SELECT p.grp, d.name, COUNT(*) FROM p6 p LEFT JOIN dim d ON p.grp = d.grp GROUP BY p.grp, d.name ORDER BY p.grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.grp, COUNT(p.id), SUM(p.qty) FROM p6 p RIGHT JOIN dim d ON p.grp = d.grp GROUP BY d.grp ORDER BY d.grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT p.grp, COUNT(d.grp) FROM p6 p LEFT JOIN dim d ON p.grp = d.grp AND d.region = 1 GROUP BY p.grp ORDER BY p.grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 p LEFT JOIN dim d ON p.grp = d.grp WHERE d.grp IS NULL
+--source ../include/duckdb_compare.inc
+--let $query= SELECT p.id, d.name, d.region FROM p6 p LEFT JOIN dim d ON p.grp = d.grp WHERE p.id <= 20 ORDER BY p.id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 a JOIN p6 b ON a.id = b.id + 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*), SUM(a.qty - b.qty) FROM p6 a JOIN p6 b ON a.id = b.id + 1 WHERE a.grp = b.grp + 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.name, COUNT(*), SUM(g.amount) FROM g JOIN p6 ON g.id = p6.id JOIN dim d ON d.grp = g.grp GROUP BY d.name ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM dim a CROSS JOIN dim b WHERE a.grp < b.grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT a.grp, b.grp FROM dim a, dim b WHERE a.region = b.region AND a.grp < b.grp ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+--let $query= SELECT a.grp, b.grp, c.grp FROM dim a JOIN dim b ON b.grp = a.grp + 1 LEFT JOIN dim c ON c.grp = b.grp + 1 ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT a.grp, b.name FROM dim a LEFT JOIN (dim b JOIN dim c ON c.grp = b.grp) ON b.grp = a.grp - 1 ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE id IN (SELECT id FROM p6 WHERE grp = 1)
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*), SUM(amount) FROM p6 WHERE grp IN (SELECT grp FROM dim WHERE region = 1)
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.grp FROM dim d WHERE EXISTS (SELECT 1 FROM p6 WHERE p6.grp = d.grp AND p6.qty > 900) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.grp FROM dim d WHERE NOT EXISTS (SELECT 1 FROM p6 WHERE p6.grp = d.grp) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.grp FROM dim d WHERE d.grp NOT IN (SELECT grp FROM p6) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE grp IN (SELECT grp FROM dim WHERE region = 2) AND id IN (SELECT id FROM g WHERE amount > 100)
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.name FROM dim d WHERE d.grp IN (SELECT p.grp FROM p6 p JOIN dim e ON e.grp = p.grp WHERE e.region = 2) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT x.grp, x.s FROM (SELECT grp, SUM(amount) AS s FROM p6 GROUP BY grp) AS x WHERE x.s > 0 ORDER BY x.grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.name, x.c FROM dim d JOIN (SELECT grp, COUNT(*) AS c FROM p6 GROUP BY grp) x ON x.grp = d.grp ORDER BY d.name
+--source ../include/duckdb_compare.inc
+--let $query= SELECT x.grp, x.c FROM (SELECT grp, COUNT(*) AS c FROM p6 WHERE qty > 0 GROUP BY grp ORDER BY c DESC, grp LIMIT 3) x ORDER BY x.grp
+--source ../include/duckdb_compare.inc
+--let $query= WITH c AS (SELECT grp, MAX(amount) AS m FROM p6 GROUP BY grp) SELECT * FROM c ORDER BY grp
+--source ../include/duckdb_compare.inc
+--let $query= WITH c AS (SELECT grp, COUNT(*) AS n FROM p6 GROUP BY grp) SELECT a.grp, b.grp FROM c a JOIN c b ON a.n = b.n AND a.grp < b.grp ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+--let $query= SELECT grp, COUNT(*), SUM(amount) FROM v6 GROUP BY grp ORDER BY grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.name, COUNT(*) FROM v6 JOIN dim d ON d.grp = v6.grp WHERE v6.amount > 100 GROUP BY d.name ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT x.d, COUNT(*) FROM (SELECT YEAR(d) AS d, grp FROM p6) x JOIN dim ON dim.grp = x.grp GROUP BY x.d ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 a JOIN p6 b ON a.b4 = b.b4 WHERE a.id < 300 AND b.id < 300
+--source ../include/duckdb_compare.inc
+--let $query= SELECT a.id, d.name FROM p6 a JOIN dim d ON a.grp = d.grp WHERE a.id < 30 ORDER BY a.b4, a.id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 a JOIN dim d ON d.label = a.b4
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM g JOIN p6 ON g.d = p6.d WHERE g.id < 1000
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.grp, COUNT(h.id), SUM(h.v) FROM dim d LEFT JOIN hist h ON h.grp = d.grp GROUP BY d.grp ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM dim d WHERE EXISTS (SELECT 1 FROM hist h WHERE h.grp = d.grp AND h.v < 40)
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.grp, (SELECT COUNT(*) FROM p6 WHERE p6.grp = d.grp) FROM dim d ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.grp, (SELECT MAX(qty) FROM p6 WHERE p6.grp = d.grp) FROM dim d ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT x.d, COUNT(*) FROM (SELECT YEAR(d) AS d, grp FROM p6 LIMIT 100000) x JOIN dim ON dim.grp = x.grp GROUP BY x.d ORDER BY 1
+--source ../include/duckdb_compare.inc
+
+--source ../include/cleanup.inc

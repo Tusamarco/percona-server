@@ -1,0 +1,75 @@
+GRANT DUCKDB_HISTORY_READER ON *.* TO root@localhost;
+CREATE TABLE h1 (id INT PRIMARY KEY, v INT, c VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb
+SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO h1 VALUES (1, 10, 'a'), (2, 20, 'B'), (3, 30, 'c'), (4, 40, 'D');
+ALTER TABLE h1 SECONDARY_LOAD;
+# purge (tag): archived in DuckDB; plain DELETE: removed
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
+DELETE FROM h1 WHERE id IN (1, 2);
+SET gtid_next = 'AUTOMATIC';
+DELETE FROM h1 WHERE id = 3;
+INSERT INTO h1 VALUES (1, 11, 'A');
+SELECT COUNT(*) FROM h1;
+COUNT(*)
+2
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*), SUM(v) FROM h1;
+COUNT(*)	SUM(v)
+2	51
+SET SESSION duckdb_history_scope = FULL;
+SELECT id, v, c FROM h1 ORDER BY id, v;
+id	v	c
+1	10	a
+1	11	A
+2	20	B
+4	40	D
+SELECT c, COUNT(*) FROM h1 GROUP BY c ORDER BY c;
+c	COUNT(*)
+a	2
+B	1
+D	1
+SET SESSION duckdb_history_scope = LIVE, use_secondary_engine = ON;
+purge_transactions	archived_rows
+1	2
+# unload of a history table needs confirmation
+ALTER TABLE h1 SECONDARY_UNLOAD;
+ERROR HY000: SECONDARY_UNLOAD of test.h1 would delete its archived rows, which exist only in the lake: SET SESSION duckdb_unload_history_confirm = ON first
+# DROP keeps the copy (stale); a new table with another structure is refused
+DROP TABLE h1;
+Warnings:
+Warning	3877	DuckDB copy of test.h1 kept and marked stale: it holds archived rows
+CREATE TABLE h1 (id INT PRIMARY KEY, v BIGINT) SECONDARY_ENGINE = duckdb
+SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+ALTER TABLE h1 SECONDARY_LOAD;
+ERROR HY000: test.h1: the structure does not match the history copy test.h1 (2 differences, see SHOW WARNINGS); nothing loaded
+SHOW WARNINGS;
+Level	Code	Message
+Warning	3877	column v: type INTEGER in the history copy, BIGINT in the new table
+Warning	3877	column c: in the history copy, missing in the new table (2 archived values)
+Error	3877	test.h1: the structure does not match the history copy test.h1 (2 differences, see SHOW WARNINGS); nothing loaded
+DROP TABLE h1;
+Warnings:
+Warning	3877	DuckDB copy of test.h1 kept and marked stale: it holds archived rows
+# the same structure: check only, then reattach (archived rows kept)
+CREATE TABLE h1 (id INT PRIMARY KEY, v INT, c VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb
+SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO h1 VALUES (1, 11, 'A'), (4, 40, 'D');
+SET SESSION duckdb_history_check_only = ON;
+ALTER TABLE h1 SECONDARY_LOAD;
+ERROR HY000: structure check passed: test.h1 can reattach its history copy; nothing loaded (duckdb_history_check_only=ON)
+SET SESSION duckdb_history_check_only = OFF;
+ALTER TABLE h1 SECONDARY_LOAD;
+SET SESSION use_secondary_engine = FORCED, duckdb_history_scope = FULL;
+SELECT id, v, c FROM h1 ORDER BY id, v;
+id	v	c
+1	10	a
+1	11	A
+2	20	B
+4	40	D
+SET SESSION duckdb_history_scope = LIVE, use_secondary_engine = ON;
+# confirmed unload, then discard of a stale copy
+SET SESSION duckdb_unload_history_confirm = ON;
+ALTER TABLE h1 SECONDARY_UNLOAD;
+SET SESSION duckdb_unload_history_confirm = OFF;
+DROP TABLE h1;
+REVOKE DUCKDB_HISTORY_READER ON *.* FROM root@localhost;

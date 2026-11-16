@@ -1,6 +1,6 @@
 # DWL#6: Query offload through the external executor
 
-Affects: Percona Server 9.7 — Status: steps 6a and 6b implemented, verified on a throwaway instance (2026-11-12) and on the reference instance (6a 2026-11-12, 6b 2026-11-13); 6c and later design
+Affects: Percona Server 9.7 — Status: steps 6a and 6b implemented, verified on the reference instance (6a 2026-11-12, 6b 2026-11-13); 6c-1, 6c-2 verified on the reference instance, 6c-3, 6d-1 and 6d-2 implemented, verified on a throwaway instance (2026-11-13); 6d-3 in progress
 
 Steps (one at a time, tested by Marco before the next):
 
@@ -12,9 +12,21 @@ Steps (one at a time, tested by Marco before the next):
   arithmetic, DIV, MOD, ABS, ROUND), LIKE, COUNT(DISTINCT), SUM/AVG
   DISTINCT, DISTINCT, date parts of DATE/DATETIME, PAD SPACE binary
   collations (`utf8mb3_bin`, `utf8mb4_bin`), TIMESTAMP constants.
-- 6c: joins, semi and anti joins, derived tables, views, UNION.
-- 6d: EXPLAIN with the DuckDB SQL, registry fix (cached TABLE objects),
-  performance measurement.
+- 6c, in three steps (decided 2026-11-13):
+  - 6c-1 (implemented): joins (inner, cross, LEFT, RIGHT), semi- and
+    anti-joins (IN, EXISTS, NOT EXISTS, NOT IN as the optimizer flattens
+    them), derived tables, views, non-recursive CTEs, scalar subqueries the
+    server rewrites into joins;
+  - 6c-2 (implemented): UNION, INTERSECT, EXCEPT (DISTINCT and ALL),
+    nested and parenthesized with their own ORDER BY / LIMIT, also in
+    derived tables;
+  - 6c-3 (implemented): subqueries the server leaves as expressions
+    (IN / NOT IN with NULLs, EXISTS, scalar subqueries in any clause,
+    correlated), the server's rewrites of the others, one-row checks.
+- 6d: 6d-1 (implemented) EXPLAIN with the DuckDB SQL; 6d-2 (implemented) registry fix
+  for cached TABLE objects, KILL and timeout; 6d-3 performance measurement
+  on a release build (separate build directory) with a production-like
+  workload (decided 2026-11-13).
 - Weight-string columns for non-binary collations: a later step, to be
   placed after 6c (decided 2026-11-12).
 
@@ -342,19 +354,343 @@ Same file, `duckdb_offload.cc`.
   can then differ in trailing spaces only. MySQL does not define which value
   is shown.
 
+### Implemented in step 6c-1
+
+Same file, `duckdb_offload.cc`; the generator works per query block.
+
+- Aliases: each table of the query is `tN`, columns `tN."col"`; a column
+  of a table outside the block is refused
+  (`outer_or_other_table_column:<table>.<column>`).
+- FROM from the join tree (`Query_block::m_table_nest`, stored in reverse
+  order by the parser): inner joins and CROSS JOIN, LEFT JOIN with its ON
+  (RIGHT JOIN arrives as LEFT JOIN), nests in parentheses.
+- LIVE scope: a history table is read as `(SELECT * FROM lake.db.t WHERE
+  "__archived_at" IS NULL) AS tN`, so the filter stays on the table
+  wherever it is (in WHERE it would turn a LEFT JOIN into an inner join).
+- Semi-join nests (IN and EXISTS subqueries flattened by the optimizer)
+  become `EXISTS (SELECT 1 FROM <nest> WHERE ...)`: the semi-join condition
+  was merged into WHERE, so each AND part using the nest's tables moves
+  into its EXISTS (multiple equalities split into pairs anchored on an
+  outer column). Anti-join nests (NOT EXISTS, NOT IN on non-nullable
+  columns) become `NOT EXISTS` with their own condition. Refused: a nest
+  inside an outer join or inside another nest, a condition across two
+  semi-joins.
+- Semi-join materialization is disabled while the server optimizes a
+  statement for us (that strategy rewrites WHERE to read its temporary
+  table `<subqueryN>`); the session's `optimizer_switch` is restored in the
+  optimize hook and when the statement context is destroyed.
+- Materialized derived tables and CTEs: `(SELECT ... AS "col", ...) AS tN`,
+  generated recursively, each value cast to the DuckDB type of its MySQL
+  type (DECIMAL kept as DECIMAL). Merged views and derived tables need
+  nothing. Refused: recursive CTEs, LATERAL, set operations inside.
+- Scalar subqueries in the select list: the server already rewrites them
+  into a LEFT JOIN with a grouped derived table (`coalesce(..., 0)` for
+  COUNT); they are offloaded that way.
+- PAD SPACE columns in joins: grouping, ordering and comparisons are exact
+  and allowed; showing a grouped PAD value or MIN/MAX of a PAD column is
+  refused (`padded_group_value_in_join`, `padded_min_max_in_join`): in a
+  join the row InnoDB meets first depends on the join order (decided
+  2026-11-13: allowed only when exactly what InnoDB does).
+- Comparisons use the comparison's collation (`compare_collation()`), not
+  only the columns'.
+- `compare_secondary_engine_cost` no longer keeps a statement-wide best
+  cost.
+
+### Implemented in step 6c-2
+
+- A set operation is printed as `SELECT ... FROM ((c0) OP (c1) ...) AS tN
+  [ORDER BY] [LIMIT]`: the post-processing query block of the
+  `Query_term_set_op` (ORDER BY, LIMIT of the whole operation) reads the
+  result table, whose columns are named c1, c2, ... (positional, so
+  duplicate names such as `SELECT a, a` cannot clash).
+- Operators, left-associative in MySQL and DuckDB
+  (`PT_set_operation::merge_descendants`): UNION is DISTINCT up to the last
+  DISTINCT operand (`last_distinct`) and ALL after it; INTERSECT is
+  DISTINCT if any operator is; EXCEPT is ALL before the first DISTINCT
+  operand (`first_distinct`) and DISTINCT from it on.
+- Each operand's columns are cast to the result types MySQL computed
+  (`types_array()`). Mixing kinds is refused (`set_operation_mixed_types`,
+  decided 2026-11-13): numbers combine with numbers, DATE with DATETIME, a
+  NULL literal with anything; string with number, TIMESTAMP with DATETIME,
+  binary with non-binary string are refused.
+- Operations that compare rows (UNION DISTINCT, INTERSECT, EXCEPT, also
+  ALL) need byte-comparable strings: PAD SPACE and other collations are
+  refused there; UNION ALL accepts any collation.
+- An operand without tables (`SELECT 1`) has no FROM.
+- The external executor is set on every query block; the first call runs
+  the statement, the rows go to the first block's count (FOUND_ROWS() as
+  InnoDB). The value holders follow the query expression's field list
+  (`get_field_list()`), the result columns for a set operation.
+- Derived tables and CTEs with a set operation are offloaded the same way.
+
+### Implemented in step 6c-3
+
+For a secondary engine the server rewrites most subqueries into joins with
+derived tables before our hook (`subquery_to_derived`): IN / EXISTS under
+OR, scalar subqueries in WHERE and the select list, EXISTS / IN in the
+select list, ANY and ALL (MAX, COUNT and `Item_bool_if`). They are
+offloaded through 6c-1, plus:
+
+- `Item_bool_if` (internal IF with constant branches) as CASE; cached
+  expressions (`Item_cache`) as the expression they cache.
+- A derived table made from a scalar subquery (`m_was_scalar_subquery`) has
+  one row: its columns are wrapped in `any_value()` in the select list and
+  HAVING of a grouped query (DuckDB requires an aggregate).
+- `m_reject_multiple_rows` (the server's rewrite of an uncorrelated scalar
+  subquery): MySQL raises ER_SUBQUERY_NO_1_ROW if the table has more than
+  one row. We add `count(*) OVER ()` and `error(...)` when it is above 1.
+  Before this step the check was missing: `WHERE grp = (SELECT grp FROM p6
+  WHERE id < 10)` returned rows instead of error 1242 (found 2026-11-13).
+- The correlated scalar subquery without aggregate is rewritten with
+  `any_value` (MySQL then checks per key): refused
+  (`correlated_scalar_subquery_without_aggregate`).
+
+Subqueries left as expressions are printed as subqueries:
+
+- `x IN (SELECT ...)` / NOT IN (`<in_optimizer>` wraps the predicate; it is
+  found among its arguments), `EXISTS (...)`, scalar `(SELECT ...)` in any
+  clause, with MySQL's truth test (NOT, IS [NOT] TRUE / FALSE as coalesce).
+  DuckDB applies the same three-valued logic to IN and NOT IN.
+- The in-to-exists strategy's additions are left out: conditions marked
+  `created_by_in2exists()` in WHERE and HAVING, and the `LIMIT 1` marked
+  `m_internal_limit` (it cut an IN list to one value).
+- Correlated subqueries: a column may belong to an enclosing block (aliases
+  are unique in the statement); an aggregate of an outer query inside a
+  subquery is refused.
+- IN compares like MySQL only for byte strings (RAW collations) and
+  comparable kinds; others, row subqueries (`(a, b) IN`) and remaining
+  ALL / ANY predicates are refused.
+- Errors (decided 2026-11-13): when DuckDB fails with an error MySQL has
+  too, the client gets MySQL's code with both messages, e.g. `ERROR 1242:
+  Subquery returns more than 1 row (DuckDB error: Invalid Input Error: More
+  than one row returned by a subquery ...)`; other DuckDB errors are 3877
+  `DuckDB error: ...`. Unlike MySQL, DuckDB may raise the scalar subquery
+  error for a row whose value MySQL would not evaluate (a branch of CASE not
+  taken): an error where MySQL returns rows, never a wrong value.
+
+### Lessons from step 6c-1
+
+- A statement-wide "best cost" in `compare_secondary_engine_cost` made
+  every plan of a second JOIN (anti-join) "not cheaper": the planner had no
+  plan and asserted (`sql_planner.cc` consider_plan). The server's own
+  comparison per JOIN must stand. Latent since 6a (one table, one plan).
+- Semi-join materialization substitutes the subquery's columns in WHERE
+  with columns of `<subqueryN>`: reading the optimized WHERE needs the
+  strategy off.
+- A simple derived table is merged: its columns are references to the
+  inner expressions (`real_item()`), not fields.
+
+### After the first performance run (decided 2026-11-14)
+
+Order: C (cost rule) and B (exact division) first, then A (weight strings
+for `_ci` collations, design under review).
+
+C, `duckdb_offload_min_rows` (session, default 1,000,000, 0 disables): the
+pre-prepare hook also tries a query in DuckDB when MySQL's InnoDB plan reads
+a loaded table of at least that many rows by a full scan, a full index scan
+or a non-unique index lookup, the access types whose row estimates come from
+sampled statistics (the 382-instead-of-52,560 case). Primary key and unique
+lookups and index ranges (index dives) keep MySQL's estimate, so they stay on
+InnoDB under the cost threshold. The table size is InnoDB's table estimate
+(free during planning; the error was per key, not per table). The decision
+is in the optimizer trace (`duckdb_offload_candidate`).
+
+B, exact decimal division (`/` of integers and decimals, and AVG), as MySQL
+computes it (mysys/decimal.cc do_div_mod, Item_func_numhybrid):
+
+- operand scales are rounded up to 9-digit words; div_precision_increment is
+  reduced by that padding; the quotient is truncated at
+  F = 9 * ceil((frac1 + frac2 + incr) / 9) digits;
+- `/` then rounds half up to its scale (operand scale + increment, at most
+  30): every arithmetic function's value is rounded to its scale, so later
+  expressions see the rounded value; AVG keeps the F digits (only the output
+  rounds);
+- translation: the operands as exact integers (integer part and fraction
+  separately), R = |A| 10^(F - f1 + f2) // |B| in HUGEINT, the sign of
+  A * B, DECIMAL(38, F), then a cast to the scale (DuckDB rounds half away
+  from zero, as MySQL's HALF_UP); NULL for a zero divisor. DECIMAL `+ - *`
+  results are cast to MySQL's scale too (it matters with AVG operands).
+- refused: operand scales above 18, F above 36. A value too large for 128
+  bits is a DuckDB error, never a wrong value.
+- AVG of integers and decimals used DuckDB's `/` (DOUBLE) since 6a: exact
+  now (the tests had not hit a difference).
+- Tests: `duckdb_offload_div_queries.sql` (table dv): increments 0, 4, 9,
+  negatives, zero, NULL, nested divisions, ROUND of a division, AVG in
+  expressions; the first version rounded where MySQL truncates (increment
+  0 and 9) and used F digits where MySQL uses the rounded value (`a / b *
+  2`): both found by these tests.
+
+### Step A: weight strings for non-binary collations (decided 2026-11-14)
+
+Decisions: weights for every string column whose collation DuckDB cannot
+compare natively, automatically; results exactly as InnoDB (in a join, a
+grouped `_ci` value is shown only when GROUP BY contains that table's primary
+key); existing copies get weights at their next load (history copies: the
+archived rows' weights are computed by the plugin at load / resync /
+reattach / refresh).
+
+A1, storage (implemented 2026-11-14):
+
+- `duckdb_collation.h/.cc`: `needs_weight()` (non-binary collations except
+  the binary-sort utf8mb3/utf8mb4 ones, which DuckDB compares on UTF-8
+  bytes; latin1_bin and other non-UTF-8 binary collations need weights),
+  `collation_weight()` = MySQL's `strnxfrm` of the value in its own
+  character set with num_codepoints = its own length (no padding); for PAD
+  SPACE collations the trailing spaces are removed first (`lengthsp`), so
+  equal values have equal weights; ordering will append the space weight at
+  query time (A2). Weights compare as bytes.
+- The copy gets `"__w_<column>" BLOB` after the other columns (and
+  `__archived_at`). The loader computes it from the InnoDB value; the binlog
+  decoder from the row image bytes and the column's collation id (before the
+  UTF-8 conversion); the applier writes it (`kWeightBase - index` in the
+  column map).
+- Archived rows (refresh after DDL, resync, reattach, adopt): copied without
+  weights, then `backfill_archived_weights()` computes one weight per
+  distinct value (UTF-8 converted back to the column's character set) and
+  updates by value; this also covers a collation change and copies made
+  before A1.
+- The history structure check ignores `__w_` columns.
+- `project_duckdb/tools/duckq.c`: runs SQL on a lake with the plugin's
+  extensions, to inspect it while the server is stopped.
+- Verified (throwaway instance): 0900_ai_ci, general_ci, latin1_swedish_ci
+  columns get weights, utf8mb4_bin none; distinct weights = MySQL's COUNT
+  (DISTINCT) (5, 4, 4); groups follow the collation (apple/Apple/ápple/APPLE
+  one group, 'apple ' another with NO PAD); applier inserts and updates have
+  weights; history copy after purge + resync: archived weights present;
+  ALTER ... COLLATE utf8mb4_0900_as_cs recomputes them (6 distinct);
+  reattach passes the structure check; unit test DuckdbCollation.Weights;
+  all offload lists pass with weight columns in every copy.
+
+A2, queries (implemented 2026-11-14):
+
+- The registry records each copy's weight columns (`weight_columns`,
+  migration; empty for copies loaded before A1: their `_ci` columns are
+  refused, "copy without weights: reload it").
+- String mode WEIGHT (any collation needing weights). `string_key()` gives
+  the key a string compares by: bytes (RAW), rtrim / padded key (PAD), or
+  the weight: the column's `__w_` column (its collation must be the
+  comparison's), or a constant's weight computed at generation with
+  MySQL's collation code (a BLOB literal); for ordering a PAD SPACE weight
+  gets the space weight appended up to the longest value. Used by
+  comparisons, IN lists, BETWEEN, NULLIF, multiple equalities and joins,
+  ORDER BY, GROUP BY, COUNT(DISTINCT), MIN/MAX (ties broken on the primary
+  key, single table).
+- Grouped values (decided 2026-11-14: exactly as InnoDB), for PAD and
+  weight collations: when GROUP BY contains all primary key columns of the
+  column's table every row of the group has the same value (any_value);
+  otherwise on a single table the row with the smallest primary key
+  (arg_min); in a join refused (`grouped_string_value_in_join`).
+- Derived tables and set operations carry `__w_<column>` next to the value
+  (set operations: every operand, for the result's weight-collation
+  columns), so the outer query groups and orders on them (UNION ALL of
+  string literals with ORDER BY).
+- Refused: LIKE on weight collations, functions over them compared or
+  grouped (UPPER(c) = ...), SELECT DISTINCT, UNION DISTINCT / INTERSECT /
+  EXCEPT, IN subqueries on them, MIN/MAX in joins.
+- Tests: `duckdb_offload_a2_queries.sql` (32: cw with 0900_ai_ci,
+  general_ci, latin1_swedish_ci, 0900_as_cs; cwd join; dim, p6, g) and
+  `duckdb_offload_a2_refusals.sql` (7); three earlier refusals on `_ci`
+  columns moved to the A2 list. All passed at the first run.
+
+### Step 6d-3: performance (in progress)
+
+- Release build in its own directory (`../percona-server-9.7-release`,
+  `CMAKE_BUILD_TYPE=RelWithDebInfo`, `DUCKDB_BUILD_TYPE=RelWithDebInfo`;
+  targets mysqld, duckdb, mysql, mysqladmin); the debug build is unchanged.
+- Workload (`project_duckdb/perf/`): a wind farm monitoring schema close to
+  production — region, site, turbine (names in the server's default
+  collation), reading (one row per turbine every 10 minutes, indexed on
+  (turbine_id, ts) and ts), alarm, maintenance (history table purged with
+  the tag); 200 turbines x 365 days = 10.5 million readings by default,
+  deterministic data. 16 queries: dashboards and reports expected in DuckDB,
+  and four expected on InnoDB (primary key lookup, short index range,
+  grouping on a `_ci` name, a window function).
+- `duckdb_perf_run.sh` runs each query RUNS times on InnoDB (OFF) and with
+  ON and the default cost threshold, as in production; it reports where the
+  query ran, the median times, the speedup, and whether the results match.
+
+First run, 2026-11-13 (release build, throwaway instance on the HDD
+machine, 8 cores; buffer pool 4G, duckdb_memory_limit 4G, duckdb_threads 6;
+`perf/results-2026-11-13-release.txt`):
+
+- Setup 185 s; SECONDARY_LOAD of 10,512,000 readings 15.4 s, small tables
+  0.1-0.2 s (the slow loads seen before were the debug build). DuckDB copy
+  58 MB of Parquet.
+- All results identical. Offloaded queries, median of 3: q02 31.9 s ->
+  0.055 s (584x), q03 13.2 -> 0.118 (112x), q07 65.8 -> 0.140 (472x), q08
+  2.45 -> 0.045 (55x), q09 21.4 -> 0.120 (179x), q11 4.08 -> 0.054 (76x).
+  q13 (primary key) and q14 (short index range) stay on InnoDB by cost, as
+  intended; q16 (window function) is refused.
+- Not offloaded although heavy, three causes:
+  1. `_ci` collations: GROUP BY a dimension name (q01 site name, q04
+     turbine model, q15), and string literals, which carry the connection
+     collation (q10 `'h1' AS p` in ORDER BY). With numbers instead, q10 runs
+     in 0.104 s instead of 64.0 s (615x).
+  2. Exact division: `SUM(decimal) / 6`, `SUM(a) / SUM(b)` (q01, q04) are
+     refused (`exact_division`, MySQL returns an exact DECIMAL).
+  3. MySQL's cost estimate: InnoDB estimated 382 readings per turbine (real
+     52,560) even after ANALYZE TABLE, so q04's join cost (26,754) stayed
+     below secondary_engine_cost_threshold (100,000) and was never offered
+     to the engine.
+- q12 (FULL scope, small table) ran on InnoDB below the threshold and
+  returned live rows only: the known FULL fallback gap (DWL#7).
+
+### Implemented in step 6d-1
+
+- EXPLAIN (any format) of an offloaded query adds notes (code 3877): the
+  DuckDB SQL, and DuckDB's own plan (`EXPLAIN <sql>` in DuckDB), which is
+  the plan that runs; MySQL's printed plan only shows that the query goes
+  to the secondary engine (note 1003). SHOW WARNINGS shows at most 512
+  bytes per message, so long text is split in numbered notes
+  ("DuckDB plan (2/7)"). A refused query (ON) has no notes; the reason is
+  in `duckdb_offload_last_refusal` and the optimizer trace.
+- EXPLAIN ANALYZE is refused by the server for any secondary engine
+  (error 1235).
+
+### Implemented in step 6d-2
+
+- Registry entries are never freed: a table that leaves the lake (unload,
+  DROP, discard, RENAME to another name, absent at reload) is marked not
+  present. Secondary TABLE objects the server keeps in its table cache
+  point to the entry's THR_LOCK, and nothing guarantees they are evicted
+  first (SECONDARY_UNLOAD does not evict them, nor do our applier's DDL
+  handling or `duckdb_discard_stale_copy`).
+- KILL QUERY interrupts DuckDB (about 1 s on a 200,000 x 20,000 inequality
+  join) and frees the executor thread. Errors as MySQL's: KILL QUERY gives
+  1317, `max_execution_time` 3024, each with DuckDB's message.
+- Verified: an offloaded query before and after SECONDARY_UNLOAD +
+  SECONDARY_LOAD, applier RENAME and back, DROP + re-create, duckdb_enable
+  OFF/ON, DROP of a history table + discard + re-create; two sessions
+  offloading every 0.3 s during six unload/load cycles (about 680 queries:
+  each either the right result or a clean "not loaded"; no crash).
+- Seen: after RENAME TABLE the copy is under the new name only once the
+  applier has read the RENAME (seconds under load); a query in between
+  finds no copy (ON: InnoDB; FORCED: "Table has not been loaded").
+
+### Lessons from step 6c-3
+
+- Most subqueries never reach us as subqueries: the server's rewrites for
+  secondary engines turn them into joins; reading its optimizer trace
+  (`expanded_query`) shows what we receive.
+- A rewrite can carry runtime checks (`m_reject_multiple_rows`): a derived
+  table is not always "just a table".
+- `Item_in_optimizer` is built with one argument; the left operand comes
+  later: positions must not be assumed.
+- The in-to-exists LIMIT 1 is invisible in the printed query but changes an
+  IN list.
+
+### Lessons from step 6c-2
+
+- `Item::is_null()` on a column reads the value in the current row buffer:
+  used to recognize a NULL literal it skipped the kind check at random, and
+  `ts UNION ALL dt` returned TIMESTAMP values in UTC instead of the session
+  time zone (one hour off). A NULL literal is recognized by its item type.
+
 ### Open points
 
-- FULL scope with `use_secondary_engine=ON`: a refused query (or one below
-  the cost threshold) runs on InnoDB with live rows only, without an error.
-  The rule "FULL never falls back" needs the DWL#7 guard; until then the
-  HOWTO says to use FORCED with FULL.
-- KILL QUERY during a long DuckDB query: implemented (killed checks, the
-  executor interrupts the task), not yet tested with a query long enough.
-- Registry entries and cached tables: from this worklog the server may keep
-  secondary `TABLE` objects cached, holding a pointer to the registry entry's
-  THR_LOCK. `Registry::reload()` must then mark entries absent instead of
-  erasing them (today it erases entries no longer in the lake, which is safe
-  only because no secondary table stays open).
+- FULL scope fallback to InnoDB: closed by the DWL#7 guard (2026-11-15).
+- After RENAME TABLE, a FORCED query fails until the applier has renamed
+  the copy (the handler is opened before the freshness wait).
 
 - Value holder Items versus protocol: to verify.
 - Behaviour of `override_executor_func` for UNION and set operations: to verify.

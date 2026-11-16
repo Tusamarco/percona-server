@@ -17,6 +17,8 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <unordered_set>
 
 #include "m_string.h"
 #include "my_thread.h"  // my_thread_end
@@ -25,6 +27,7 @@
 #include "mysql/service_srv_session_info.h"
 #include "mysql/strings/m_ctype.h"
 #include "sql/auth/sql_security_ctx.h"
+#include "sql/sql_audit.h"  // mysql_audit_enable_auditing
 #include "sql/sql_class.h"
 
 namespace duckdb_se {
@@ -32,6 +35,22 @@ namespace duckdb_se {
 namespace {
 
 std::atomic<const void *> g_plugin{nullptr};
+
+// Internal sessions open now (is_internal_session). The count lets the
+// guard skip the lookup for every other statement.
+std::atomic<int> g_internal_count{0};
+std::mutex g_internal_mutex;
+std::unordered_set<const THD *> g_internal;
+
+void register_internal(const THD *thd, bool add) {
+  std::lock_guard<std::mutex> lk(g_internal_mutex);
+  if (add) {
+    g_internal.insert(thd);
+    g_internal_count++;
+  } else if (g_internal.erase(thd) > 0) {
+    g_internal_count--;
+  }
+}
 
 // Result of one statement. We need only success or the error.
 struct Outcome {
@@ -127,16 +146,36 @@ bool run_internal_statements(const std::vector<std::string> &statements,
     return true;
   }
   // The replication applier's privileges without PRIVILEGE_CHECKS_USER.
-  srv_session_info_get_thd(session)->security_context()->skip_grants();
-
-  bool failed =
-      run_one(session, "SET SESSION sql_log_bin = 0", err, sql_errno);
+  THD *thd = srv_session_info_get_thd(session);
+  thd->security_context()->skip_grants();
+  // Like the replication applier, not stopped by (super_)read_only: see
+  // is_internal_session(). Session service THDs are created with auditing
+  // off (sql/srv_session.cc), so no audit event would reach duckdb_guard:
+  // turn it on for this session. Audit plugins (e.g. audit_log) then see
+  // these internal statements too, as for any connection.
+  mysql_audit_enable_auditing(thd);
+  bool failed = false;
+  try {
+    register_internal(thd, true);
+  } catch (...) {
+    *err = "cannot register the internal session";
+    failed = true;
+  }
+  if (!failed)
+    failed = run_one(session, "SET SESSION sql_log_bin = 0", err, sql_errno);
   for (const std::string &sql : statements) {
     if (failed) break;
     failed = run_one(session, sql, err, sql_errno);
   }
+  register_internal(thd, false);
   srv_session_close(session);
   return failed;
+}
+
+bool is_internal_session(const THD *thd) {
+  if (g_internal_count.load(std::memory_order_acquire) == 0) return false;
+  std::lock_guard<std::mutex> lk(g_internal_mutex);
+  return g_internal.count(thd) > 0;
 }
 
 }  // namespace duckdb_se

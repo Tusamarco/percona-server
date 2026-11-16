@@ -1,0 +1,17 @@
+query ran_in       innodb_s   duckdb_s  speedup  note
+q01   DuckDB          5.250      0.049   107.1x  
+q02   DuckDB         17.879      0.041   439.4x  
+q03   DuckDB          7.265      0.087    83.9x  
+q04   InnoDB         25.781     25.718     1.0x  not offloaded (cost below threshold, or: grouped_string_value_in_join)
+q05   InnoDB          0.037      0.037     1.0x  not offloaded (cost below threshold, or: grouped_string_value_in_join)
+q06   InnoDB          0.020      0.021     0.9x  not offloaded (cost below threshold, or: grouped_string_value_in_join)
+q07   DuckDB         36.809      0.147   249.6x  
+q08   DuckDB          2.467      0.046    53.8x  
+q09   DuckDB         21.761      0.108   200.7x  
+q10   DuckDB         35.731      0.062   574.4x  
+q11   DuckDB          4.220      0.056    75.1x  
+q12   InnoDB          0.009      0.011     0.8x  not offloaded (cost below threshold, or: grouped_string_value_in_join)
+q13   InnoDB          0.008      0.008     1.0x  not offloaded (cost below threshold, or: grouped_string_value_in_join)
+q14   InnoDB          0.007      0.008     1.0x  not offloaded (cost below threshold, or: grouped_string_value_in_join)
+q15   InnoDB         22.790     22.525     1.0x  not offloaded (cost below threshold, or: grouped_string_value_in_join)
+q16   InnoDB         21.479     21.458     1.0x  not offloaded (cost below threshold, or: window)

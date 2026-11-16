@@ -1,0 +1,76 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#7 (section 34): under duckdb_history_scope=FULL a statement that reads
+# a history table never runs on InnoDB.
+--source ../include/have_duckdb.inc
+--source ../include/tables_g.inc
+--source ../include/tables_p6.inc
+--source ../include/tables_6c.inc
+GRANT DUCKDB_HISTORY_READER ON *.* TO root@localhost;
+--connect (con_g, localhost, root,,)
+CREATE VIEW vh AS SELECT id, grp, v FROM hist;
+CREATE PROCEDURE ph() SELECT COUNT(*) FROM hist;
+CREATE TABLE hcopy (id INT PRIMARY KEY, v INT);
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM information_schema.PLUGINS WHERE PLUGIN_NAME = 'duckdb_guard';
+
+SET SESSION use_secondary_engine = OFF, duckdb_history_scope = FULL;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT COUNT(*) FROM hist;
+SET SESSION use_secondary_engine = ON;
+SELECT COUNT(*) FROM hist;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM hist LIMIT 1;
+--error ER_SECONDARY_ENGINE_PLUGIN
+INSERT INTO hcopy SELECT id, v FROM hist;
+SELECT COUNT(*) FROM hcopy;
+# UPDATE and DELETE read the rows they change: stopped under FULL (the live
+# count after LIVE below shows nothing changed)
+--error ER_SECONDARY_ENGINE_PLUGIN
+UPDATE hist SET v = 0 WHERE id = 50;
+--error ER_SECONDARY_ENGINE_PLUGIN
+DELETE FROM hist WHERE id = 50;
+--error ER_SECONDARY_ENGINE_PLUGIN
+DELETE FROM hcopy WHERE id IN (SELECT id FROM hist);
+--error ER_SECONDARY_ENGINE_PLUGIN
+UPDATE hcopy SET v = 1 WHERE id IN (SELECT id FROM hist);
+--error ER_SECONDARY_ENGINE_PLUGIN
+TRUNCATE TABLE hist;
+SELECT COUNT(*) FROM vh;
+CALL ph();
+SET SESSION duckdb_history_scope = LIVE;
+SELECT COUNT(*) FROM hist;
+SELECT v FROM hist WHERE id = 50;
+SELECT COUNT(*) FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) r FROM hist) x;
+SELECT /*+ SET_VAR(duckdb_history_scope = FULL) */ COUNT(*) FROM hist;
+PREPARE s FROM 'SELECT COUNT(*) FROM hist';
+SET SESSION duckdb_history_scope = FULL;
+EXECUTE s;
+SET SESSION duckdb_history_scope = LIVE;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SET GLOBAL duckdb_enable = OFF;
+SET SESSION duckdb_history_scope = FULL;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT COUNT(*) FROM hist;
+SET SESSION duckdb_history_scope = LIVE;
+SET GLOBAL duckdb_enable = ON;
+--source ../include/wait_applier.inc
+--disconnect con_g
+--connection default
+REVOKE DUCKDB_HISTORY_READER ON *.* FROM root@localhost;
+--error ER_SPECIFIC_ACCESS_DENIED_ERROR
+SET SESSION duckdb_history_scope = FULL;
+--source ../include/cleanup.inc

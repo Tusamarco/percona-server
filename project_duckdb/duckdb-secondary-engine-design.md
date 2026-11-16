@@ -242,7 +242,7 @@ We start from a copy of storage/secondary_engine_mock into `storage/duckdb/`. We
 
 Because core code must not change, the plugin reads the binary log. It uses only public interfaces:
 
-- Notification: a `Binlog_storage_observer` registered with `register_binlog_storage_observer()` (sql/replication.h), the API semisync uses. `after_flush` gives the binlog file and position after each group commit, so we never poll.
+- Notification: a `Trans_observer` registered with `register_trans_observer()` (sql/replication.h), the API semisync uses. `after_commit` gives the binlog file and position of each transaction after its InnoDB commit, in binary log order with `binlog_order_commits=ON`, so we never poll and DuckDB never shows a transaction before InnoDB does (`after_sync`, used before, runs before the InnoDB commit; with semi-sync AFTER_SYNC that gap lasts until the replica acknowledges).
 - Parsing: the in-tree event library (`libs/mysql/binlog/event`): `Gtid` events (transaction id and tag), `Table_map`, `Write_rows`, `Update_rows`, `Delete_rows`. Compressed transaction payloads are decoded by the same library. Events for tables that are not loaded are ignored.
 
 ```

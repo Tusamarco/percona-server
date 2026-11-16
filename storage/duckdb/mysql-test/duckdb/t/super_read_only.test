@@ -1,0 +1,73 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#4 (manual-test-plan.md section 18): with super_read_only=ON (a replica)
+# the refresh after DDL still runs (the guard lets the plugin's internal
+# session pass the read-only check), while user statements are refused.
+# The applier is paused (duckdb_enable=OFF) so that the DDL, run before
+# super_read_only is set, is read by the applier after it.
+--source ../include/have_duckdb.inc
+GRANT DUCKDB_HISTORY_READER ON *.* TO root@localhost;
+--connect (con_r, localhost, root,,)
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, 1), (2, 2), (3, 3);
+ALTER TABLE t1 SECONDARY_LOAD;
+CREATE TABLE h1 (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO h1 VALUES (1, 1), (2, 2), (3, 3);
+ALTER TABLE h1 SECONDARY_LOAD;
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
+DELETE FROM h1 WHERE id = 1;
+SET gtid_next = 'AUTOMATIC';
+--source ../include/wait_applier.inc
+--let $refreshes_before= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_ddl_refreshes', Value, 1)
+--let $failures_before= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_ddl_failures', Value, 1)
+
+--echo # Applier paused: it reads the DDL after super_read_only is ON
+SET GLOBAL duckdb_enable = OFF;
+ALTER TABLE t1 MODIFY v BIGINT;
+UPDATE t1 SET v = v + 5000000000 WHERE id = 2;
+ALTER TABLE h1 ADD COLUMN note VARCHAR(10) NOT NULL DEFAULT 'n';
+SET GLOBAL super_read_only = ON;
+SET GLOBAL duckdb_enable = ON;
+--source ../include/wait_applier.inc
+--let $refreshes_after= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_ddl_refreshes', Value, 1)
+--let $failures_after= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_ddl_failures', Value, 1)
+--disable_query_log
+eval SELECT $refreshes_after - $refreshes_before AS refreshes, $failures_after - $failures_before AS failures;
+--enable_query_log
+SELECT @@global.super_read_only;
+
+--echo # User statements are still refused
+--error ER_OPTION_PREVENTS_STATEMENT
+ALTER TABLE t1 SECONDARY_UNLOAD;
+--error ER_OPTION_PREVENTS_STATEMENT
+INSERT INTO t1 VALUES (9, 9);
+
+--echo # The copies are current: DuckDB = InnoDB, archived row kept
+--let $query= SELECT id, v FROM t1 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, v, note FROM h1 ORDER BY id
+--source ../include/duckdb_compare.inc
+SET SESSION use_secondary_engine = ON, duckdb_history_scope = FULL;
+SELECT id, v, note FROM h1 ORDER BY id;
+SET SESSION duckdb_history_scope = LIVE;
+
+SET GLOBAL super_read_only = OFF;
+SET GLOBAL read_only = OFF;
+--disconnect con_r
+--connection default
+REVOKE DUCKDB_HISTORY_READER ON *.* FROM root@localhost;
+--source ../include/cleanup.inc

@@ -1,0 +1,34 @@
+CREATE TABLE t1 (id INT PRIMARY KEY, i BIGINT, u INT UNSIGNED, d DECIMAL(12,3), f DOUBLE,
+dt DATE, tm DATETIME(6), ts TIMESTAMP(3) NULL, s VARCHAR(30) COLLATE utf8mb4_0900_ai_ci,
+l VARCHAR(30) CHARACTER SET latin1, b VARBINARY(20)) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, -5, 7, 1.250, 0.5, '2024-01-31', '2024-01-31 10:11:12.123456', '2024-06-01 01:02:03.456', 'Apple', 'été', 0x00FF);
+ALTER TABLE t1 SECONDARY_LOAD;
+INSERT INTO t1 VALUES (2, 9223372036854775807, 4294967295, -999999999.999, -1e300, '1000-01-01', '9999-12-31 23:59:59.999999', NULL, 'apple ', 'Ä', ''),
+(3, NULL, NULL, NULL, NULL, NULL, NULL, '2038-01-19 03:14:07.000', NULL, NULL, NULL);
+UPDATE t1 SET i = i + 1, s = 'BANANA', d = d * 2 WHERE id = 1;
+DELETE FROM t1 WHERE id = 3;
+INSERT INTO t1 VALUES (3, 3, 3, 3, 3, '2003-03-03', '2003-03-03 03:03:03', '2003-03-03 03:03:03', 'cherry', 'c', 0x03);
+BEGIN;
+UPDATE t1 SET f = f + 1 WHERE id = 2;
+UPDATE t1 SET f = f + 1 WHERE id = 2;
+DELETE FROM t1 WHERE id = 1;
+INSERT INTO t1 VALUES (1, 1, 1, 1, 1, '2001-01-01', '2001-01-01 01:01:01', NULL, 'apple', 'a', 0x01);
+COMMIT;
+# SELECT id, i, u, d, f, dt, tm, ts, s, l, b FROM t1 ORDER BY id
+# A transaction larger than duckdb_apply_batch_max_rows, applied in pieces
+SET @old_rows = @@global.duckdb_apply_batch_max_rows;
+SET GLOBAL duckdb_apply_batch_max_rows = 1000;
+SET SESSION cte_max_recursion_depth = 10000;
+INSERT INTO t1 (id, i) WITH RECURSIVE s(n) AS (SELECT 100 UNION ALL SELECT n + 1 FROM s WHERE n < 3599) SELECT n, n FROM s;
+applied_in_pieces
+1
+SET GLOBAL duckdb_apply_batch_max_rows = @old_rows;
+# SELECT COUNT(*), SUM(i) FROM t1
+# DDL: ADD COLUMN refreshes the copy; RENAME TABLE follows; TRUNCATE
+ALTER TABLE t1 ADD COLUMN extra INT NOT NULL DEFAULT 7;
+# SELECT COUNT(*), SUM(extra) FROM t1
+RENAME TABLE t1 TO t2;
+# SELECT COUNT(*) FROM t2
+TRUNCATE TABLE t2;
+# SELECT COUNT(*) FROM t2
+RENAME TABLE t2 TO t1;

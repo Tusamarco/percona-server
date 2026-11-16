@@ -46,6 +46,9 @@ void unregister_offload_observer(void *plugin);
 /** duckdb_offload_wait_applied of the session (ha_duckdb.cc). */
 bool offload_wait_applied(THD *thd);
 
+/** duckdb_offload_min_rows of the session (ha_duckdb.cc). */
+unsigned long long offload_min_rows(THD *thd);
+
 }  // namespace duckdb_se
 
 #endif  // STORAGE_DUCKDB_DUCKDB_OFFLOAD_H_

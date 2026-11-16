@@ -4,8 +4,11 @@ Lines marked `-- EXPECTED ERROR` must fail with that error: it is the result
 the test checks, not a problem.
 
 Manual checks for what is implemented so far: DWL#1 to DWL#5 and DWL#6
-steps 6a and 6b (sections 1 to 22). They will become the MTR suite `duckdb`
-(postponed, 2026-11-11). Update this file whenever a step adds behavior.
+steps 6a to 6d, A1, A2 and DWL#7 (sections 1 to 34). Since 2026-11-15 most of them are also in the MTR suite
+`storage/duckdb/mysql-test/duckdb` (its README maps tests to sections); the
+sections that need restarts with special options, a replica, semi-sync or
+long runs stay manual. Update this file and the suite whenever a step adds
+behavior.
 
 Reference instance: `/opt/mysql_instances/master96`, schema `windmills_small`,
 test tables `mill1`..`mill10` (see DWL-03, Reference test tables).
@@ -632,6 +635,54 @@ SELECT @@gtid_executed;                            -- equal to the source's
 --    GTID of its own (no refresh or load written to its binary log).
 -- 5. Replica restart and replica stopped while the source writes: no loss,
 --    nothing applied twice.
+-- 6. History table (SECONDARY_ENGINE_ATTRIBUTE '{"retain_history": true}')
+--    with a tagged purge on the source
+--    (SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge'; DELETE ...): the tag
+--    reaches the replica's binary log; purge_transactions and archived_rows
+--    move on the replica; untagged deletes are deleted.
+-- 7. FULL scope on the replica: DUCKDB_HISTORY_READER must be granted on the
+--    replica itself with sql_log_bin = 0 (a source without the plugin does
+--    not know the privilege: GRANT is a syntax error there). FULL shows live
+--    and archived rows; FULL + OFF stopped by the guard.
+-- 8. Weight strings: a utf8mb4_0900_ai_ci column, GROUP BY and WHERE on it.
+-- 9. Offloaded joins, subqueries, UNION, COUNT(DISTINCT) on the replica:
+--    same as InnoDB, or refused for the documented reasons.
+```
+
+Helpers used for the run (compare OFF and FORCED on the replica after
+waiting for the replica and the reader):
+`WAIT_FOR_EXECUTED_GTID_SET('<source gtid_executed>', 300)`, then wait until
+`duckdb_apply_reader_state = 'idle'` and `duckdb_apply_reader_position` >=
+`SHOW BINARY LOG STATUS` position.
+
+Notes from the 2026-11-15 run:
+
+- `ALTER TABLE ... SECONDARY_LOAD` and `SECONDARY_UNLOAD` are written to the
+  binary log with a GTID (server behaviour). On a replica they must run with
+  `sql_log_bin = 0`, otherwise each one is an errant GTID.
+- Local writes on the replica are errant GTIDs as always; use
+  `super_read_only` on real replicas.
+- Found (guard, not replica specific): a single-table `UPDATE` or `DELETE`
+  of a history table under FULL scope was not stopped: the guard listened to
+  READ events only, and the target table of an UPDATE or DELETE raises an
+  UPDATE or DELETE event. Fixed 2026-11-16: the guard also listens to UPDATE
+  and DELETE (MTR `guard`).
+- Found: with `super_read_only = ON` on the replica, the refresh after a
+  replicated DDL failed (error 1290: the internal `ALTER TABLE ...
+  SECONDARY_LOAD` is refused) and the copy became stale.
+  `SECONDARY_LOAD`/`UNLOAD` and the GRANT by hand are refused too (expected).
+  Fixed 2026-11-16: the guard lets the internal session pass the read-only
+  check (DWL-04, Replicas; MTR `super_read_only`).
+
+```sql
+-- 10. super_read_only on the replica (requires duckdb_guard ACTIVE)
+SET GLOBAL super_read_only = ON;                  -- replica
+-- source: ALTER TABLE ... MODIFY / ADD COLUMN / RENAME / TRUNCATE on a
+-- classic and a history table, then DML
+-- replica: duckdb_apply_ddl_refreshes moves, duckdb_apply_ddl_failures does
+-- not; DuckDB = InnoDB; FULL keeps the archived rows; error log
+-- "refreshed ... after DDL"; gtid_executed has no new replica GTID.
+-- User statements still refused (1290): SECONDARY_UNLOAD, INSERT.
 ```
 
 ## 19. History copies: reattach, resync, adopt, discard, step 3b (DWL#3)
@@ -908,10 +959,373 @@ GROUP BY b4` may show `a` on InnoDB and `a ` in DuckDB (equal under
 utf8mb4_bin; MySQL groups by sorting there and does not define which value
 of the group is shown). DWL-06, Lessons from step 6b.
 
+## 23. Query offload, step 6c-1 (DWL#6)
+
+Tables of `duckdb_offload_setup.sql`: g, p6, plus dim (7 rows: groups 0-4,
+8, 9; `label` utf8mb4_bin, `ci` utf8mb4_0900_ai_ci), hist (history table,
+100 rows, 30 purged = archived), nl (no secondary engine) and the view v6.
+The setup purges hist with the tag: the account needs TRANSACTION_GTID_TAG.
+
+```bash
+cd project_duckdb
+export MYSQL="mysql -S /opt/mysql_instances/master96/mysql.sock -u dba -p<password> windmills_small"
+$MYSQL < duckdb_offload_setup.sql                    # re-creates all test tables
+./duckdb_offload_compare.sh duckdb_offload_6c_queries.sql                  # 37/37 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6c_refusals.sql  # 5/5 (set operations moved to 6c-2, NOT IN to 6c-3)
+./duckdb_offload_compare.sh duckdb_offload_6a_queries.sql                  # 19/19
+./duckdb_offload_compare.sh duckdb_offload_6b_queries.sql                  # 45/45
+EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6b_refusals.sql  # 12/12 (two moved to 6c)
+```
+
+```sql
+-- 1. A table without a DuckDB copy in the query
+SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
+SELECT COUNT(*) FROM p6 JOIN nl ON nl.grp = p6.grp;      -- InnoDB answers (5715)
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM p6 JOIN nl ON nl.grp = p6.grp;      -- EXPECTED ERROR 3889: ... [windmills_small.nl]
+
+-- 2. History table in joins (FORCED; FULL needs DUCKDB_HISTORY_READER)
+SELECT COUNT(h.id) FROM dim d LEFT JOIN hist h ON h.grp = d.grp;   -- LIVE: 49
+SELECT COUNT(*) FROM dim d WHERE EXISTS (SELECT 1 FROM hist h WHERE h.grp = d.grp AND h.v < 10);  -- LIVE: 0
+SET SESSION duckdb_history_scope = FULL;
+SELECT COUNT(h.id) FROM dim d LEFT JOIN hist h ON h.grp = d.grp;   -- FULL: 70
+SELECT COUNT(*) FROM dim d WHERE EXISTS (SELECT 1 FROM hist h WHERE h.grp = d.grp AND h.v < 10);  -- FULL: 7
+SET SESSION duckdb_history_scope = LIVE;
+
+-- 3. The session's optimizer_switch is unchanged after offload, refusal or fallback
+SELECT @@optimizer_switch LIKE '%,materialization=on%';  -- 1 before and after
+SELECT d.grp FROM dim d WHERE EXISTS (SELECT 1 FROM p6 WHERE p6.grp = d.grp);
+SELECT @@optimizer_switch LIKE '%,materialization=on%';  -- 1
+
+-- 4. The generated SQL of a join (aliases t0, t1, ...; EXISTS for IN)
+SET optimizer_trace = 'enabled=on';
+SELECT COUNT(*) FROM p6 WHERE grp IN (SELECT grp FROM dim WHERE region = 1);
+SELECT TRACE FROM information_schema.OPTIMIZER_TRACE\G   -- ... WHERE EXISTS (SELECT 1 FROM ... AS t1 WHERE ...)
+SET optimizer_trace = 'enabled=off';
+SET SESSION use_secondary_engine = ON;
+```
+
+## 24. The applier waits for the InnoDB commit (DWL#4, 2026-11-13)
+
+Semi-sync with no replica holds each commit after the binary log sync and
+before the InnoDB commit, for `rpl_semi_sync_source_timeout`: the window in
+which a transaction is in the binary log but not visible in InnoDB.
+
+```sql
+-- 1. SECONDARY_LOAD requires binlog_order_commits=ON
+SET GLOBAL binlog_order_commits = OFF;
+ALTER TABLE dim SECONDARY_UNLOAD;
+ALTER TABLE dim SECONDARY_LOAD;      -- EXPECTED ERROR 3877: ... requires binlog_order_commits=ON
+SET GLOBAL binlog_order_commits = ON;
+ALTER TABLE dim SECONDARY_LOAD;
+
+-- 2. The window (needs the semisync_source plugin in the plugin directory)
+INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
+SET GLOBAL rpl_semi_sync_source_timeout = 8000, rpl_semi_sync_source_enabled = ON;
+SHOW BINARY LOG STATUS;              -- note the position
+```
+
+```sql
+-- session A (blocks about 8 s):
+INSERT INTO dim VALUES (50, 'fifty', 'f', 5, 'F');
+```
+
+```sql
+-- session B, during the wait:
+SHOW BINARY LOG STATUS;              -- the position has moved: the INSERT is in the binary log
+SET SESSION use_secondary_engine = OFF;
+SELECT COUNT(*) FROM dim WHERE grp = 50;   -- 0 (InnoDB has not committed)
+SET SESSION use_secondary_engine = FORCED, duckdb_offload_wait_applied = OFF;
+SELECT COUNT(*) FROM dim WHERE grp = 50;   -- 0 (DuckDB does not show it either)
+-- after session A returns (and about 1 s): both 1
+SET SESSION use_secondary_engine = ON, duckdb_offload_wait_applied = ON;
+SET GLOBAL rpl_semi_sync_source_enabled = OFF;
+UNINSTALL PLUGIN rpl_semi_sync_source;
+DELETE FROM dim WHERE grp = 50;
+```
+
+## 25. Query offload, step 6c-2 (DWL#6)
+
+Same tables (`duckdb_offload_setup.sql`).
+
+```bash
+cd project_duckdb
+./duckdb_offload_compare.sh duckdb_offload_6c2_queries.sql                  # 26/26 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6c2_refusals.sql  # 6/6 refused as expected
+# regressions: 6a 19/19, 6b 45/45, 6c 37/37, refusals 12/12 and 5/5
+```
+
+```sql
+SET SESSION use_secondary_engine = FORCED;
+-- 1. FOUND_ROWS() as on InnoDB
+SELECT grp FROM dim UNION ALL SELECT grp FROM dim WHERE grp < 3;
+SELECT FOUND_ROWS();                                    -- 10
+-- 2. Mixed kinds are refused
+SELECT ts FROM p6 WHERE id < 5 UNION ALL SELECT dt FROM p6 WHERE id < 5 ORDER BY 1;
+-- EXPECTED ERROR 3877: ... set_operation_mixed_types
+-- 3. The generated SQL
+SET optimizer_trace = 'enabled=on';
+SELECT grp FROM dim UNION SELECT grp FROM p6 UNION ALL SELECT grp FROM dim ORDER BY 1;
+SELECT TRACE FROM information_schema.OPTIMIZER_TRACE\G -- ((...) UNION (...) UNION ALL (...)) AS t3 ORDER BY t3.c1
+SET optimizer_trace = 'enabled=off';
+SET SESSION use_secondary_engine = ON;
+```
+
+## 26. Query offload, step 6c-3 (DWL#6)
+
+Same tables (`duckdb_offload_setup.sql`); dim.region and p6.qty have NULLs.
+
+```bash
+cd project_duckdb
+./duckdb_offload_compare.sh duckdb_offload_6c3_queries.sql                  # 33/33 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6c3_refusals.sql  # 5/5 refused as expected
+# regressions: 6a 19/19, 6b 45/45, 6c 37/37, 6c2 26/26; refusals 12/12, 5/5, 6/6
+```
+
+```sql
+-- 1. A scalar subquery with more than one row: error 1242 in both
+SET SESSION use_secondary_engine = OFF;
+SELECT COUNT(*) FROM dim WHERE grp = (SELECT grp FROM p6 WHERE id < 10);
+-- EXPECTED ERROR 1242: Subquery returns more than 1 row
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM dim WHERE grp = (SELECT grp FROM p6 WHERE id < 10);
+-- EXPECTED ERROR 1242: Subquery returns more than 1 row (DuckDB error: Invalid Input Error: More than one row ...)
+SELECT d.grp FROM dim d ORDER BY (SELECT p6.qty FROM p6 WHERE p6.grp = d.grp), d.grp;
+-- EXPECTED ERROR 1242: ... (DuckDB error: ... scalar subqueries can only return a single row ...)
+-- 2. The SQL of an IN left as a subquery (no LIMIT 1, no in-to-exists condition)
+SET optimizer_trace = 'enabled=on';
+SELECT d.grp, d.region NOT IN (SELECT region FROM dim WHERE grp > 7) FROM dim d ORDER BY 1;
+SELECT TRACE FROM information_schema.OPTIMIZER_TRACE\G -- (NOT (t0."region" IN (SELECT ... WHERE (t1."grp" > 7))))
+SET optimizer_trace = 'enabled=off';
+SET SESSION use_secondary_engine = ON;
+```
+
+## 27. Cached tables, KILL and timeout, step 6d-2 (DWL#6)
+
+```sql
+-- 1. A cached secondary table across unload/reload, DROP + re-create, enable OFF/ON
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM dim;                              -- 7 (the server caches the table)
+ALTER TABLE dim SECONDARY_UNLOAD;
+SELECT COUNT(*) FROM dim;                              -- EXPECTED ERROR 3877: Table has not been loaded
+ALTER TABLE dim SECONDARY_LOAD;
+SELECT COUNT(*) FROM dim;                              -- 7
+SET GLOBAL duckdb_enable = OFF;
+SELECT COUNT(*) FROM dim;                              -- EXPECTED ERROR 3877: Table has not been loaded
+SET GLOBAL duckdb_enable = ON;                         -- wait a few seconds
+SELECT COUNT(*) FROM dim;                              -- 7
+
+-- 2. KILL QUERY (session A runs, session B kills after a few seconds)
+-- A:
+SELECT COUNT(*) FROM g JOIN p6 ON g.amount < p6.amount;
+-- B:
+SELECT id FROM information_schema.processlist WHERE info LIKE 'SELECT COUNT(*) FROM g JOIN%';
+KILL QUERY <id>;
+-- A, within about a second:
+-- EXPECTED ERROR 1317: Query execution was interrupted (DuckDB error: INTERRUPT Error: Interrupted!)
+SHOW GLOBAL STATUS LIKE 'duckdb_executor_threads_busy';   -- 0
+
+-- 3. max_execution_time
+SET SESSION max_execution_time = 1500;
+SELECT COUNT(*) FROM g JOIN p6 ON g.amount < p6.amount;
+-- EXPECTED ERROR 3024: Query execution was interrupted, maximum statement execution time exceeded (DuckDB error: ...)
+SET SESSION max_execution_time = 0;
+SET SESSION use_secondary_engine = ON;
+```
+
+Stress (optional, bash): two sessions run an offloaded join every 0.3 s while
+a third runs `ALTER TABLE dim SECONDARY_UNLOAD; ALTER TABLE dim
+SECONDARY_LOAD` six times: every query gives the right count or "Table has
+not been loaded"; the server stays up.
+
+## 28. EXPLAIN with the DuckDB SQL and plan, step 6d-1 (DWL#6)
+
+```sql
+SET SESSION use_secondary_engine = FORCED;
+EXPLAIN FORMAT=TREE SELECT d.name, COUNT(*) FROM p6 JOIN dim d ON d.grp = p6.grp WHERE p6.qty > 0 GROUP BY d.name ORDER BY 1;
+SHOW WARNINGS;     -- Note 1003, Note 3877 "DuckDB SQL: SELECT ...", Notes 3877 "DuckDB plan (1/n) ..."
+EXPLAIN FORMAT=JSON SELECT COUNT(*) FROM p6 WHERE grp IN (SELECT grp FROM dim);
+SHOW WARNINGS;     -- the same notes
+SET SESSION use_secondary_engine = ON;
+EXPLAIN SELECT ci, COUNT(*) FROM dim GROUP BY ci;
+SHOW WARNINGS;     -- no DuckDB notes (refused: collation)
+EXPLAIN ANALYZE SELECT COUNT(*) FROM p6;   -- with FORCED: EXPECTED ERROR 1235 (server)
+```
+
+## 29. Performance, step 6d-3 (DWL#6): release build, production-like workload
+
+Release build (separate directory, the debug build stays as it is):
+
+```bash
+mkdir -p /opt/mysql_source/percona-server-9.7-release && cd /opt/mysql_source/percona-server-9.7-release
+cmake ../percona-server -DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21 \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DDUCKDB_BUILD_TYPE=RelWithDebInfo \
+  -DWITH_DUCKDB=ON -DWITH_UNIT_TESTS=OFF -DWITH_ROUTER=OFF \
+  -DWITH_SSL=system -DWITH_CURL=system -DWITH_LDAP=system -DWITH_KERBEROS=system \
+  -DCOMPILATION_COMMENT="Marco compile 9.7 with DuckDB (release)"
+cmake --build . -j 6 --target mysqld duckdb mysql mysqladmin
+# runtime_output_directory/mysqld and plugin_output_directory/ha_duckdb.so
+```
+
+Workload, on an instance running the release mysqld and plugin (a database
+`perf`; the setup needs TRANSACTION_GTID_TAG, q12 needs DUCKDB_HISTORY_READER):
+
+```bash
+cd project_duckdb/perf
+(echo "SET @turbines = 200, @days = 365;"; cat duckdb_perf_setup.sql) | mysql ... perf
+export MYSQL="mysql -S <socket> -u dba -p<password> perf"
+./duckdb_perf_run.sh                      # RUNS=3 by default: median of 3
+# columns: query, ran_in (InnoDB/DuckDB), innodb_s, duckdb_s, speedup, note
+# expected: no "RESULTS DIFFER"; q13-q16 on InnoDB (lookup, index range,
+# _ci collation, window function); the reports in DuckDB
+```
+
+## 30. Exact division, AVG, and duckdb_offload_min_rows (DWL#6, 2026-11-14)
+
+```bash
+cd project_duckdb
+$MYSQL < duckdb_offload_setup.sql                                         # adds table dv
+./duckdb_offload_compare.sh duckdb_offload_div_queries.sql                # 18/18 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6b_refusals.sql # 11/11 (qty / 3 moved to the division list)
+# regressions: 6a 19/19, 6b 45/45, 6c 37/37, 6c2 26/26, 6c3 33/33, refusals 5/5, 6/6, 5/5
+```
+
+```sql
+-- duckdb_offload_min_rows on the perf database (section 29), with ON:
+SET SESSION use_secondary_engine = ON;
+SELECT * FROM reading WHERE id = 1234567;                    -- InnoDB (not tried)
+SELECT ts, power_kw FROM reading WHERE turbine_id = 42 AND ts >= '2025-12-31 23:00:00';  -- InnoDB
+SELECT turbine_id, COUNT(*) FROM reading WHERE turbine_id IN (SELECT id FROM turbine WHERE site_id = 3) GROUP BY turbine_id;
+SHOW GLOBAL STATUS LIKE 'duckdb_offload_queries';            -- +1 (cost below the threshold, tried by the rule)
+SET SESSION duckdb_offload_min_rows = 0;                     -- the same query stays on InnoDB
+```
+
+## 31. Moving the lake, duckdb_lake_relocate (DWL#2, 2026-11-14)
+
+On a throwaway instance (stop it first; paths are examples):
+
+```bash
+mv /path/inst /path/inst_moved
+sed -i "s|/path/inst|/path/inst_moved|g" /path/inst_moved/my.cnf /path/inst_moved/logs/binlog.index
+mysqld --defaults-file=/path/inst_moved/my.cnf &
+# error log: DuckDB lake moved: the catalog's data path .../inst/duckdb_data/data/ is now .../inst_moved/duckdb_data/data/
+# queries in DuckDB give the same results; a second restart logs no move
+# with --loose-duckdb-lake-relocate=OFF after another move: "cannot attach ... (with duckdb_lake_relocate=ON ...)", plugin not loaded
+# with a Parquet file of data/ moved away: "... 1 of its N files are not under ...: not relocated", plugin not loaded
+```
+
+## 32. Weight strings, storage (DWL#6 step A1, 2026-11-14)
+
+```sql
+CREATE TABLE wt (id INT PRIMARY KEY, c VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, g VARCHAR(20) COLLATE utf8mb4_general_ci,
+  l VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_swedish_ci, b VARCHAR(20) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO wt VALUES (1, 'apple', 'apple', 'été', 'x'), (2, 'Apple', 'APPLE  ', 'ETE', 'x '), (3, 'ápple', 'apple ', 'ete', 'X'),
+  (4, 'banana', 'Banana', 'Ä', 'y'), (5, NULL, NULL, NULL, NULL), (6, '', '', '', ''), (7, 'apple ', 'apple', 'été ', 'x'), (8, 'zebra', 'ZEBRA', 'z', 'z');
+ALTER TABLE wt SECONDARY_LOAD;
+INSERT INTO wt VALUES (9, 'APPLE', 'Apple', 'ÉTÉ', 'x'), (10, 'Zebra', 'zebra  ', 'Z', 'Z');
+UPDATE wt SET c = 'BANANA', l = 'ä' WHERE id = 4;
+SELECT COUNT(DISTINCT c), COUNT(DISTINCT g), COUNT(DISTINCT l) FROM wt;   -- 5 4 4
+```
+
+Stop the server, then inspect the lake with `tools/duckq` (build line in
+`tools/duckq.c`):
+
+```bash
+L=<datadir or duckdb_data_path>
+./duckq :memory: "ATTACH 'ducklake:$L/catalog.ducklake' AS lake (DATA_PATH '$L/data/', READ_ONLY)" \
+  "SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE database_name='lake' AND table_name='wt'" \
+  "SELECT count(DISTINCT __w_c), count(DISTINCT __w_g), count(DISTINCT __w_l) FROM lake.<db>.wt" \
+  "SELECT count(*) FILTER (WHERE c IS NOT NULL AND __w_c IS NULL) FROM lake.<db>.wt"
+# id,c,g,l,b,__w_c,__w_g,__w_l   (no weight for utf8mb4_bin)
+# 5 4 4                           (as MySQL)
+# 0                               (applier rows have weights)
+```
+
+History table: purge rows with the tag, `ALTER TABLE ... SECONDARY_LOAD`
+(resync), then `ALTER TABLE ... MODIFY c ... COLLATE utf8mb4_0900_as_cs`:
+with duckq, archived rows have weights (none missing) and their distinct
+count follows the new collation.
+
+## 33. Weight strings, queries (DWL#6 step A2, 2026-11-14)
+
+```bash
+cd project_duckdb
+$MYSQL < duckdb_offload_setup.sql                                          # adds cw, cwd (weights)
+./duckdb_offload_compare.sh duckdb_offload_a2_queries.sql                  # 32/32 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_a2_refusals.sql  # 7/7 refused as expected
+# regressions: 6a 19/19, 6b 45/45, 6c 37/37, 6c2 26/26, 6c3 33/33, div 18/18;
+# refusals 6b 9/9, 6c 4/4 (three _ci cases moved to the A2 list), 6c2 6/6, 6c3 5/5
+```
+
+A copy loaded before A1 has no weights: a query on its `_ci` columns is
+refused with "copy without weights: reload it" (SECONDARY_UNLOAD +
+SECONDARY_LOAD, or SECONDARY_LOAD for a history table).
+
+## 34. FULL scope guard (DWL#7, 2026-11-15)
+
+Needs DUCKDB_HISTORY_READER; table hist of duckdb_offload_setup.sql (70 live,
+30 archived), plus:
+
+```sql
+-- FULL scope needs the privilege (nobody has it until granted, root
+-- included): without it the SET below fails with error 1227 and the session
+-- stays LIVE, so none of the checks apply. Grant it, then reconnect.
+GRANT DUCKDB_HISTORY_READER ON *.* TO CURRENT_USER();
+
+CREATE OR REPLACE VIEW vh AS SELECT id, grp, v FROM hist;
+DROP PROCEDURE IF EXISTS ph;
+CREATE PROCEDURE ph() SELECT COUNT(*) FROM hist;
+DROP TABLE IF EXISTS hcopy;
+CREATE TABLE hcopy (id INT PRIMARY KEY, v INT);
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM information_schema.PLUGINS WHERE PLUGIN_NAME LIKE 'duckdb%';  -- duckdb, duckdb_guard ACTIVE
+
+SET SESSION use_secondary_engine = OFF, duckdb_history_scope = FULL;   -- must succeed
+SELECT @@session.duckdb_history_scope;                                    -- FULL
+SELECT COUNT(*) FROM hist;        -- EXPECTED ERROR 3877: ... requires DuckDB execution, but use_secondary_engine=OFF
+SET SESSION use_secondary_engine = ON;
+SELECT COUNT(*) FROM hist;        -- 100 (below the cost threshold, forced to DuckDB)
+SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM hist LIMIT 1;   -- EXPECTED ERROR 3877: ... window
+INSERT INTO hcopy SELECT id, v FROM hist;                       -- EXPECTED ERROR 3877: ... only a SELECT can read it
+SELECT COUNT(*) FROM hcopy;                                     -- 0
+SELECT COUNT(*) FROM vh; CALL ph();                             -- 100, 100
+SET SESSION duckdb_history_scope = LIVE;
+SELECT COUNT(*) FROM hist;                                      -- 70
+SELECT /*+ SET_VAR(duckdb_history_scope = FULL) */ COUNT(*) FROM hist;   -- 100
+PREPARE s FROM 'SELECT COUNT(*) FROM hist';
+SET SESSION duckdb_history_scope = FULL;  EXECUTE s;            -- 100
+SET SESSION duckdb_history_scope = LIVE;  EXECUTE s;            -- 70
+SET GLOBAL duckdb_enable = OFF;
+SET SESSION duckdb_history_scope = FULL;
+SELECT COUNT(*) FROM hist;        -- EXPECTED ERROR 3877: ... the DuckDB lake is not open
+SET GLOBAL duckdb_enable = ON;
+SET SESSION duckdb_history_scope = LIVE;
+SHOW GLOBAL STATUS LIKE 'duckdb_guard%';
+-- restart with --loose-duckdb-guard=OFF: SET duckdb_history_scope = FULL;
+--   EXPECTED ERROR 3877: ... requires the duckdb_guard plugin, which is not active
+```
+
 ## Results log
 
 | Date | Build | Sections run | Result | Notes |
 |---|---|---|---|---|
+| 2026-11-16 | clang-21, C++23, debug | MTR suite (16 tests, --parallel=2, --testcase-timeout=45) | pass | all 16 pass after the guard and super_read_only changes (new test super_read_only). A first run timed out in guard's setup (200k-row INSERT took 15 min with swap full): not a plugin problem; tests took 1-22 min each on the loaded machine |
+| 2026-11-16 | clang-21, C++23, debug | 18 cases 7 and 10, guard and super_read_only fixes (replica pair 3402/3403, MTR guard, super_read_only) | pass after fixes | guard: UPDATE, DELETE, TRUNCATE, DELETE and UPDATE with a subquery on a history table stopped under FULL, nothing changed (MTR guard). super_read_only=ON on the replica: before the fix the refresh failed (1290) and mt and rh went stale; rh could not be reattached (MODIFY BIGINT + ADD COLUMN: 2 differences, archived rows lost on that test table). After: classic mt MODIFY BIGINT, RENAME, TRUNCATE of r1b, history rh2 MODIFY BIGINT + ADD COLUMN: 4 refreshes, 0 failures, DuckDB = InnoDB, FULL 842 with archived rows; SECONDARY_UNLOAD and INSERT by root refused (1290); no new replica GTID. Seen: srv_session THDs are not audited (m_audited=false): the internal session enables auditing |
+| 2026-11-15 | clang-21, C++23, debug | 18, replica (throwaway source 3402 without the plugin, replica 3403 with it) | pass, one open point | CREATE TABLE ... SECONDARY_ENGINE=duckdb and retain_history attribute accepted by the source without the plugin; load on the replica with sql_log_bin=0: gtid_executed equal. DML and a 55k-row transaction in 6 pieces (batch_max_rows 10000): DuckDB = InnoDB. MODIFY BIGINT, ADD COLUMN, RENAME, TRUNCATE: replication never stopped, 3 refreshes, 1 rename, 0 failures. 8 concurrent source sessions, 4 parallel workers (all used): equal, no errant GTID. STOP REPLICA during writes and a replica restart during writes: caught up, equal. Tagged purge: tag in the replica's GTID set, 1 purge, 100 archived rows; FULL 990 rows (890 live + 100 archived), FULL+OFF stopped. Joins, IN and scalar subqueries, COUNT(DISTINCT) equal; a grouped _ci name in a join and a UNION of _ci columns refused (documented). Seen: SECONDARY_LOAD/UNLOAD are binlogged (errant GTID without sql_log_bin=0); DUCKDB_HISTORY_READER must be granted on the replica locally. Open point: UPDATE of a history table under FULL not stopped by the guard (UPDATE event, not READ) |
+| 2026-11-15 | clang-21, C++23, debug | MTR suite storage/duckdb/mysql-test/duckdb (15 tests, --parallel=2) | pass after fixes | all 15 pass (replay without --record: 14, history fixed to record counter deltas, then passed after guard on the same server). Fixed while building it: wait include forced to the secondary engine in FORCED sessions, trailing SQL comments in includes, duckdb_discard_stale_copy / duckdb_apply_start_position kept their last value (now empty after running, plugin change), reader state 'waiting to commit' added so that 'idle' means everything committed (plugin change). About 1.5 hours on the HDD machine |
+| 2026-11-15 | clang-21, C++23, debug | 34, DWL#7 (throwaway instance) | pass | guard ACTIVE; FULL+OFF error; FULL+ON below threshold 100 (LIVE 70); window under FULL: error; hint, view, procedure correct; INSERT ... SELECT stopped; prepared statement FULL 100 / LIVE 70 / OFF 70; duckdb_enable=OFF and stale copy stopped; guard disabled: FULL refused; regressions all pass (A2 Q29 needed a tie-breaker: 't' and 'T' are equal in 0900_ai_ci) |
+| 2026-11-14 | clang-21, C++23, debug | 33, step A2 (throwaway instance) | pass | A2 32/32 identical and offloaded at the first run, refusals 7/7; regressions all pass; three earlier _ci refusals now offloaded (identical) and moved |
+| 2026-11-14 | clang-21, C++23, debug | 32, step A1 (throwaway instance) | pass | weight columns for 0900_ai_ci, general_ci, latin1 (none for utf8mb4_bin); distinct weights = MySQL COUNT(DISTINCT) 5/4/4; applier rows weighted; history archived rows weighted after resync, recomputed after a collation change (as_cs: 6); reattach structure check passes; unit tests 39; all offload lists pass after reloading every test table |
+| 2026-11-14 | clang-21, C++23, debug | 31 (throwaway instance) | pass | moved with relocate ON: logged, same results, next start normal; OFF: refused, plugin not loaded; a missing Parquet file: refused (1 of 13 files); moved back: relocated. The perf instance was moved to /opt/mysql_instances/duckdb_perf the same day by updating the catalog by hand (before this variable existed). Regressions all pass |
+| 2026-11-14 | clang-21, C++23, debug + release | 30 (throwaway instances) | pass after fixes | exact division and AVG 18/18 with div_precision_increment 0, 4, 9; regressions all pass. min_rows rule: PK lookup and index range not tried, a non-unique lookup join tried and offloaded. Fixed during the test: rounding where MySQL truncates (increments 0, 9), F digits where MySQL uses the rounded value (a / b * 2), an overflow scaling decimals by 10^18 |
+| 2026-11-13 | clang-21, C++23, RelWithDebInfo | 29, step 6d-3 (throwaway release instance, 10.5M readings) | pass, findings | all results identical; offloaded 55x-584x (q02 31.9 s -> 0.055 s); load of 10.5M rows 15.4 s. Not offloaded although heavy: _ci collations (GROUP BY names, string literals), exact decimal division, InnoDB cost underestimate (382 vs 52,560 rows per key) below the threshold. perf/results-2026-11-13-release.txt |
+| 2026-11-13 | clang-21, C++23, debug | 29, workload check (throwaway instance, 20 turbines x 30 days) | pass | setup and runner work; all results identical; at 86,400 readings most queries stay below the default cost threshold (InnoDB); q15 refused (collation:name), q16 (window); debug timings not meaningful (release build compiling at the same time) |
+| 2026-11-13 | clang-21, C++23, debug | 28, step 6d-1 (throwaway instance) | pass | EXPLAIN TREE, JSON and traditional: note with the DuckDB SQL and DuckDB's plan in 7 to 10 numbered notes; no notes for a refused query or outside EXPLAIN |
+| 2026-11-13 | clang-21, C++23, debug | 27, step 6d-2 (throwaway instance) | pass | registry entries never freed: cached tables across unload/reload, RENAME and back, DROP + re-create, enable OFF/ON, history DROP + discard + re-create; stress with two sessions during six unload/load cycles (about 680 queries, right result or clean refusal, no crash). KILL QUERY: DuckDB interrupted in about 1 s, executor freed, error 1317 with DuckDB's message; max_execution_time: 3024. Regressions all pass. Seen: loads took up to 22 s while the release build ran (HDD) |
+| 2026-11-13 | clang-21, C++23, debug | 26, step 6c-3 (throwaway instance) | pass after fixes | 6c-3 33/33 identical and offloaded, refusals 5/5; regressions 6a 19/19, 6b 45/45, 6c 37/37, 6c-2 26/26, refusals 12/12, 5/5, 6/6; 1242 with both messages for a scalar subquery with several rows. Fixed: 6c-1 returned rows instead of error 1242 for a rewritten scalar subquery with several rows (m_reject_multiple_rows ignored); a crash on IN in the select list (Item_in_optimizer has one argument at first); IN and NOT IN wrong with the in-to-exists LIMIT 1 (m_internal_limit) |
+| 2026-11-13 | clang-21, C++23, debug | 23, 24, 25, steps 6c-1, 6c-2, after_commit (reference instance) | pass | reported by Marco: all lists as expected |
+| 2026-11-13 | clang-21, C++23, debug | 25, step 6c-2 (throwaway instance) | pass after a fix | 6c-2 26/26 identical and offloaded, refusals 6/6; regressions 6a 19/19, 6b 45/45, 6c 37/37, refusals 12/12 and 6/6; FOUND_ROWS() 10 and 2 as InnoDB. Fixed: TIMESTAMP UNION ALL DATETIME was offloaded with TIMESTAMP values in UTC (one hour off): the NULL-literal test used is_null() on a column; a FROM-less operand (SELECT 'x') was refused as no_table |
+| 2026-11-13 | clang-21, C++23, debug | 24 (throwaway instance) | pass | reader woken by after_commit: during an 8 s semi-sync wait the binary log had moved (481 -> 798), InnoDB 0, DuckDB 0; both 1 after the commit. SECONDARY_LOAD refused with binlog_order_commits=OFF. Regressions after the change: 6a 19/19, 6b 45/45, 6c 37/37, refusals 12/12 and 8/8, unit tests 38. Seen: a batch of three tables took about 4 s to commit (HDD), so a query right after it can exceed the 5 s freshness wait (applier_behind); re-running the setup reattached the old hist copy (FULL 130 rows): the setup now discards it |
+| 2026-11-13 | clang-21, C++23, debug | 23, step 6c-1 (throwaway instance) | pass after fixes | 6c 37/37 identical and offloaded, 6c refusals 8/8, regressions 6a 19/19, 6b 45/45, 6b refusals 12/12; table without copy: InnoDB with ON, 3889 with FORCED; hist LIVE 49/0, FULL 70/7; optimizer_switch unchanged after offload, refusal and fallback. Fixed during the test: NOT EXISTS crashed the server in the join planner (statement-wide best cost in compare_secondary_engine_cost); EXISTS refused (semi-join materialization rewrote WHERE to <subquery2>); YEAR() column of a derived table refused. Seen: correlated scalar subqueries are rewritten by the server into joins and offloaded |
 | 2026-11-13 | clang-21, C++23, debug | 22, step 6b (reference instance) | pass | setup with duckdb_offload_setup.sql; 45/45 identical and offloaded, 14/14 refused as expected, 6a regression 19/19 |
 | 2026-11-12 | clang-21, C++23, debug | 22, step 6b (throwaway instance) | pass after fixes | 45/45 identical and offloaded, 14/14 refused as expected, 6a 19/19; TIMESTAMP ranges and DST-ambiguous IN lists equal under +05:30, -08:00, SYSTEM. Fixed during the test: a server crash on GROUP BY DAYOFWEEK(dt) (holders typed from the select list instead of JOIN::fields, which the metadata used); YEAR() refused (result type YEAR); integer DIV refused as exact division; SUM of DECIMAL refused above 38 digits; MIN/MAX of utf8mb4_bin ties ('' and ' ') picked a different row; LIKE on a binary column failed in DuckDB's binder; b4 = 1 failed at execution instead of being refused. Accepted: representative of a PAD group under sort-based grouping |
 | 2026-11-07 | clang-21, C++23, debug | 1 | pass | smoke test, 480 files C++23 |

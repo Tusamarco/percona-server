@@ -77,6 +77,12 @@ loose-duckdb_threads      = 8
    0750, and a missing `catalog.ducklake` is created.
 6. If `data/` contains files and `catalog.ducklake` is missing, plugin
    initialization fails with an error asking the DBA to restore the catalog.
+6a. If the catalog stores another data path than the configured one (the
+   lake was moved or restored elsewhere), `duckdb_lake_relocate` (global,
+   default ON, added 2026-11-14) decides: ON attaches with the configured
+   path when every data and delete file of the current snapshot is under
+   it, updates the path stored in the catalog and logs a warning; a missing
+   file, or OFF, refuses to open the lake (plugin not loaded at startup).
 7. Plugin initialization fails if the resolved path is the datadir itself or
    inside a schema directory, or if the directory is world-writable.
 8. A warning is logged if the path is inside `secure_file_priv`, if

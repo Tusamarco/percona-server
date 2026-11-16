@@ -1,0 +1,74 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#6: when a query is tried in DuckDB (cost threshold,
+# duckdb_offload_min_rows), writes in a transaction, EXPLAIN notes,
+# max_execution_time (sections 21, 27, 28, 30).
+--source ../include/have_duckdb.inc
+--source ../include/tables_g.inc
+
+--echo # Below the cost threshold: InnoDB; duckdb_offload_min_rows tries a full scan of g
+SET SESSION use_secondary_engine = ON, duckdb_offload_min_rows = 0;
+--let $before= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_queries', Value, 1)
+SELECT COUNT(*) FROM g WHERE n = 3;
+--let $after= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_queries', Value, 1)
+--disable_query_log
+eval SELECT $after - $before AS offloaded_without_rule;
+--enable_query_log
+SET SESSION duckdb_offload_min_rows = 100000;
+--let $before= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_queries', Value, 1)
+SELECT COUNT(*) FROM g WHERE n = 3;
+--let $after= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_queries', Value, 1)
+--disable_query_log
+eval SELECT $after - $before AS offloaded_with_rule;
+--enable_query_log
+--let $before= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_queries', Value, 1)
+SELECT id FROM g WHERE id = 12345;
+--let $after= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_queries', Value, 1)
+--disable_query_log
+eval SELECT $after - $before AS offloaded_primary_key_lookup;
+--enable_query_log
+SET SESSION duckdb_offload_min_rows = DEFAULT;
+
+--echo # Read your own writes; a transaction that wrote is not offloaded
+SET SESSION use_secondary_engine = FORCED;
+INSERT INTO g (id, grp) VALUES (900001, 1);
+SELECT COUNT(*) FROM g WHERE id > 900000;
+DELETE FROM g WHERE id > 900000;
+SELECT COUNT(*) FROM g WHERE id > 900000;
+BEGIN;
+INSERT INTO g (id, grp) VALUES (900002, 1);
+--error ER_SECONDARY_ENGINE
+SELECT COUNT(*) FROM g;
+ROLLBACK;
+
+--echo # EXPLAIN: notes with the DuckDB SQL and DuckDB's plan
+--disable_result_log
+EXPLAIN FORMAT=TREE SELECT grp, SUM(amount) FROM g GROUP BY grp;
+--enable_result_log
+--let $notes= query_get_value(SHOW COUNT(*) WARNINGS, @@session.warning_count, 1)
+--let $code= query_get_value(SHOW WARNINGS, Code, 2)
+--disable_query_log
+eval SELECT $notes >= 3 AS duckdb_notes, $code AS note_code;
+--enable_query_log
+
+--echo # max_execution_time interrupts DuckDB: MySQL's error with DuckDB's message
+SET SESSION max_execution_time = 1000;
+--replace_regex /\(DuckDB error: .*\)/(DuckDB error: ...)/
+--error ER_QUERY_TIMEOUT
+SELECT COUNT(*) FROM g a JOIN g b ON a.amount < b.amount;
+SET SESSION max_execution_time = 0, use_secondary_engine = ON;
+
+--source ../include/cleanup.inc

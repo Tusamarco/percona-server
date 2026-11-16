@@ -312,7 +312,7 @@ bool BinlogReader::start(size_t stack_size, std::string *err) {
     return false;
   }
   m_stack_size = stack_size;
-  m_synced = BinlogPos();
+  m_committed = BinlogPos();
   m_position = BinlogPos();
   m_stop = false;
   m_state = "waiting for the binary log";
@@ -402,13 +402,13 @@ void BinlogReader::fail_and_wait(const std::string &err) {
   m_cv.wait(lk, [this] { return m_stop.load(); });
 }
 
-void BinlogReader::notify_synced(const char *file, my_off_t pos) {
+void BinlogReader::notify_committed(const char *file, my_off_t pos) {
   if (file == nullptr) return;
   std::lock_guard<std::mutex> lk(m_mutex);
   if (!m_running) return;
-  BinlogPos synced{file, pos};
-  if (m_synced < synced) {
-    m_synced = std::move(synced);
+  BinlogPos committed{file, pos};
+  if (m_committed < committed) {
+    m_committed = std::move(committed);
     m_cv.notify_one();
   }
 }
@@ -532,23 +532,28 @@ void BinlogReader::loop() {
   // files again.
   m_batch.pending = resumed_after_gap;
   m_last_commit = std::chrono::steady_clock::now();
-  // The current end of the binary log counts as synced: it was recovered at
-  // startup, and at runtime the next sync supersedes it.
-  if (m_synced < end) m_synced = end;
+  // The current end of the binary log counts as committed: at server startup
+  // crash recovery has committed every transaction in it. At a runtime start
+  // (duckdb_enable, duckdb_apply_start_position) a transaction between its
+  // binary log sync and its InnoDB commit at that moment can be read before
+  // InnoDB shows it (DWL-04, known limitation); later reads wait for
+  // after_commit.
+  if (m_committed < end) m_committed = end;
   DUCKDB_LOG_INFO("binlog reader started at %s:%llu (%s)", start.file.c_str(),
                   start.pos,
                   applied.empty() ? "no applied position yet"
                                   : "applied position");
 
   while (!m_stop) {
-    if (!(m_position < m_synced)) {
+    if (!(m_position < m_committed)) {
       // Nothing new to read: we commit the pending batch when it is due.
       if (m_batch.pending) {
         const auto deadline = batch_deadline();
         // wait_applied() asks for the pending batch now.
         if (!m_flush_requested &&
             std::chrono::steady_clock::now() < deadline) {
-          m_state = "idle";
+          // Read, not yet committed ("idle" means everything is committed).
+          m_state = "waiting to commit";
           m_cv.wait_until(lk, deadline);
           continue;
         }
@@ -575,7 +580,7 @@ void BinlogReader::loop() {
     m_state = "reading";
     m_caught_up = false;
     const BinlogPos from = m_position;
-    const BinlogPos end = m_synced;
+    const BinlogPos end = m_committed;
     lk.unlock();
 
     BinlogPos reached = from;
@@ -632,7 +637,7 @@ void BinlogReader::loop() {
   flush_on_stop();
 }
 
-// We read one file from `from`. In the active file we stop at the synced
+// We read one file from `from`. In the active file we stop at the committed
 // position; an older file is read to its end (*eof = true).
 bool BinlogReader::read_file(const BinlogPos &from, const BinlogPos &end,
                              BinlogPos *reached, bool *eof, std::string *err) {

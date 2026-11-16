@@ -63,12 +63,23 @@ struct LoadedTable {
   /** Primary key column names (\x1f separated); empty for copies loaded
       before step 3b until the applier records it. */
   std::string pk_columns;
+  /** Columns with a weight column "__w_<column>" in the copy (\x1f
+      separated; DWL#6 step A); empty for copies loaded before A1. */
+  std::string weight_columns;
   /** GTID set executed when the table was loaded (DWL#4 skips it). */
   std::string load_gtid_set;
   /** Binary log position at load time; empty for tables loaded before 4a. */
   BinlogPos load_position;
   /** Table lock for the handler, as in the MOCK engine. */
   THR_LOCK lock;
+  /**
+    false once the table left the lake (unload, drop, discard, rename to
+    another name). The entry itself is never freed: secondary TABLE objects
+    the server keeps in its table cache (DWL#6 opens them for every
+    offloaded query) point to its lock, and nothing guarantees they are
+    evicted first (our own DDL handling and discard do not evict them).
+  */
+  bool present{true};
 
   LoadedTable() { thr_lock_init(&lock); }
   ~LoadedTable() { thr_lock_delete(&lock); }
@@ -87,6 +98,7 @@ struct TableState {
   bool refresh_pending{false};
   std::string pending_renames;
   std::string pk_columns;
+  std::string weight_columns;
   BinlogPos load_position;
   /** Changes are applied to the copy. */
   bool usable() const { return !stale && !refresh_pending; }
@@ -94,8 +106,9 @@ struct TableState {
 
 /**
   In-memory cache of lake.__mysql.tables, the source of truth for "is this table
-  loaded". Entries stay in memory when the lake closes, so a handler never holds
-  a dangling lock; reload() refreshes them when the lake opens.
+  loaded". Entries are never freed (a table that leaves the lake is marked not
+  present), so a handler never holds a dangling lock; reload() refreshes them
+  when the lake opens.
 */
 class Registry {
  public:
@@ -108,14 +121,16 @@ class Registry {
   bool reload(duckdb_connection con, std::string *err);
 
   /**
-    The entry, or nullptr. The pointer stays valid until remove(): use it only
-    under a metadata lock on the table (handler, load, unload). Other threads
-    use snapshot().
+    The entry, or nullptr if the table is not in the lake. The pointer stays
+    valid for the life of the server (entries are never freed); its fields
+    are read only under a metadata lock on the table (handler, load,
+    unload). Other threads use snapshot().
   */
   LoadedTable *find(const std::string &db, const std::string &table);
   void add(const std::string &db, const std::string &table,
            bool retain_history, const std::string &load_gtid_set,
-           const BinlogPos &load_position, const std::string &pk_columns);
+           const BinlogPos &load_position, const std::string &pk_columns,
+           const std::string &weight_columns);
   /** Records the primary key of a copy loaded before step 3b. */
   void set_pk_columns(const std::string &db, const std::string &table,
                       const std::string &pk_columns);
@@ -145,6 +160,8 @@ class Registry {
   Registry() = default;
   using Key = std::pair<std::string, std::string>;
   std::mutex m_mutex;
+  /** The entry if present, under m_mutex. */
+  LoadedTable *live(const Key &key);
   std::map<Key, LoadedTable> m_tables;
 };
 

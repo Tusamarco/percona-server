@@ -14,11 +14,29 @@
 -- Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 --
 -- DWL#6: drops and re-creates the offload test tables (manual-test-plan.md
--- sections 21 and 22) in the current database: n (helper), g (step 6a),
--- p6 (step 6b). Run with: mysql ... <database> < duckdb_offload_setup.sql
+-- sections 21 to 23) in the current database: n (helper), g (step 6a),
+-- p6 (step 6b), dim, hist, nl and the view v6 (step 6c). The purge of hist
+-- needs TRANSACTION_GTID_TAG. Run with:
+--   mysql ... <database> < duckdb_offload_setup.sql
 SET SESSION use_secondary_engine = ON;
 SET SESSION cte_max_recursion_depth = 30000;
-DROP TABLE IF EXISTS g, p6, n;
+DROP VIEW IF EXISTS v6;
+DROP TABLE IF EXISTS g, p6, n, dim, hist, nl, dv, cw, cwd;
+-- DROP TABLE keeps the DuckDB copy of a history table (stale): we discard it,
+-- otherwise the new hist would reattach the old archived rows. No copy (first
+-- run): the error is ignored.
+DROP PROCEDURE IF EXISTS duckdb_test_discard_hist;
+DELIMITER //
+CREATE PROCEDURE duckdb_test_discard_hist()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN END;
+  SET SESSION duckdb_unload_history_confirm = ON;
+  SET GLOBAL duckdb_discard_stale_copy = CONCAT(DATABASE(), '.hist');
+  SET SESSION duckdb_unload_history_confirm = OFF;
+END//
+DELIMITER ;
+CALL duckdb_test_discard_hist();
+DROP PROCEDURE duckdb_test_discard_hist;
 
 CREATE TABLE n (n INT PRIMARY KEY);
 INSERT INTO n WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM s WHERE n < 999) SELECT n FROM s;
@@ -70,6 +88,52 @@ FROM seq;
 ALTER TABLE p6 SECONDARY_ENGINE = duckdb;
 ALTER TABLE p6 SECONDARY_LOAD;
 
-SELECT 'g' AS t, COUNT(*) AS row_count FROM g UNION ALL SELECT 'p6', COUNT(*) FROM p6;   -- 200000, 20000
+-- step 6c: a dimension (grp 0-4 and 8, 9: p6 groups 5 and 6 have no match;
+-- 8 and 9 match nothing), a history table with archived rows, a table
+-- without a DuckDB copy, a view.
+CREATE TABLE dim (grp INT PRIMARY KEY, name VARCHAR(20) COLLATE utf8mb4_0900_bin,
+  label VARCHAR(20) COLLATE utf8mb4_bin, region INT NULL,
+  ci VARCHAR(20) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb;
+INSERT INTO dim VALUES (0, 'zero', 'z ', 1, 'Z'), (1, 'one', 'o', 1, 'O'), (2, 'two', 't', 2, 't'),
+  (3, 'three', 't ', NULL, 'T'), (4, 'four', 'f', 2, 'f'), (8, 'eight', 'e', 3, 'e'), (9, 'nine', 'n', NULL, 'N');
+ALTER TABLE dim SECONDARY_LOAD;
+CREATE TABLE hist (id INT PRIMARY KEY, grp INT NOT NULL, v INT) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO hist SELECT n, n % 10, n FROM n WHERE n < 100;
+ALTER TABLE hist SECONDARY_LOAD;
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
+DELETE FROM hist WHERE id < 30;                          -- 30 rows archived in DuckDB
+SET gtid_next = 'AUTOMATIC';
+CREATE TABLE nl (grp INT PRIMARY KEY, x INT);
+INSERT INTO nl VALUES (1, 10), (2, 20);
+CREATE VIEW v6 AS SELECT id, grp, amount, qty FROM p6 WHERE qty > 0;
+
+-- exact decimal division (DWL#6 after 6d-3): decimals of several scales,
+-- negatives, zeros, NULLs, values on rounding boundaries
+CREATE TABLE dv (id INT PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(6,3), i INT, j BIGINT) SECONDARY_ENGINE = duckdb;
+INSERT INTO dv SELECT n, IF(n % 11 = 0, NULL, ((n * 7919) % 200001 - 100000) / 100), IF(n % 13 = 0, 0, ((n * 104729) % 20001 - 10000) / 1000),
+  IF(n % 17 = 0, 0, (n * 31) % 2001 - 1000), (n * 2654435761) % 1000000007 FROM n WHERE n < 1000;
+INSERT INTO dv VALUES (2001, 1.00, 3.000, 3, 6), (2002, 2.00, 3.000, -3, -6), (2003, 0.05, 0.200, 8, 16), (2004, -0.05, 0.200, -8, 7),
+  (2005, 1.25, 8.000, 2, 2), (2006, 99999999.99, 0.001, 1, 1), (2007, -12.35, 10.000, 7, 3);
+ALTER TABLE dv SECONDARY_LOAD;
+
+-- weight strings (DWL#6 step A): values that differ only in case, accent or
+-- trailing spaces, in NO PAD (0900_ai_ci, 0900_as_cs), PAD SPACE
+-- (general_ci) and latin1 collations; cwd joins on a _ci column
+CREATE TABLE cw (id INT PRIMARY KEY, c VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, g VARCHAR(20) COLLATE utf8mb4_general_ci,
+  l VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_swedish_ci, s VARCHAR(20) COLLATE utf8mb4_0900_as_cs, k INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO cw SELECT n + 1, IF(n % 23 = 0, NULL, ELT(n % 10 + 1, 'apple', 'Apple', 'ápple', 'APPLE', 'banana', 'Banana ', 'BANANA', 'cherry', 'Cherry', 'apple ')),
+  ELT(n % 8 + 1, 'apple', 'APPLE  ', 'apple ', 'Banana', 'banana', 'b', 'B ', 'cherry'),
+  ELT(n % 6 + 1, 'été', 'ETE', 'ete', 'Ä', 'ä', 'z'), ELT(n % 5 + 1, 'Apple', 'apple', 'APPLE', 'Äpple', 'apple'), n % 7
+  FROM n WHERE n < 1000;
+INSERT INTO cw SELECT n + 1001, ELT(n % 4 + 1, 'durian', 'Durian', 'DURIAN ', 'dürian'), ELT(n % 3 + 1, 'zz', 'ZZ ', 'z'),
+  ELT(n % 2 + 1, 'o', 'Ö'), ELT(n % 3 + 1, 'Z', 'z', 'Ž'), n % 5 FROM n WHERE n < 1000;
+ALTER TABLE cw SECONDARY_LOAD;
+CREATE TABLE cwd (id INT PRIMARY KEY, c VARCHAR(20) COLLATE utf8mb4_0900_ai_ci NOT NULL, region INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO cwd VALUES (1, 'APPLE', 1), (2, 'banana', 1), (3, 'Cherry', 2), (4, 'durian', 2), (5, 'Elderberry', 3);
+ALTER TABLE cwd SECONDARY_LOAD;
+
+SELECT 'g' AS t, COUNT(*) AS row_count FROM g UNION ALL SELECT 'p6', COUNT(*) FROM p6
+  UNION ALL SELECT 'dim', COUNT(*) FROM dim UNION ALL SELECT 'hist', COUNT(*) FROM hist;  -- 200000, 20000, 7, 70
 SELECT table_name, create_options FROM information_schema.tables
- WHERE table_schema = DATABASE() AND table_name IN ('g', 'p6');                        -- SECONDARY_LOAD="1"
+ WHERE table_schema = DATABASE() AND table_name IN ('g', 'p6', 'dim', 'hist');           -- SECONDARY_LOAD="1"

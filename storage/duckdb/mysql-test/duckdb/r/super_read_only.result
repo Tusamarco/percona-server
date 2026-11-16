@@ -1,0 +1,41 @@
+GRANT DUCKDB_HISTORY_READER ON *.* TO root@localhost;
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, 1), (2, 2), (3, 3);
+ALTER TABLE t1 SECONDARY_LOAD;
+CREATE TABLE h1 (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb
+SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO h1 VALUES (1, 1), (2, 2), (3, 3);
+ALTER TABLE h1 SECONDARY_LOAD;
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
+DELETE FROM h1 WHERE id = 1;
+SET gtid_next = 'AUTOMATIC';
+# Applier paused: it reads the DDL after super_read_only is ON
+SET GLOBAL duckdb_enable = OFF;
+ALTER TABLE t1 MODIFY v BIGINT;
+UPDATE t1 SET v = v + 5000000000 WHERE id = 2;
+ALTER TABLE h1 ADD COLUMN note VARCHAR(10) NOT NULL DEFAULT 'n';
+SET GLOBAL super_read_only = ON;
+SET GLOBAL duckdb_enable = ON;
+refreshes	failures
+2	0
+SELECT @@global.super_read_only;
+@@global.super_read_only
+1
+# User statements are still refused
+ALTER TABLE t1 SECONDARY_UNLOAD;
+ERROR HY000: The MySQL server is running with the --super-read-only option so it cannot execute this statement
+INSERT INTO t1 VALUES (9, 9);
+ERROR HY000: The MySQL server is running with the --super-read-only option so it cannot execute this statement
+# The copies are current: DuckDB = InnoDB, archived row kept
+# SELECT id, v FROM t1 ORDER BY id
+# SELECT id, v, note FROM h1 ORDER BY id
+SET SESSION use_secondary_engine = ON, duckdb_history_scope = FULL;
+SELECT id, v, note FROM h1 ORDER BY id;
+id	v	note
+1	1	NULL
+2	2	n
+3	3	n
+SET SESSION duckdb_history_scope = LIVE;
+SET GLOBAL super_read_only = OFF;
+SET GLOBAL read_only = OFF;
+REVOKE DUCKDB_HISTORY_READER ON *.* FROM root@localhost;

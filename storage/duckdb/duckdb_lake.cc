@@ -334,9 +334,22 @@ bool Lake::open_duckdb(const std::string &lake, const LakeSettings &s,
   if (run("ATTACH 'ducklake:" + catalog + "' AS lake (DATA_PATH '" + data +
               "')",
           &msg)) {
-    *err = "cannot attach the DuckDB lake " + catalog + ": " + msg;
-    close_duckdb();
-    return true;
+    // DuckLake keeps the data path in the catalog and refuses another one:
+    // the lake was moved or restored elsewhere.
+    const bool moved = msg.find("does not match existing data path") !=
+                       std::string::npos;
+    if (!moved || !s.relocate) {
+      *err = "cannot attach the DuckDB lake " + catalog + ": " + msg +
+             (moved ? " (with duckdb_lake_relocate=ON the plugin accepts a "
+                      "moved lake whose files are all in duckdb_data_path)"
+                    : "");
+      close_duckdb();
+      return true;
+    }
+    if (relocate(catalog, data, err)) {
+      close_duckdb();
+      return true;
+    }
   }
   if (run("SET temp_directory = '" + tmp + "'", &msg) ||
       run("CREATE SCHEMA IF NOT EXISTS lake.__mysql", &msg) ||
@@ -357,6 +370,88 @@ bool Lake::open_duckdb(const std::string &lake, const LakeSettings &s,
     return true;
   }
   drop_build_leftovers();
+  return false;
+}
+
+// A moved lake (duckdb_lake_relocate=ON): attach with the configured data
+// path, check that every file the current snapshot uses is there (data and
+// delete files; paths relative to the data path, schema and table, or
+// absolute), then store the new data path in the catalog so the next start
+// attaches normally. A missing file refuses the lake: the configured
+// directory is not this catalog's data.
+bool Lake::relocate(const std::string &catalog, const std::string &data,
+                    std::string *err) {
+  std::string msg;
+  if (run("ATTACH 'ducklake:" + catalog + "' AS lake (DATA_PATH '" + data +
+              "', OVERRIDE_DATA_PATH true)",
+          &msg)) {
+    *err = "cannot attach the moved DuckDB lake " + catalog + ": " + msg;
+    return true;
+  }
+  const std::string m = "__ducklake_metadata_lake.";
+  const std::string dir =
+      "CASE WHEN t.path_is_relative THEN (CASE WHEN s.path_is_relative THEN "
+      "'" + data + "' || s.path ELSE s.path END) || t.path ELSE t.path END";
+  const std::string files =
+      "SELECT CASE WHEN f.path_is_relative THEN " + dir +
+      " || f.path ELSE f.path END FROM " + m + "ducklake_data_file f JOIN " +
+      m + "ducklake_table t ON t.table_id = f.table_id AND t.end_snapshot IS "
+      "NULL JOIN " + m + "ducklake_schema s ON s.schema_id = t.schema_id AND "
+      "s.end_snapshot IS NULL WHERE f.end_snapshot IS NULL UNION ALL SELECT "
+      "CASE WHEN f.path_is_relative THEN " + dir +
+      " || f.path ELSE f.path END FROM " + m + "ducklake_delete_file f JOIN " +
+      m + "ducklake_table t ON t.table_id = f.table_id AND t.end_snapshot IS "
+      "NULL JOIN " + m + "ducklake_schema s ON s.schema_id = t.schema_id AND "
+      "s.end_snapshot IS NULL WHERE f.end_snapshot IS NULL";
+  duckdb_result res;
+  if (duckdb_query(m_admin, files.c_str(), &res) == DuckDBError) {
+    const char *e = duckdb_result_error(&res);
+    *err = std::string("cannot list the files of the moved DuckDB lake: ") +
+           (e != nullptr ? e : "query failed");
+    duckdb_destroy_result(&res);
+    return true;
+  }
+  size_t total = 0, missing = 0;
+  std::string first_missing;
+  for (idx_t r = 0; r < duckdb_row_count(&res); r++) {
+    char *p = duckdb_value_varchar(&res, 0, r);
+    total++;
+    std::error_code ec;
+    if (p == nullptr || !fs::exists(fs::path(p), ec)) {
+      if (missing++ == 0) first_missing = p != nullptr ? p : "(null)";
+    }
+    duckdb_free(p);
+  }
+  duckdb_destroy_result(&res);
+  if (missing > 0) {
+    *err = "the DuckDB lake catalog " + catalog + " stores another data path "
+           "and " + std::to_string(missing) + " of its " +
+           std::to_string(total) + " files are not under " + data +
+           " (first: " + first_missing + "): not relocated";
+    return true;
+  }
+  std::string old_path;
+  if (duckdb_query(m_admin,
+                   ("SELECT value FROM " + m +
+                    "ducklake_metadata WHERE key = 'data_path'")
+                       .c_str(),
+                   &res) == DuckDBSuccess &&
+      duckdb_row_count(&res) > 0) {
+    char *v = duckdb_value_varchar(&res, 0, 0);
+    old_path = v != nullptr ? v : "";
+    duckdb_free(v);
+  }
+  duckdb_destroy_result(&res);
+  if (run("UPDATE " + m + "ducklake_metadata SET value = '" + data +
+              "' WHERE key = 'data_path'",
+          &msg)) {
+    *err = "cannot store the new data path of the moved DuckDB lake: " + msg;
+    return true;
+  }
+  DUCKDB_LOG_WARNING(
+      "DuckDB lake moved: the catalog's data path %s is now %s (%zu files "
+      "checked; duckdb_lake_relocate=ON)",
+      old_path.c_str(), data.c_str(), total);
   return false;
 }
 

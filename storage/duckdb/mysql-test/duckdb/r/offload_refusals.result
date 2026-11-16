@@ -1,0 +1,124 @@
+# SELECT CASE WHEN qty < 0 THEN 'neg' ELSE 'pos' END AS k, COUNT(*) FROM p6 GROUP BY k ORDER BY k
+SET SESSION use_secondary_engine = FORCED;
+SELECT CASE WHEN qty < 0 THEN 'neg' ELSE 'pos' END AS k, COUNT(*) FROM p6 GROUP BY k ORDER BY k;
+Got one of the listed errors
+# SELECT HEX(b4), COUNT(*) FROM p6 GROUP BY b4 ORDER BY b4
+SET SESSION use_secondary_engine = FORCED;
+SELECT HEX(b4), COUNT(*) FROM p6 GROUP BY b4 ORDER BY b4;
+Got one of the listed errors
+# SELECT COUNT(*) FROM p6 WHERE raw LIKE 'k_'
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM p6 WHERE raw LIKE 'k_';
+Got one of the listed errors
+# SELECT id, TRUNCATE(amount, 1) FROM p6 WHERE id <= 5 ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, TRUNCATE(amount, 1) FROM p6 WHERE id <= 5 ORDER BY id;
+Got one of the listed errors
+# SELECT id, ROUND(price) FROM p6 WHERE id <= 5 ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, ROUND(price) FROM p6 WHERE id <= 5 ORDER BY id;
+Got one of the listed errors
+# SELECT id, u + 1 FROM p6 WHERE id <= 5 ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, u + 1 FROM p6 WHERE id <= 5 ORDER BY id;
+Got one of the listed errors
+# SELECT DISTINCT b4 FROM p6 ORDER BY b4
+SET SESSION use_secondary_engine = FORCED;
+SELECT DISTINCT b4 FROM p6 ORDER BY b4;
+Got one of the listed errors
+# SELECT id, HOUR(ts) FROM p6 WHERE id <= 5 ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, HOUR(ts) FROM p6 WHERE id <= 5 ORDER BY id;
+Got one of the listed errors
+# SELECT COUNT(*) FROM p6 WHERE b4 = 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM p6 WHERE b4 = 1;
+Got one of the listed errors
+# SELECT a.b4, COUNT(*) FROM p6 a JOIN dim d ON a.grp = d.grp GROUP BY a.b4 ORDER BY a.b4
+SET SESSION use_secondary_engine = FORCED;
+SELECT a.b4, COUNT(*) FROM p6 a JOIN dim d ON a.grp = d.grp GROUP BY a.b4 ORDER BY a.b4;
+Got one of the listed errors
+# SELECT d.name, MIN(a.b4) FROM p6 a JOIN dim d ON a.grp = d.grp GROUP BY d.name ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT d.name, MIN(a.b4) FROM p6 a JOIN dim d ON a.grp = d.grp GROUP BY d.name ORDER BY 1;
+Got one of the listed errors
+# SELECT d.grp, x.c FROM dim d, LATERAL (SELECT COUNT(*) AS c FROM p6 WHERE p6.grp = d.grp) x ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT d.grp, x.c FROM dim d, LATERAL (SELECT COUNT(*) AS c FROM p6 WHERE p6.grp = d.grp) x ORDER BY 1;
+Got one of the listed errors
+# WITH RECURSIVE r (k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM r WHERE k < 5) SELECT dim.grp FROM r JOIN dim ON dim.grp = r.k ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+WITH RECURSIVE r (k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM r WHERE k < 5) SELECT dim.grp FROM r JOIN dim ON dim.grp = r.k ORDER BY 1;
+Got one of the listed errors
+# SELECT grp FROM dim UNION SELECT name FROM dim ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT grp FROM dim UNION SELECT name FROM dim ORDER BY 1;
+Got one of the listed errors
+# SELECT label FROM dim UNION SELECT b4 FROM p6 ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT label FROM dim UNION SELECT b4 FROM p6 ORDER BY 1;
+Got one of the listed errors
+# SELECT ci FROM dim UNION SELECT ci FROM p6 ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT ci FROM dim UNION SELECT ci FROM p6 ORDER BY 1;
+Got one of the listed errors
+# SELECT ts FROM p6 WHERE id < 5 UNION ALL SELECT dt FROM p6 WHERE id < 5 ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT ts FROM p6 WHERE id < 5 UNION ALL SELECT dt FROM p6 WHERE id < 5 ORDER BY 1;
+Got one of the listed errors
+# SELECT d FROM p6 WHERE id < 5 UNION ALL SELECT 'x' ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT d FROM p6 WHERE id < 5 UNION ALL SELECT 'x' ORDER BY 1;
+Got one of the listed errors
+# SELECT grp FROM dim WHERE grp IN (SELECT grp FROM p6 UNION SELECT 1) ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT grp FROM dim WHERE grp IN (SELECT grp FROM p6 UNION SELECT 1) ORDER BY 1;
+Got one of the listed errors
+# SELECT d.grp, (SELECT p6.qty FROM p6 WHERE p6.grp = d.grp AND p6.id = d.grp + 7) FROM dim d ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT d.grp, (SELECT p6.qty FROM p6 WHERE p6.grp = d.grp AND p6.id = d.grp + 7) FROM dim d ORDER BY 1;
+Got one of the listed errors
+# SELECT d.grp, (d.grp, d.region) IN (SELECT grp, region FROM dim WHERE grp < 3) FROM dim d ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT d.grp, (d.grp, d.region) IN (SELECT grp, region FROM dim WHERE grp < 3) FROM dim d ORDER BY 1;
+Got one of the listed errors
+# SELECT d.grp, d.label IN (SELECT b4 FROM p6 WHERE id < 20) FROM dim d ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT d.grp, d.label IN (SELECT b4 FROM p6 WHERE id < 20) FROM dim d ORDER BY 1;
+Got one of the listed errors
+# SELECT d.grp, d.ci IN (SELECT ci FROM p6 WHERE id < 20) FROM dim d ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT d.grp, d.ci IN (SELECT ci FROM p6 WHERE id < 20) FROM dim d ORDER BY 1;
+Got one of the listed errors
+# SELECT d.grp, d.grp IN (SELECT name FROM dim) FROM dim d ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT d.grp, d.grp IN (SELECT name FROM dim) FROM dim d ORDER BY 1;
+Got one of the listed errors
+# SELECT COUNT(*) FROM cw WHERE c LIKE 'a%'
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM cw WHERE c LIKE 'a%';
+Got one of the listed errors
+# SELECT DISTINCT c FROM cw ORDER BY c
+SET SESSION use_secondary_engine = FORCED;
+SELECT DISTINCT c FROM cw ORDER BY c;
+Got one of the listed errors
+# SELECT c FROM cw WHERE id < 10 UNION SELECT c FROM cwd ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT c FROM cw WHERE id < 10 UNION SELECT c FROM cwd ORDER BY 1;
+Got one of the listed errors
+# SELECT UPPER(c), COUNT(*) FROM cw GROUP BY UPPER(c) ORDER BY 1
+SET SESSION use_secondary_engine = FORCED;
+SELECT UPPER(c), COUNT(*) FROM cw GROUP BY UPPER(c) ORDER BY 1;
+Got one of the listed errors
+# SELECT COUNT(*) FROM cw WHERE UPPER(c) = 'APPLE'
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM cw WHERE UPPER(c) = 'APPLE';
+Got one of the listed errors
+# SELECT d.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY d.c ORDER BY d.c
+SET SESSION use_secondary_engine = FORCED;
+SELECT d.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY d.c ORDER BY d.c;
+Got one of the listed errors
+# SELECT cw.c, MIN(d.c) FROM cw JOIN cwd d ON d.c = cw.c WHERE cw.id < 50 GROUP BY cw.id, cw.c ORDER BY cw.id
+SET SESSION use_secondary_engine = FORCED;
+SELECT cw.c, MIN(d.c) FROM cw JOIN cwd d ON d.c = cw.c WHERE cw.id < 50 GROUP BY cw.id, cw.c ORDER BY cw.id;
+Got one of the listed errors

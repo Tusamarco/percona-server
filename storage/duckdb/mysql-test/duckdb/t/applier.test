@@ -1,0 +1,72 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#4: changes applied from the binary log (manual-test-plan.md sections
+# 12-17): DML of every type, a large transaction in pieces, DDL refresh,
+# RENAME TABLE, TRUNCATE.
+--source ../include/have_duckdb.inc
+
+CREATE TABLE t1 (id INT PRIMARY KEY, i BIGINT, u INT UNSIGNED, d DECIMAL(12,3), f DOUBLE,
+  dt DATE, tm DATETIME(6), ts TIMESTAMP(3) NULL, s VARCHAR(30) COLLATE utf8mb4_0900_ai_ci,
+  l VARCHAR(30) CHARACTER SET latin1, b VARBINARY(20)) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, -5, 7, 1.250, 0.5, '2024-01-31', '2024-01-31 10:11:12.123456', '2024-06-01 01:02:03.456', 'Apple', 'été', 0x00FF);
+ALTER TABLE t1 SECONDARY_LOAD;
+INSERT INTO t1 VALUES (2, 9223372036854775807, 4294967295, -999999999.999, -1e300, '1000-01-01', '9999-12-31 23:59:59.999999', NULL, 'apple ', 'Ä', ''),
+  (3, NULL, NULL, NULL, NULL, NULL, NULL, '2038-01-19 03:14:07.000', NULL, NULL, NULL);
+UPDATE t1 SET i = i + 1, s = 'BANANA', d = d * 2 WHERE id = 1;
+DELETE FROM t1 WHERE id = 3;
+INSERT INTO t1 VALUES (3, 3, 3, 3, 3, '2003-03-03', '2003-03-03 03:03:03', '2003-03-03 03:03:03', 'cherry', 'c', 0x03);
+BEGIN;
+UPDATE t1 SET f = f + 1 WHERE id = 2;
+UPDATE t1 SET f = f + 1 WHERE id = 2;
+DELETE FROM t1 WHERE id = 1;
+INSERT INTO t1 VALUES (1, 1, 1, 1, 1, '2001-01-01', '2001-01-01 01:01:01', NULL, 'apple', 'a', 0x01);
+COMMIT;
+--source ../include/wait_applier.inc
+--let $query= SELECT id, i, u, d, f, dt, tm, ts, s, l, b FROM t1 ORDER BY id
+--source ../include/duckdb_compare.inc
+
+--echo # A transaction larger than duckdb_apply_batch_max_rows, applied in pieces
+SET @old_rows = @@global.duckdb_apply_batch_max_rows;
+SET GLOBAL duckdb_apply_batch_max_rows = 1000;
+--let $pieces_before= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_pieces', Value, 1)
+SET SESSION cte_max_recursion_depth = 10000;
+INSERT INTO t1 (id, i) WITH RECURSIVE s(n) AS (SELECT 100 UNION ALL SELECT n + 1 FROM s WHERE n < 3599) SELECT n, n FROM s;
+--source ../include/wait_applier.inc
+--let $pieces_after= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_pieces', Value, 1)
+--disable_query_log
+eval SELECT $pieces_after > $pieces_before AS applied_in_pieces;
+--enable_query_log
+SET GLOBAL duckdb_apply_batch_max_rows = @old_rows;
+--let $query= SELECT COUNT(*), SUM(i) FROM t1
+--source ../include/duckdb_compare.inc
+
+--echo # DDL: ADD COLUMN refreshes the copy; RENAME TABLE follows; TRUNCATE
+ALTER TABLE t1 ADD COLUMN extra INT NOT NULL DEFAULT 7;
+--source ../include/wait_applier.inc
+--let $query= SELECT COUNT(*), SUM(extra) FROM t1
+--source ../include/duckdb_compare.inc
+RENAME TABLE t1 TO t2;
+--source ../include/wait_applier.inc
+--let $query= SELECT COUNT(*) FROM t2
+--source ../include/duckdb_compare.inc
+TRUNCATE TABLE t2;
+--source ../include/wait_applier.inc
+--let $query= SELECT COUNT(*) FROM t2
+--source ../include/duckdb_compare.inc
+RENAME TABLE t2 TO t1;
+--source ../include/wait_applier.inc
+
+--source ../include/cleanup.inc

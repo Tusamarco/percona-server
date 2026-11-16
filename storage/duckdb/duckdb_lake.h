@@ -41,6 +41,9 @@ struct LakeSettings {
   unsigned int threads;
   unsigned int executor_threads;
   unsigned long long executor_stack_size;
+  /** duckdb_lake_relocate: accept a lake whose catalog stores another data
+      path (moved or restored elsewhere) when all its files are here. */
+  bool relocate;
 };
 
 /**
@@ -137,6 +140,8 @@ class Lake {
   void close_duckdb();
   /** Drops build tables left by a load interrupted before its swap. */
   void drop_build_leftovers();
+  bool relocate(const std::string &catalog, const std::string &data,
+                std::string *err);
 
   std::mutex m_mutex;
   std::mutex m_apply_mutex;

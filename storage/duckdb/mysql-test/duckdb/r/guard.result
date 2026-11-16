@@ -1,0 +1,69 @@
+GRANT DUCKDB_HISTORY_READER ON *.* TO root@localhost;
+CREATE VIEW vh AS SELECT id, grp, v FROM hist;
+CREATE PROCEDURE ph() SELECT COUNT(*) FROM hist;
+CREATE TABLE hcopy (id INT PRIMARY KEY, v INT);
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM information_schema.PLUGINS WHERE PLUGIN_NAME = 'duckdb_guard';
+PLUGIN_NAME	PLUGIN_STATUS
+duckdb_guard	ACTIVE
+SET SESSION use_secondary_engine = OFF, duckdb_history_scope = FULL;
+SELECT COUNT(*) FROM hist;
+ERROR HY000: duckdb_history_scope=FULL requires DuckDB execution, but use_secondary_engine=OFF (test.hist is a history table)
+SET SESSION use_secondary_engine = ON;
+SELECT COUNT(*) FROM hist;
+COUNT(*)
+100
+SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM hist LIMIT 1;
+ERROR HY000: the DuckDB secondary engine cannot run this query: window
+INSERT INTO hcopy SELECT id, v FROM hist;
+ERROR HY000: duckdb_history_scope=FULL: test.hist is a history table and only a SELECT can read it with its archived rows (this statement also writes, or is not a SELECT)
+SELECT COUNT(*) FROM hcopy;
+COUNT(*)
+0
+UPDATE hist SET v = 0 WHERE id = 50;
+ERROR HY000: duckdb_history_scope=FULL: test.hist is a history table; FULL is a read scope and an UPDATE, DELETE or TRUNCATE would act on the live rows only: change rows with duckdb_history_scope=LIVE
+DELETE FROM hist WHERE id = 50;
+ERROR HY000: duckdb_history_scope=FULL: test.hist is a history table; FULL is a read scope and an UPDATE, DELETE or TRUNCATE would act on the live rows only: change rows with duckdb_history_scope=LIVE
+DELETE FROM hcopy WHERE id IN (SELECT id FROM hist);
+ERROR HY000: duckdb_history_scope=FULL: test.hist is a history table; FULL is a read scope and an UPDATE, DELETE or TRUNCATE would act on the live rows only: change rows with duckdb_history_scope=LIVE
+UPDATE hcopy SET v = 1 WHERE id IN (SELECT id FROM hist);
+ERROR HY000: duckdb_history_scope=FULL: test.hist is a history table and only a SELECT can read it with its archived rows (this statement also writes, or is not a SELECT)
+TRUNCATE TABLE hist;
+ERROR HY000: duckdb_history_scope=FULL: test.hist is a history table; FULL is a read scope and an UPDATE, DELETE or TRUNCATE would act on the live rows only: change rows with duckdb_history_scope=LIVE
+SELECT COUNT(*) FROM vh;
+COUNT(*)
+100
+CALL ph();
+COUNT(*)
+100
+SET SESSION duckdb_history_scope = LIVE;
+SELECT COUNT(*) FROM hist;
+COUNT(*)
+70
+SELECT v FROM hist WHERE id = 50;
+v
+50
+SELECT COUNT(*) FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) r FROM hist) x;
+COUNT(*)
+70
+SELECT /*+ SET_VAR(duckdb_history_scope = FULL) */ COUNT(*) FROM hist;
+COUNT(*)
+100
+PREPARE s FROM 'SELECT COUNT(*) FROM hist';
+SET SESSION duckdb_history_scope = FULL;
+EXECUTE s;
+COUNT(*)
+100
+SET SESSION duckdb_history_scope = LIVE;
+EXECUTE s;
+COUNT(*)
+70
+DEALLOCATE PREPARE s;
+SET GLOBAL duckdb_enable = OFF;
+SET SESSION duckdb_history_scope = FULL;
+SELECT COUNT(*) FROM hist;
+ERROR HY000: duckdb_history_scope=FULL: the DuckDB lake is not open (duckdb_enable=OFF?): test.hist cannot be read with its archived rows
+SET SESSION duckdb_history_scope = LIVE;
+SET GLOBAL duckdb_enable = ON;
+REVOKE DUCKDB_HISTORY_READER ON *.* FROM root@localhost;
+SET SESSION duckdb_history_scope = FULL;
+ERROR 42000: Access denied; you need (at least one of) the DUCKDB_HISTORY_READER privilege(s) for this operation

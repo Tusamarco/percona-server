@@ -34,6 +34,10 @@ struct Value {
   uint64_t u{0};  // UINT
   double d{0};    // DOUBLE
   std::string s;  // TEXT, BLOB
+  /** TEXT of a collation DuckDB cannot compare: MySQL's weight of the value
+      (DWL#6 step A1), computed from the bytes in the column's charset. */
+  std::string w;
+  bool weighted{false};
   bool operator==(const Value &o) const;
   /** Readable form, for the debug log and the collapse key. */
   std::string to_string() const;

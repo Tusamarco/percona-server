@@ -1,0 +1,2 @@
+--plugin-dir=$MTR_BINDIR/plugin_output_directory
+--plugin-load-add=ha_duckdb.so

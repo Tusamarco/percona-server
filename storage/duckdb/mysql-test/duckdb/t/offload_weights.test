@@ -1,0 +1,88 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#6 step A2: weight strings (section 33).
+--source ../include/have_duckdb.inc
+--source ../include/tables_g.inc
+--source ../include/tables_p6.inc
+--source ../include/tables_6c.inc
+--source ../include/tables_cw.inc
+
+--let $query= SELECT COUNT(*) FROM cw WHERE c = 'apple'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE c = 'APPLE '
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE g = 'apple  '
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE c IN ('apple', 'BANANA', 'durian')
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE c > 'b'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE c < 'B' OR c BETWEEN 'cherry' AND 'DURIAN'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE g > 'apple' AND g < 'b '
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE l = 'ete'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE s = 'Apple'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE c = UPPER('apple') AND c <> 'x'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT c, COUNT(*), SUM(k) FROM cw GROUP BY c ORDER BY c
+--source ../include/duckdb_compare.inc
+--let $query= SELECT g, COUNT(*) FROM cw GROUP BY g ORDER BY g
+--source ../include/duckdb_compare.inc
+--let $query= SELECT l, COUNT(*) FROM cw GROUP BY l ORDER BY l
+--source ../include/duckdb_compare.inc
+--let $query= SELECT s, COUNT(*) FROM cw GROUP BY s ORDER BY s
+--source ../include/duckdb_compare.inc
+--let $query= SELECT k, COUNT(DISTINCT c), COUNT(DISTINCT g), COUNT(DISTINCT l), COUNT(DISTINCT s) FROM cw GROUP BY k ORDER BY k
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(c), MAX(c), MIN(g), MAX(g), MIN(l), MAX(s) FROM cw
+--source ../include/duckdb_compare.inc
+--let $query= SELECT k, MIN(c), MAX(g) FROM cw GROUP BY k ORDER BY k
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, c FROM cw WHERE id < 40 ORDER BY c, id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, g FROM cw WHERE id < 40 ORDER BY g DESC, id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT c, COUNT(*) FROM cw GROUP BY c HAVING c <> 'apple' ORDER BY c
+--source ../include/duckdb_compare.inc
+--let $query= SELECT SUM(CASE WHEN c = 'apple' THEN 1 ELSE 0 END), COUNT(NULLIF(c, 'banana')) FROM cw
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.id, d.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY d.id, d.c ORDER BY d.id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.c, COUNT(cw.id) FROM cwd d LEFT JOIN cw ON cw.c = d.c GROUP BY d.id, d.c ORDER BY d.c
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM cw WHERE c IN (SELECT c FROM cwd WHERE region = 1)
+--source ../include/duckdb_compare.inc
+--let $query= SELECT 'h1' AS p, k FROM cw WHERE id < 5 UNION ALL SELECT 'h2', k FROM cw WHERE id < 5 ORDER BY p DESC, k
+--source ../include/duckdb_compare.inc
+--let $query= SELECT x.c, x.n FROM (SELECT c, COUNT(*) AS n FROM cw WHERE id < 900 GROUP BY c) x ORDER BY x.c
+--source ../include/duckdb_compare.inc
+--let $query= SELECT ci, COUNT(*), SUM(amount) FROM g GROUP BY ci ORDER BY ci
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 JOIN dim ON dim.ci = p6.ci
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.ci, COUNT(*) FROM p6 JOIN dim d ON d.grp = p6.grp GROUP BY d.grp, d.ci ORDER BY d.ci, d.grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM dim WHERE ci = 'm' OR ci = 'T'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT ci, COUNT(*) FROM p6 GROUP BY ci ORDER BY ci
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE ci = 'm'
+--source ../include/duckdb_compare.inc
+
+--source ../include/cleanup.inc

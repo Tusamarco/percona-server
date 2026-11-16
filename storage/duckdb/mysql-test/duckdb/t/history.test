@@ -1,0 +1,86 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#5 and DWL#3 step 3b (sections 19, 20): purge with the tag, LIVE and
+# FULL scope, plain DELETE, unload confirmation, a dropped history table's
+# copy kept stale, check only, structure mismatch, reattach, discard.
+--source ../include/have_duckdb.inc
+GRANT DUCKDB_HISTORY_READER ON *.* TO root@localhost;
+--connect (con_h, localhost, root,,)
+
+CREATE TABLE h1 (id INT PRIMARY KEY, v INT, c VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO h1 VALUES (1, 10, 'a'), (2, 20, 'B'), (3, 30, 'c'), (4, 40, 'D');
+ALTER TABLE h1 SECONDARY_LOAD;
+# The counters are server-wide: the test records how much they grow.
+--let $purges_before= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_purge_transactions', Value, 1)
+--let $archived_before= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_archived_rows', Value, 1)
+--echo # purge (tag): archived in DuckDB; plain DELETE: removed
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
+DELETE FROM h1 WHERE id IN (1, 2);
+SET gtid_next = 'AUTOMATIC';
+DELETE FROM h1 WHERE id = 3;
+INSERT INTO h1 VALUES (1, 11, 'A');
+--source ../include/wait_applier.inc
+SELECT COUNT(*) FROM h1;
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*), SUM(v) FROM h1;
+SET SESSION duckdb_history_scope = FULL;
+SELECT id, v, c FROM h1 ORDER BY id, v;
+SELECT c, COUNT(*) FROM h1 GROUP BY c ORDER BY c;
+SET SESSION duckdb_history_scope = LIVE, use_secondary_engine = ON;
+--let $purges_after= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_purge_transactions', Value, 1)
+--let $archived_after= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_apply_archived_rows', Value, 1)
+--disable_query_log
+eval SELECT $purges_after - $purges_before AS purge_transactions, $archived_after - $archived_before AS archived_rows;
+--enable_query_log
+
+--echo # unload of a history table needs confirmation
+--error ER_SECONDARY_ENGINE_PLUGIN
+ALTER TABLE h1 SECONDARY_UNLOAD;
+
+--echo # DROP keeps the copy (stale); a new table with another structure is refused
+DROP TABLE h1;
+CREATE TABLE h1 (id INT PRIMARY KEY, v BIGINT) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+--error ER_SECONDARY_ENGINE_PLUGIN
+ALTER TABLE h1 SECONDARY_LOAD;
+SHOW WARNINGS;
+DROP TABLE h1;
+
+--echo # the same structure: check only, then reattach (archived rows kept)
+CREATE TABLE h1 (id INT PRIMARY KEY, v INT, c VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO h1 VALUES (1, 11, 'A'), (4, 40, 'D');
+SET SESSION duckdb_history_check_only = ON;
+--error ER_SECONDARY_ENGINE_PLUGIN
+ALTER TABLE h1 SECONDARY_LOAD;
+SET SESSION duckdb_history_check_only = OFF;
+ALTER TABLE h1 SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+SET SESSION use_secondary_engine = FORCED, duckdb_history_scope = FULL;
+SELECT id, v, c FROM h1 ORDER BY id, v;
+SET SESSION duckdb_history_scope = LIVE, use_secondary_engine = ON;
+
+--echo # confirmed unload, then discard of a stale copy
+SET SESSION duckdb_unload_history_confirm = ON;
+ALTER TABLE h1 SECONDARY_UNLOAD;
+SET SESSION duckdb_unload_history_confirm = OFF;
+DROP TABLE h1;
+
+--disconnect con_h
+--connection default
+REVOKE DUCKDB_HISTORY_READER ON *.* FROM root@localhost;
+--source ../include/cleanup.inc

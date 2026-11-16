@@ -1,0 +1,50 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#2, DWL#3: the plugins, variables and status; load and unload.
+--source ../include/have_duckdb.inc
+
+SELECT PLUGIN_NAME, PLUGIN_STATUS, PLUGIN_TYPE, PLUGIN_AUTHOR
+  FROM information_schema.PLUGINS WHERE PLUGIN_NAME LIKE 'duckdb%' ORDER BY 1;
+SELECT ENGINE, SUPPORT FROM information_schema.ENGINES WHERE ENGINE = 'DUCKDB';
+--replace_column 2 #
+SHOW GLOBAL STATUS LIKE 'duckdb_enabled';
+
+--echo # Variables (paths and sizes vary)
+SELECT VARIABLE_NAME FROM performance_schema.global_variables
+  WHERE VARIABLE_NAME LIKE 'duckdb%' ORDER BY 1;
+
+--echo # Load and unload
+CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(10)) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+ALTER TABLE t1 SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+SELECT TABLE_NAME, CREATE_OPTIONS FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't1';
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM t1;
+SET SESSION use_secondary_engine = ON;
+ALTER TABLE t1 SECONDARY_UNLOAD;
+SET SESSION use_secondary_engine = FORCED;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT COUNT(*) FROM t1;
+SET SESSION use_secondary_engine = ON;
+
+--echo # Refused loads
+CREATE TABLE t2 (v INT) SECONDARY_ENGINE = duckdb;
+--error ER_SECONDARY_ENGINE_PLUGIN
+ALTER TABLE t2 SECONDARY_LOAD;
+
+--source ../include/cleanup.inc

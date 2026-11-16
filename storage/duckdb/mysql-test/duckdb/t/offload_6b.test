@@ -1,0 +1,111 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#6 step 6b: expressions, PAD SPACE collations, TIMESTAMP constants (section 22).
+--source ../include/have_duckdb.inc
+--source ../include/tables_p6.inc
+
+--let $query= SELECT id, amount + qty, amount - 1.5, amount * qty, qty * 3 - id, -qty, ABS(qty) FROM p6 WHERE id <= 30 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT grp, SUM(amount * qty), SUM(qty * id), MIN(price * 2), MAX(-amount) FROM p6 GROUP BY grp ORDER BY grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, qty DIV 7, qty MOD 7, qty % 0, qty DIV 0, amount MOD 3, id DIV -4 FROM p6 WHERE id <= 30 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, price / 3, price / 0, price * 1.5 FROM p6 WHERE id <= 30 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, ROUND(amount), ROUND(amount, 1), ROUND(amount, -1), ROUND(qty, -2) FROM p6 WHERE id <= 40 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE qty * 2 > amount AND id % 3 = 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, CASE WHEN qty > 500 THEN 'high' WHEN qty > 0 THEN 'mid' ELSE 'low' END FROM p6 WHERE id <= 30 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, CASE grp WHEN 1 THEN 'one' WHEN 2 THEN 'two' END, IF(qty IS NULL, -1, qty), IFNULL(amount, 0), COALESCE(qty, amount, -9) FROM p6 WHERE id <= 30 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, NULLIF(grp, 3), NULLIF(b4, 'a') FROM p6 WHERE id <= 30 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT CASE WHEN qty < 0 THEN -1 ELSE 1 END AS k, COUNT(*), SUM(amount) FROM p6 GROUP BY k ORDER BY k
+--source ../include/duckdb_compare.inc
+--let $query= SELECT DISTINCT grp FROM p6 ORDER BY grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT DISTINCT s FROM p6 ORDER BY s
+--source ../include/duckdb_compare.inc
+--let $query= SELECT DISTINCT raw FROM p6 ORDER BY raw
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(DISTINCT grp), COUNT(DISTINCT qty), COUNT(DISTINCT b4), COUNT(DISTINCT b3), COUNT(DISTINCT s), COUNT(DISTINCT raw) FROM p6
+--source ../include/duckdb_compare.inc
+--let $query= SELECT grp, COUNT(DISTINCT b4), SUM(DISTINCT qty), AVG(DISTINCT qty) FROM p6 GROUP BY grp ORDER BY grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, YEAR(d), MONTH(d), DAYOFMONTH(d), DAYOFYEAR(d), QUARTER(d), DAYOFWEEK(d), WEEKDAY(d) FROM p6 WHERE id <= 30 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, YEAR(dt), HOUR(dt), MINUTE(dt), SECOND(dt), DATE(dt), HOUR(d) FROM p6 WHERE id <= 30 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT YEAR(d), MONTH(d), COUNT(*), SUM(amount) FROM p6 GROUP BY YEAR(d), MONTH(d) ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+--let $query= SELECT DAYOFWEEK(dt), COUNT(*) FROM p6 GROUP BY DAYOFWEEK(dt) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE d >= '2021-06-01' AND YEAR(dt) = 2021
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 LIKE 'a%'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 LIKE 'a'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 LIKE 'a_'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE s LIKE 'p%' OR s LIKE '_q'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 NOT LIKE '%b%'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 LIKE 'a|_%' ESCAPE '|'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 = 'a'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 = 'a    '
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b3 = 'x' OR b3 = 'Y'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 IN ('a', 'b ', '')
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 > 'a'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 < 'a'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 BETWEEN 'a' AND 'b'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE b4 <> 'a'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, b4, b3 FROM p6 WHERE id <= 40 ORDER BY b4, id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, b4 FROM p6 WHERE id <= 40 ORDER BY b4 DESC, id DESC
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(b4), MAX(b4), MIN(b3), MAX(b3) FROM p6
+--source ../include/duckdb_compare.inc
+--let $query= SELECT grp, MIN(b4), MAX(b3) FROM p6 GROUP BY grp ORDER BY grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT b4, COUNT(*) FROM p6 GROUP BY b4 ORDER BY b4
+--source ../include/duckdb_compare.inc
+--let $query= SELECT b3, COUNT(*), SUM(qty) FROM p6 GROUP BY b3 HAVING COUNT(*) > 100 ORDER BY b3 DESC
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(id), MAX(id), COUNT(DISTINCT b3), COUNT(*) FROM p6 GROUP BY b4 ORDER BY MIN(id)
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE ts >= '2021-06-01 00:00:00'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE ts BETWEEN '2021-10-31 01:00:00' AND '2021-10-31 04:00:00'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, ts FROM p6 WHERE ts < '2021-03-02' ORDER BY ts, id LIMIT 10
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM p6 WHERE ts IN ('2021-03-01 01:40:07', '2021-03-01 03:20:14')
+--source ../include/duckdb_compare.inc
+
+--source ../include/cleanup.inc

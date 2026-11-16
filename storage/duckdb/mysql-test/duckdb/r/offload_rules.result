@@ -1,0 +1,43 @@
+# Below the cost threshold: InnoDB; duckdb_offload_min_rows tries a full scan of g
+SET SESSION use_secondary_engine = ON, duckdb_offload_min_rows = 0;
+SELECT COUNT(*) FROM g WHERE n = 3;
+COUNT(*)
+12308
+offloaded_without_rule
+0
+SET SESSION duckdb_offload_min_rows = 100000;
+SELECT COUNT(*) FROM g WHERE n = 3;
+COUNT(*)
+12308
+offloaded_with_rule
+1
+SELECT id FROM g WHERE id = 12345;
+id
+12345
+offloaded_primary_key_lookup
+0
+SET SESSION duckdb_offload_min_rows = DEFAULT;
+# Read your own writes; a transaction that wrote is not offloaded
+SET SESSION use_secondary_engine = FORCED;
+INSERT INTO g (id, grp) VALUES (900001, 1);
+SELECT COUNT(*) FROM g WHERE id > 900000;
+COUNT(*)
+1
+DELETE FROM g WHERE id > 900000;
+SELECT COUNT(*) FROM g WHERE id > 900000;
+COUNT(*)
+0
+BEGIN;
+INSERT INTO g (id, grp) VALUES (900002, 1);
+SELECT COUNT(*) FROM g;
+ERROR HY000: Secondary engine operation failed. Reason: "Query is part of a multi-statement transaction, which is not supported in secondary engines.".
+ROLLBACK;
+# EXPLAIN: notes with the DuckDB SQL and DuckDB's plan
+EXPLAIN FORMAT=TREE SELECT grp, SUM(amount) FROM g GROUP BY grp;
+duckdb_notes	note_code
+1	3877
+# max_execution_time interrupts DuckDB: MySQL's error with DuckDB's message
+SET SESSION max_execution_time = 1000;
+SELECT COUNT(*) FROM g a JOIN g b ON a.amount < b.amount;
+ERROR HY000: Query execution was interrupted, maximum statement execution time exceeded (DuckDB error: ...)
+SET SESSION max_execution_time = 0, use_secondary_engine = ON;

@@ -29,7 +29,9 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,16 +47,21 @@
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
 #include "sql/item_sum.h"
+#include "sql/item_subselect.h"
 #include "include/mem_root_deque.h"
 #include "sql/opt_trace.h"
 #include "sql/query_result.h"
+#include "sql/query_term.h"
 #include "sql/replication.h"  // Trans_observer
 #include "sql/sql_class.h"
+#include "sql/sql_executor.h"  // QEP_TAB
 #include "sql/sql_lex.h"
 #include "sql/sql_optimizer.h"
 #include "sql/table.h"
 #include "sql/tztime.h"
 #include "storage/duckdb/duckdb_binlog_reader.h"
+#include "storage/duckdb/duckdb_collation.h"
+#include "storage/duckdb/duckdb_guard.h"
 #include "storage/duckdb/duckdb_lake.h"
 #include "storage/duckdb/duckdb_load.h"  // history_scope_full
 #include "storage/duckdb/duckdb_registry.h"
@@ -73,9 +80,17 @@ std::unordered_map<my_thread_id, BinlogPos> g_last_commit;
 const handlerton *g_hton = nullptr;
 char g_session_marker;  // our per-connection data: close_connection is called
 
+// The transaction observer, after the InnoDB commit of each transaction.
+// It also wakes the binlog reader: with binlog_order_commits=ON the server
+// commits a group in InnoDB, then calls after_commit for each transaction in
+// binary log order (sql/binlog.cc, ordered_commit), so the reader never reads
+// a transaction InnoDB has not committed yet. after_sync (earlier) runs
+// before the InnoDB commit: DuckDB could show a transaction before InnoDB
+// does, for seconds with semi-sync AFTER_SYNC waiting for a replica.
 int after_commit(Trans_param *param) {
   try {
     if (param->log_file == nullptr || *param->log_file == '\0') return 0;
+    BinlogReader::instance().notify_committed(param->log_file, param->log_pos);
     std::lock_guard<std::mutex> guard(g_commit_mutex);
     auto it = g_last_commit.find(param->thread_id);
     if (it != g_last_commit.end())
@@ -91,6 +106,7 @@ Trans_observer g_trans_observer = {sizeof(Trans_observer), nullptr, nullptr,
 bool g_observer_registered = false;
 
 int close_connection(handlerton *, THD *thd) {
+  guard_forget(thd);
   try {
     std::lock_guard<std::mutex> guard(g_commit_mutex);
     g_last_commit.erase(thd->thread_id());
@@ -144,6 +160,7 @@ enum class Kind {
 class OffloadContext : public Secondary_engine_execution_context {
  public:
   ~OffloadContext() override {
+    restore_optimizer_switch();
     if (!con) return;
     std::string ignored;
     try {
@@ -159,16 +176,46 @@ class OffloadContext : public Secondary_engine_execution_context {
   std::string sql;
   std::vector<Kind> kinds;
   std::string reason;
-  double best_cost{DBL_MAX};
   bool executed{false};
   std::unique_ptr<Lake::Connection> con;
   duckdb_prepared_statement stmt{nullptr};
+
+  // Semi-join materialization is turned off while the server optimizes a
+  // statement for us: that strategy rewrites WHERE to read its own
+  // temporary table (<subqueryN>), which DuckDB does not have. The other
+  // strategies keep the conditions on the real tables. sql_lex.cc
+  // (update_semijoin_strategies) says secondary engines choose their
+  // strategies through thd->variables.optimizer_switch.
+  void disable_semijoin_materialization(THD *t) {
+    thd = t;
+    had_materialization = (thd->variables.optimizer_switch &
+                           OPTIMIZER_SWITCH_MATERIALIZATION) != 0;
+    thd->variables.optimizer_switch &= ~OPTIMIZER_SWITCH_MATERIALIZATION;
+    switch_changed = true;
+  }
+  void restore_optimizer_switch() {
+    if (!switch_changed) return;
+    if (had_materialization)
+      thd->variables.optimizer_switch |= OPTIMIZER_SWITCH_MATERIALIZATION;
+    switch_changed = false;
+  }
+
+ private:
+  THD *thd{nullptr};
+  bool had_materialization{false};
+  bool switch_changed{false};
 };
 
 OffloadContext *context(THD *thd) {
   return static_cast<OffloadContext *>(
       thd->lex->secondary_engine_execution_context());
 }
+
+// Our own error for a scalar subquery with more than one row (the one-row
+// check of a derived table made from a scalar subquery); DuckDB's own
+// message for a scalar subquery is matched too.
+constexpr const char *kDuckDBMultipleRows =
+    "More than one row returned by a subquery used as an expression";
 
 bool is_string(const Item *item) {
   return item->result_type() == STRING_RESULT && !item->is_temporal();
@@ -186,15 +233,45 @@ bool is_unicode_charset(const CHARSET_INFO *cs) {
 // - PAD: PAD SPACE binary collations of utf8mb3/utf8mb4 (utf8mb3_bin,
 //   utf8mb4_bin): code point order with trailing spaces ignored, reproduced
 //   with rtrim (equality) and a padded sort key (ordering);
-// - REFUSE: any other collation (weight strings, a later step).
-enum class StrMode { RAW, PAD, REFUSE };
+// - WEIGHT: any other collation: the copy has MySQL's weight of each value
+//   in "__w_<column>" (DWL#6 step A); constants are weighted when we print
+//   the SQL; other expressions are refused;
+// - REFUSE: not used (kept for a collation without weights).
+enum class StrMode { RAW, PAD, WEIGHT, REFUSE };
 
-StrMode str_mode(const Item *item) {
-  const CHARSET_INFO *cs = item->collation.collation;
+StrMode str_mode_cs(const CHARSET_INFO *cs) {
   if (cs == &my_charset_bin) return StrMode::RAW;
   if ((cs->state & MY_CS_BINSORT) != 0 && is_unicode_charset(cs))
     return cs->pad_attribute == NO_PAD ? StrMode::RAW : StrMode::PAD;
-  return StrMode::REFUSE;
+  return needs_weight(cs) ? StrMode::WEIGHT : StrMode::REFUSE;
+}
+
+// A BLOB literal of any bytes.
+std::string blob_literal(const std::string &bytes) {
+  static const char hex[] = "0123456789ABCDEF";
+  std::string out = "'";
+  for (unsigned char b : bytes) {
+    out += "\\x";
+    out += hex[b >> 4];
+    out += hex[b & 15];
+  }
+  return out + "'::BLOB";
+}
+
+std::vector<std::string> split_list(const std::string &joined) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (!joined.empty() && start <= joined.size()) {
+    size_t end = joined.find('\x1f', start);
+    if (end == std::string::npos) end = joined.size();
+    out.push_back(joined.substr(start, end - start));
+    start = end + 1;
+  }
+  return out;
+}
+
+StrMode str_mode(const Item *item) {
+  return str_mode_cs(item->collation.collation);
 }
 
 bool is_date_or_datetime(enum_field_types t) {
@@ -214,6 +291,30 @@ std::string pad_sort_key(const std::string &e, size_t max_bytes) {
 std::string pad_equal_key(const std::string &e) {
   return "rtrim(" + e + ", ' ')";
 }
+
+// Kinds a set operation may combine: numbers with numbers, DATE with
+// DATETIME; otherwise the same kind.
+int kind_class(Kind k) {
+  switch (k) {
+    case Kind::INT:
+    case Kind::UINT:
+    case Kind::DOUBLE:
+    case Kind::DECIMAL:
+      return 0;
+    case Kind::STRING:
+      return 1;
+    case Kind::BLOB:
+      return 2;
+    case Kind::DATE:
+    case Kind::DATETIME:
+      return 3;
+    case Kind::TIMESTAMP:
+      return 4;
+  }
+  return -1;
+}
+
+bool same_class(Kind a, Kind b) { return kind_class(a) == kind_class(b); }
 
 class Generator {
  public:
@@ -239,29 +340,88 @@ class Generator {
   bool operands(Item_func *fn, bool ordering, unsigned from, unsigned to,
                 std::vector<std::string> *ops);
   bool numeric(Item *item, std::string *out);
+  int division_frac(int f1, int f2) const;
+  bool internal_frac(Item *item, int *frac);
+  bool exact_division(const std::string &a, int f1, const std::string &b,
+                      int f2, int round_to, std::string *out);
   bool temporal_arg(Item *item, std::string *out);
   bool order_key(Item *item, std::string *out);
+  bool weight_expr(Item *item, const CHARSET_INFO *cs, std::string *out);
+  bool string_key(Item *item, const CHARSET_INFO *cs, bool ordering,
+                  size_t max_bytes, std::string *out);
   bool literal(Item *item, std::string *out);
   bool typed_literal(Item *item, enum_field_types type, std::string *out);
   bool output_kind(Item *item, Kind *kind, std::string *cast);
 
+  // An AND part of a condition and the tables it uses.
+  struct Conj {
+    std::string sql;
+    table_map tables;
+  };
+  bool table_ref(Table_ref *tr, std::string *out);
+  bool from_list(mem_root_deque<Table_ref *> &list, bool under_outer,
+                 bool in_semi, std::string *out);
+  bool conjuncts(Item *cond, table_map avoid, std::vector<Conj> *out);
+  bool multi_eq(Item_multi_eq *eq, table_map avoid, std::vector<Conj> *out);
+  bool comparable(Item *a, Item *b);
+  bool block_sql(Query_block *qb, const std::vector<std::string> *names,
+                 std::vector<Kind> *kinds, std::string *sql,
+                 const std::vector<Item *> *targets = nullptr,
+                 const std::string *from_sql = nullptr,
+                 std::set<std::string> *weights_out = nullptr,
+                 bool weights_required = false);
+  bool setop_sql(Query_term_set_op *t, const std::vector<std::string> *names,
+                 const std::vector<Item *> *targets, std::vector<Kind> *kinds,
+                 std::string *sql, std::set<std::string> *weights_out = nullptr,
+                 bool weights_required = false);
+  bool subquery_sql(Query_expression *unit, std::string *sql);
+  bool subquery(Item_subselect *sub, std::string *out);
+  std::string truth(const std::string &e, Item::Bool_test test, bool *ok);
+
+  // A table of the query: its alias and primary key (base tables).
+  struct TableInfo {
+    std::string alias;
+    std::string pk;          // the key, or row(...) of its columns
+    std::string pk_parts;    // its columns
+    std::string pk_negated;  // negated (empty unless all integers)
+    bool derived{false};     // a materialized derived table (our SQL)
+    bool positional{false};  // columns named c1, c2, ... (set operations)
+    bool scalar{false};      // a scalar subquery the server made a table:
+                             // exactly one row (or none)
+    std::set<std::string> weights;  // columns with a weight column
+    std::vector<const Field *> pk_fields;  // base tables
+  };
+  // What is being printed in one query block.
+  struct Block {
+    Block *parent{nullptr};    // the enclosing block of a subquery
+    Query_block *qb{nullptr};  // the query block printed
+    std::set<const TABLE *> tables;  // the tables its columns may use
+    bool post_group{false};          // select list, HAVING, ORDER BY
+    int agg_depth{0};
+    // PAD SPACE columns in GROUP BY: grouped on rtrim(); outside an
+    // aggregate shown as the value of the row with the smallest primary
+    // key, the row InnoDB meets first (single table only).
+    std::vector<const Field *> group_pad;
+    std::set<const Field *> grouped;  // GROUP BY columns
+    struct Semi {
+      Table_ref *nest;
+      bool anti;
+      std::string from;
+    };
+    std::vector<Semi> semi;  // semi- and anti-join nests at the top
+  };
+  bool grouped_value(const Field *field, const TableInfo &ti,
+                     const std::string &col, std::string *out);
+
   THD *m_thd;
   std::string *m_reason;
-  TABLE *m_table{nullptr};
+  bool m_full{false};
+  std::map<const TABLE *, TableInfo> m_info;
+  int m_next_alias{0};
+  Block *m_block{nullptr};
   // While printing the operands of a comparison with a DATE, DATETIME or
   // TIMESTAMP column: constants are values of that type, as MySQL compares.
   enum_field_types m_temporal{MYSQL_TYPE_NULL};
-  // Printing the select list, HAVING or ORDER BY of a grouped query.
-  bool m_post_group{false};
-  int m_agg_depth{0};
-  // PAD SPACE string columns in GROUP BY: grouped on rtrim(); outside an
-  // aggregate they are shown as the value of the row with the smallest
-  // primary key, the row InnoDB meets first in the group.
-  std::vector<const Field *> m_group_pad;
-  std::string m_pk;
-  // The primary key columns, and negated (empty if one is not a number).
-  std::string m_pk_parts;
-  std::string m_pk_negated;
 };
 
 // A constant compared with a DATE, DATETIME or TIMESTAMP: MySQL converts it
@@ -380,9 +540,7 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
         temporal = t;
     } else if (is_string(a)) {
       strings = true;
-      const StrMode mode = str_mode(a);
-      if (mode == StrMode::REFUSE) return refuse_collation(a);
-      if (mode == StrMode::PAD) pad = true;
+      if (str_mode(a) == StrMode::REFUSE) return refuse_collation(a);
       max_bytes = std::max<size_t>(max_bytes, a->max_length);
     } else {
       numbers = true;
@@ -396,6 +554,19 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
   // string to the number's type (and fail on 'ab').
   if (strings && (numbers || const_numbers))
     return refuse("string_number_comparison");
+  // The comparison's collation decides (a COLLATE clause or a column of
+  // another collation can change it).
+  const CHARSET_INFO *cs = nullptr;
+  if (strings) {
+    cs = fn->compare_collation();
+    for (unsigned i = from; i < to && cs == nullptr; i++)
+      if (is_string(args[i]->real_item()) && !args[i]->real_item()->const_item())
+        cs = args[i]->real_item()->collation.collation;
+    if (cs == nullptr || str_mode_cs(cs) == StrMode::REFUSE)
+      return refuse(std::string("collation:comparison (") +
+                    (cs != nullptr ? cs->m_coll_name : "unknown") + ")");
+  }
+  (void)pad;
   const enum_field_types saved = m_temporal;
   m_temporal = timestamp ? MYSQL_TYPE_TIMESTAMP : temporal;
   bool failed = false;
@@ -410,15 +581,96 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
       const double v = a->val_real();
       snprintf(buf, sizeof(buf), "CAST(%.17g AS DOUBLE)", v);
       s = a->null_value ? "NULL" : buf;
+    } else if (strings && is_string(a)) {
+      // The comparison key of the collation: bytes, rtrim / padded key, or
+      // MySQL's weight.
+      failed = string_key(a, cs, ordering, max_bytes, &s);
     } else {
       failed = expr(a, &s);
     }
-    if (!failed && pad && is_string(a))
-      s = ordering ? pad_sort_key(s, max_bytes) : pad_equal_key(s);
     ops->push_back(s);
   }
   m_temporal = saved;
   return failed;
+}
+
+// MySQL's decimal division (mysys/decimal.cc, do_div_mod): operand scales
+// are rounded up to 9-digit words, div_precision_increment is reduced by
+// that padding, and the quotient is truncated at a whole number of words:
+// F fractional digits. That truncated value is what other expressions use;
+// only the output rounds it (half up) to the item's scale.
+int Generator::division_frac(int f1, int f2) const {
+  auto words = [](int digits) { return (digits + 8) / 9; };
+  const int frac1 = words(f1) * 9, frac2 = words(f2) * 9;
+  int incr = static_cast<int>(m_thd->variables.div_precincrement) -
+             (frac1 - f1) - (frac2 - f2);
+  if (incr < 0) incr = 0;
+  return words(frac1 + frac2 + incr) * 9;
+}
+
+// The scale of an operand's value as MySQL holds it: arithmetic functions
+// (division included) round their value to their scale; AVG keeps the
+// division's F digits.
+bool Generator::internal_frac(Item *item, int *frac) {
+  item = item->real_item();
+  if (item->type() == Item::SUM_FUNC_ITEM) {
+    auto *sum = down_cast<Item_sum *>(item);
+    if ((sum->sum_func() == Item_sum::AVG_FUNC ||
+         sum->sum_func() == Item_sum::AVG_DISTINCT_FUNC) &&
+        sum->result_type() == DECIMAL_RESULT && sum->argument_count() == 1) {
+      *frac = division_frac(static_cast<int>(sum->get_arg(0)->decimals), 0);
+      return false;
+    }
+  }
+  *frac = static_cast<int>(item->decimals);
+  return false;
+}
+
+// a / b exactly as MySQL: with A, B the operands times 10^f1, 10^f2 (exact
+// integers), R = |A| 10^(F - f1 + f2) // |B| (truncated), with the sign of
+// A * B, as DECIMAL(38, F), then rounded half up to round_to digits (unless
+// -1); NULL when b is 0. Computed in HUGEINT: a value
+// too large for 128 bits is a DuckDB error, never a wrong value.
+bool Generator::exact_division(const std::string &a, int f1,
+                               const std::string &b, int f2, int round_to,
+                               std::string *out) {
+  const int F = division_frac(f1, f2);
+  const int shift = F - f1 + f2;
+  if (F > 36 || shift < 0 || f1 > 18 || f2 > 18)
+    return refuse("exact_division_precision");
+  auto pow10 = [](int n) {
+    return "CAST('1" + std::string(static_cast<size_t>(n), '0') +
+           "' AS HUGEINT)";
+  };
+  // The value times 10^scale as an exact integer: integer part and
+  // fraction separately (x * 10^scale in DECIMAL overflows DuckDB's
+  // 38-digit intermediate for values that fit).
+  auto scaled = [&](const std::string &e, int scale) {
+    if (scale == 0) return "CAST(" + e + " AS HUGEINT)";
+    const std::string x =
+        "CAST(" + e + " AS DECIMAL(38," + std::to_string(scale) + "))";
+    return "(CAST(trunc(" + x + ") AS HUGEINT) * " + pow10(scale) +
+           " + CAST((" + x + " - trunc(" + x + ")) * " + pow10(scale) +
+           " AS HUGEINT))";
+  };
+  const std::string A = scaled(a, f1), B = scaled(b, f2);
+  const std::string R =
+      "((abs(" + A + ") * " + pow10(shift) + ") // abs(" + B + "))";
+  const std::string signed_r = "(CASE WHEN (" + A + " < 0) <> (" + B +
+                               " < 0) THEN -" + R + " ELSE " + R + " END)";
+  const std::string unit =
+      F == 0 ? std::string("CAST(1 AS DECIMAL(1,0))")
+             : "CAST('0." + std::string(static_cast<size_t>(F - 1), '0') +
+                   "1' AS DECIMAL(" + std::to_string(F + 1) + "," +
+                   std::to_string(F) + "))";
+  std::string value = "CAST(CAST(" + signed_r + " AS DECIMAL(38,0)) * " +
+                      unit + " AS DECIMAL(38," + std::to_string(F) + "))";
+  // DuckDB's DECIMAL cast rounds half away from zero, as MySQL's HALF_UP.
+  if (round_to >= 0 && round_to < F)
+    value = "CAST(" + value + " AS DECIMAL(38," + std::to_string(round_to) +
+            "))";
+  *out = "(CASE WHEN " + B + " = 0 THEN NULL ELSE " + value + " END)";
+  return false;
 }
 
 // An arithmetic operand: a number (no string or temporal conversion), with
@@ -451,27 +703,134 @@ bool Generator::temporal_arg(Item *item, std::string *out) {
 bool Generator::order_key(Item *item, std::string *out) {
   Item *e = item->real_item();
   std::string s;
-  if (is_string(e)) {
-    const StrMode mode = str_mode(e);
-    if (mode == StrMode::REFUSE) return refuse_collation(e);
-    if (expr(e, &s)) return true;
-    *out = mode == StrMode::PAD ? pad_sort_key(s, e->max_length) : s;
+  if (is_string(e))
+    return string_key(e, e->collation.collation, true, e->max_length, out);
+  return expr(e, out);
+}
+
+// The weight of a string under collation cs: the weight column of a column
+// (the column's own collation must be cs), or the weight of a constant,
+// computed now with MySQL's collation code. Other expressions are refused.
+bool Generator::weight_expr(Item *item, const CHARSET_INFO *cs,
+                            std::string *out) {
+  item = item->real_item();
+  if (item->type() == Item::CACHE_ITEM &&
+      down_cast<Item_cache *>(item)->get_example() != nullptr)
+    item = down_cast<Item_cache *>(item)->get_example()->real_item();
+  if (item->const_item()) {
+    if (item->is_null()) {
+      *out = "NULL";
+      return false;
+    }
+    String buf;
+    const String *v = item->val_str(&buf);
+    if (v == nullptr) {
+      *out = "NULL";
+      return false;
+    }
+    String conv;
+    uint errors = 0;
+    if (conv.copy(v->ptr(), v->length(), v->charset(), cs, &errors) ||
+        errors != 0)
+      return refuse("weighted_constant_charset");
+    *out = blob_literal(collation_weight(cs, conv.ptr(), conv.length()));
     return false;
   }
-  return expr(e, out);
+  if (item->type() != Item::FIELD_ITEM)
+    return refuse(std::string("collation:expression (") + cs->m_coll_name +
+                  ")");
+  auto *f = down_cast<Item_field *>(item);
+  if (f->field == nullptr) return refuse("weight_without_field");
+  if (f->field->charset() != cs)
+    return refuse(std::string("collation:") + f->field_name + " compared as " +
+                  cs->m_coll_name);
+  const Block *owner = m_block;
+  while (owner != nullptr && owner->tables.count(f->field->table) == 0)
+    owner = owner->parent;
+  if (owner == nullptr) return refuse("outer_or_other_table_column");
+  const TableInfo &ti = m_info[f->field->table];
+  const std::string name =
+      ti.positional ? "c" + std::to_string(f->field->field_index() -
+                                           f->field->table->hidden_field_count +
+                                           1)
+                    : std::string(f->field->field_name);
+  if (ti.weights.count(name) == 0)
+    return refuse(std::string("collation:") + f->field_name + " (" +
+                  cs->m_coll_name + ", copy without weights: reload it)");
+  *out = ti.alias + "." + quote_ident(std::string(kWeightPrefix) + name);
+  return false;
+}
+
+// The key a string compares by under collation cs: its bytes (binary
+// collations), rtrim / padded key (PAD SPACE binary), or MySQL's weight;
+// for ordering a PAD SPACE weight gets the space weight appended up to the
+// longest value (max_bytes), so 'a' sorts as 'a   ' (after 'a\t').
+bool Generator::string_key(Item *item, const CHARSET_INFO *cs, bool ordering,
+                           size_t max_bytes, std::string *out) {
+  switch (str_mode_cs(cs)) {
+    case StrMode::RAW:
+      return expr(item, out);
+    case StrMode::PAD: {
+      std::string e;
+      if (expr(item, &e)) return true;
+      *out = ordering ? pad_sort_key(e, max_bytes) : pad_equal_key(e);
+      return false;
+    }
+    case StrMode::WEIGHT: {
+      if (weight_expr(item, cs, out)) return true;
+      if (ordering && cs->pad_attribute != NO_PAD) {
+        const size_t chars = max_bytes / std::max<uint>(cs->mbmaxlen, 1) + 1;
+        if (chars > 4096) return refuse("padded_order_too_long");
+        std::string pad;
+        const std::string space = space_weight(cs);
+        for (size_t i = 0; i < chars; i++) pad += space;
+        *out = "(" + *out + " || " + blob_literal(pad) + ")";
+      }
+      return false;
+    }
+    default:
+      return refuse(std::string("collation:") + cs->m_coll_name);
+  }
+}
+
+// A grouped string column (PAD or weight collation) outside an aggregate:
+// the group holds values equal under the collation that may differ ('a',
+// 'A '). MySQL shows the first row it met. On one table that is the row
+// with the smallest primary key; when GROUP BY contains the column's
+// table's primary key every row of the group has the same value; otherwise
+// (a join) the first row depends on the join order: refused (decided
+// 2026-11-14: exactly as InnoDB).
+bool Generator::grouped_value(const Field *field, const TableInfo &ti,
+                              const std::string &col, std::string *out) {
+  bool pk_grouped = !ti.pk_fields.empty();
+  for (const Field *k : ti.pk_fields)
+    pk_grouped = pk_grouped && m_block->grouped.count(k) > 0;
+  if (pk_grouped) {
+    *out = "any_value(" + col + ")";
+    return false;
+  }
+  if (m_block->tables.size() == 1 && !ti.pk.empty()) {
+    *out = "arg_min(" + col + ", " + ti.pk + ")";
+    return false;
+  }
+  (void)field;
+  return refuse("grouped_string_value_in_join");
 }
 
 bool Generator::aggregate(Item_sum *s, std::string *out) {
   if (s->m_is_window_function) return refuse("window_function");
-  if (m_agg_depth > 0) return refuse("nested_aggregate");
+  if (m_block->agg_depth > 0) return refuse("nested_aggregate");
+  if (s->aggr_query_block != nullptr && m_block->qb != nullptr &&
+      s->aggr_query_block != m_block->qb)
+    return refuse("aggregate_of_outer_query");
   const Item_sum::Sumfunctype f = s->sum_func();
   if (s->argument_count() != 1) return refuse("aggregate_arguments");
   Item *arg = s->get_arg(0)->real_item();
-  m_agg_depth++;
+  m_block->agg_depth++;
   struct Leave {
     int &d;
     ~Leave() { d--; }
-  } leave{m_agg_depth};
+  } leave{m_block->agg_depth};
   std::string a;
   switch (f) {
     case Item_sum::COUNT_FUNC:
@@ -484,10 +843,9 @@ bool Generator::aggregate(Item_sum *s, std::string *out) {
       return false;
     case Item_sum::COUNT_DISTINCT_FUNC:
       if (is_string(arg)) {
-        const StrMode mode = str_mode(arg);
-        if (mode == StrMode::REFUSE) return refuse_collation(arg);
-        if (expr(arg, &a)) return true;
-        if (mode == StrMode::PAD) a = pad_equal_key(a);
+        if (string_key(arg, arg->collation.collation, false, arg->max_length,
+                       &a))
+          return true;
       } else if (expr(arg, &a)) {
         return true;
       }
@@ -513,24 +871,36 @@ bool Generator::aggregate(Item_sum *s, std::string *out) {
         *out = "avg(" + d + a + ")";
         return false;
       }
-      *out = "(CAST(sum(" + d + a + ") AS DECIMAL(38," +
-             std::to_string(s->decimals) + ")) / NULLIF(count(" + d + a +
-             "), 0))";
-      return false;
+      // MySQL divides the exact sum by the count with its decimal division
+      // (Item_sum_avg): the same exact division as `/`.
+      // AVG keeps the truncated digits (Item_sum_avg::val_decimal does not
+      // round; the output does).
+      return exact_division("sum(" + d + a + ")",
+                            static_cast<int>(arg->decimals),
+                            "count(" + d + a + ")", 0, -1, out);
     }
     case Item_sum::MIN_FUNC:
     case Item_sum::MAX_FUNC: {
       const char *fn = f == Item_sum::MIN_FUNC ? "min" : "max";
-      if (is_string(arg) && str_mode(arg) == StrMode::PAD) {
+      if (is_string(arg) && (str_mode(arg) == StrMode::PAD ||
+                             str_mode(arg) == StrMode::WEIGHT)) {
         // Values equal under PAD SPACE ('' and ' ') tie: MySQL keeps the
         // first one met, the smallest primary key in a scan. The tie is
         // broken on the primary key (negated for MAX).
-        if (m_pk_negated.empty()) return refuse("padded_min_max_key");
+        // In a join the first row met depends on the join order: refused.
+        if (m_block->tables.size() > 1) return refuse("padded_min_max_in_join");
+        if (arg->type() != Item::FIELD_ITEM)
+          return refuse("padded_min_max_of_expression");
+        const auto info =
+            m_info.find(down_cast<Item_field *>(arg)->field->table);
+        if (info == m_info.end() || info->second.pk_negated.empty())
+          return refuse("padded_min_max_key");
         std::string key;
         if (expr(arg, &a) || order_key(arg, &key)) return true;
         const bool min = f == Item_sum::MIN_FUNC;
         *out = std::string(min ? "arg_min(" : "arg_max(") + a + ", row(" +
-               key + ", " + (min ? m_pk_parts : m_pk_negated) +
+               key + ", " +
+               (min ? info->second.pk_parts : info->second.pk_negated) +
                ")) FILTER (WHERE " + a + " IS NOT NULL)";
         return false;
       }
@@ -563,6 +933,12 @@ bool Generator::function(Item_func *fn, std::string *out) {
     std::string l, r;
     if (numeric(args[0], &l) || numeric(args[1], &r)) return true;
     *out = "(" + l + " " + op + " " + r + ")";
+    // MySQL rounds a DECIMAL result to the item's scale
+    // (Item_func_numhybrid::val_decimal): it matters when an operand has
+    // more digits (AVG).
+    if (fn->result_type() == DECIMAL_RESULT)
+      *out = "CAST(" + *out + " AS DECIMAL(38," +
+             std::to_string(fn->decimals) + "))";
     return false;
   };
   switch (fn->functype()) {
@@ -622,43 +998,10 @@ bool Generator::function(Item_func *fn, std::string *out) {
     }
     case Item_func::MULTI_EQ_FUNC: {
       // The optimizer's equality propagation: f1 = f2 = ... [= const].
-      auto *eq = down_cast<Item_multi_eq *>(fn);
-      std::vector<Item *> fields;
-      for (Item_field &f : eq->get_fields()) fields.push_back(&f);
-      if (fields.empty()) return refuse("empty_multiple_equality");
-      Item *first = fields[0];
-      const bool str = is_string(first);
-      if (str && str_mode(first) == StrMode::REFUSE)
-        return refuse_collation(first);
-      const bool pad = str && str_mode(first) == StrMode::PAD;
-      const enum_field_types t = first->data_type();
-      auto print = [&](Item *it, std::string *s) {
-        if (expr(it, s)) return true;
-        if (pad) *s = pad_equal_key(*s);
-        return false;
-      };
-      std::string f0, all;
-      if (print(first, &f0)) return true;
-      for (size_t i = 1; i < fields.size(); i++) {
-        if (fields[i]->data_type() != t ||
-            (is_string(fields[i]) && str_mode(fields[i]) != str_mode(first)))
-          return refuse("multiple_equality_types");
-        std::string a;
-        if (print(fields[i], &a)) return true;
-        all += (all.empty() ? "" : " AND ") + ("(" + f0 + " = " + a + ")");
-      }
-      if (Item *c = eq->const_arg(); c != nullptr) {
-        std::string cs;
-        if (t == MYSQL_TYPE_TIMESTAMP || is_date_or_datetime(t)) {
-          if (typed_literal(c, t, &cs)) return true;
-        } else if (str != is_string(c)) {
-          return refuse("multiple_equality_types");
-        } else if (expr(c, &cs)) {
-          return true;
-        }
-        if (pad) cs = pad_equal_key(cs);
-        all += (all.empty() ? "" : " AND ") + ("(" + f0 + " = " + cs + ")");
-      }
+      std::vector<Conj> parts;
+      if (multi_eq(down_cast<Item_multi_eq *>(fn), 0, &parts)) return true;
+      std::string all;
+      for (const Conj &c : parts) all += (all.empty() ? "" : " AND ") + c.sql;
       *out = all.empty() ? "TRUE" : "(" + all + ")";
       return false;
     }
@@ -667,7 +1010,9 @@ bool Generator::function(Item_func *fn, std::string *out) {
       if (!is_string(a) || a->const_item()) return refuse("like_argument");
       if (a->collation.collation == &my_charset_bin)
         return refuse("like_on_binary_string");
-      if (str_mode(a) == StrMode::REFUSE) return refuse_collation(a);
+      // LIKE compares characters: not with weights.
+      if (str_mode(a) != StrMode::RAW && str_mode(a) != StrMode::PAD)
+        return refuse_collation(a);
       if (!args[1]->const_item() || !is_string(args[1]->real_item()))
         return refuse("like_pattern_not_constant");
       // Trailing spaces are significant in LIKE, PAD SPACE or not.
@@ -693,8 +1038,19 @@ bool Generator::function(Item_func *fn, std::string *out) {
     case Item_func::MUL_FUNC: return arith("*");
     case Item_func::DIV_FUNC: {
       if (name == "DIV") break;  // integer division, below
-      // MySQL divides integers and decimals exactly (DECIMAL result); DuckDB
-      // returns DOUBLE: only the DOUBLE case is the same.
+      if (fn->result_type() == DECIMAL_RESULT) {
+        Item *l = args[0]->real_item(), *rt = args[1]->real_item();
+        if (l->result_type() == REAL_RESULT || rt->result_type() == REAL_RESULT)
+          return refuse("exact_division");
+        int f1, f2;
+        if (internal_frac(l, &f1) || internal_frac(rt, &f2)) return true;
+        std::string a, b;
+        if (numeric(l, &a) || numeric(rt, &b)) return true;
+        // The value is rounded to the item's scale (as every arithmetic
+        // function's, Item_func_numhybrid::val_decimal).
+        return exact_division(a, f1, b, f2, static_cast<int>(fn->decimals),
+                              out);
+      }
       if (fn->result_type() != REAL_RESULT) return refuse("exact_division");
       std::string l, r;
       if (numeric(args[0], &l) || numeric(args[1], &r)) return true;
@@ -774,6 +1130,24 @@ bool Generator::function(Item_func *fn, std::string *out) {
       *out = text + " END)";
       return false;
     }
+    case Item_func::ISTRUTH_FUNC: {
+      std::string a;
+      if (expr(args[0], &a)) return true;
+      // The test is only visible through its name (bool_transform_names).
+      static const std::pair<const char *, Item::Bool_test> tests[] = {
+          {"is true", Item::BOOL_IS_TRUE},
+          {"is false", Item::BOOL_IS_FALSE},
+          {"is not true", Item::BOOL_NOT_TRUE},
+          {"is not false", Item::BOOL_NOT_FALSE}};
+      for (const auto &t : tests)
+        if (name == t.first) {
+          bool ok = true;
+          *out = truth(a, t.second, &ok);
+          return ok ? false : refuse("truth_test");
+        }
+      return refuse("truth_test:" + name);
+    }
+    case Item_func::BOOL_IF_FUNC:  // internal IF with constant branches
     case Item_func::IF_FUNC: {
       std::string c, a, b;
       if (expr(args[0], &c) || expr(args[1], &a) || expr(args[2], &b))
@@ -801,6 +1175,25 @@ bool Generator::function(Item_func *fn, std::string *out) {
       break;
   }
   // Functions without their own functype, by name.
+  if (name == "<in_optimizer>") {
+    // Wraps an IN subquery predicate (created with it as its only argument;
+    // the left operand is added later): we look for it.
+    for (unsigned i = 0; i < n; i++) {
+      Item *a = args[i] != nullptr ? args[i]->real_item() : nullptr;
+      if (a != nullptr && a->type() == Item::SUBQUERY_ITEM)
+        return subquery(down_cast<Item_subselect *>(a), out);
+    }
+    return refuse("in_optimizer");
+  }
+  if (name == "any_value")
+    // The server's rewrite of a correlated scalar subquery without
+    // aggregate: MySQL raises an error when a key has several rows, which
+    // any_value hides.
+    return refuse("correlated_scalar_subquery_without_aggregate");
+  if (name == "true" || name == "false") {
+    *out = name == "true" ? "TRUE" : "FALSE";
+    return false;
+  }
   if (name == "coalesce" || name == "ifnull") {
     std::string all;
     for (unsigned i = 0; i < n; i++) {
@@ -853,20 +1246,53 @@ bool Generator::function(Item_func *fn, std::string *out) {
 
 bool Generator::expr(Item *item, std::string *out) {
   item = item->real_item();
-  if (item->has_subquery()) return refuse("subquery");
   switch (item->type()) {
+    case Item::SUBQUERY_ITEM:
+      return subquery(down_cast<Item_subselect *>(item), out);
+    case Item::CACHE_ITEM: {
+      // A cached copy of an expression (the server's rewrites use them).
+      Item *example = down_cast<Item_cache *>(item)->get_example();
+      if (example == nullptr) return refuse("cache_without_expression");
+      return expr(example, out);
+    }
     case Item::FIELD_ITEM: {
       auto *f = down_cast<Item_field *>(item);
-      if (f->field == nullptr || f->field->table != m_table)
-        return refuse("outer_or_other_table_column");
+      // A column of this block or, in a subquery, of an enclosing block (a
+      // correlated reference: aliases are unique in the statement).
+      const Block *owner = m_block;
+      while (owner != nullptr && f->field != nullptr &&
+             owner->tables.count(f->field->table) == 0)
+        owner = owner->parent;
+      if (f->field == nullptr || owner == nullptr)
+        return refuse(std::string("outer_or_other_table_column:") +
+                      (f->table_name != nullptr ? f->table_name : "") + "." +
+                      (f->field_name != nullptr ? f->field_name : ""));
       if (f->field->is_flag_set(NOT_SECONDARY_FLAG))
         return refuse(std::string("not_secondary_column:") + f->field_name);
-      const std::string col = "t." + quote_ident(f->field->field_name);
+      const TableInfo &ti = m_info[f->field->table];
+      const std::string col =
+          ti.positional
+              ? ti.alias + ".c" +
+                    std::to_string(f->field->field_index() -
+                                   f->field->table->hidden_field_count + 1)
+              : ti.alias + "." + quote_ident(f->field->field_name);
+      if (owner != m_block) {
+        *out = col;
+        return false;
+      }
+      // A table made from a scalar subquery has one row: its columns are
+      // the same for the whole group (MySQL allows them in HAVING and the
+      // select list; DuckDB wants an aggregate).
+      if (ti.scalar && m_block->post_group && m_block->agg_depth == 0) {
+        *out = "any_value(" + col + ")";
+        return false;
+      }
       bool group_pad = false;
-      for (const Field *g : m_group_pad) group_pad = group_pad || g == f->field;
-      *out = m_post_group && m_agg_depth == 0 && group_pad
-                 ? "arg_min(" + col + ", " + m_pk + ")"
-                 : col;
+      for (const Field *g : m_block->group_pad)
+        group_pad = group_pad || g == f->field;
+      if (m_block->post_group && m_block->agg_depth == 0 && group_pad)
+        return grouped_value(f->field, ti, col, out);
+      *out = col;
       return false;
     }
     case Item::INT_ITEM:
@@ -915,8 +1341,15 @@ bool Generator::output_kind(Item *item, Kind *kind, std::string *cast) {
       *cast = "DATE";
       return false;
     case MYSQL_TYPE_YEAR:
-      // YEAR() of a date is an integer; a YEAR column is not translated.
-      if (item->type() != Item::FUNC_ITEM) return refuse("unsupported_result_type");
+      // YEAR() of a date is an integer, also as a column of a derived table
+      // (cast to BIGINT by our SQL); a YEAR column is not translated.
+      if (Item *r = item->real_item(); r->type() == Item::FIELD_ITEM) {
+        const auto info = m_info.find(down_cast<Item_field *>(r)->field->table);
+        if (info == m_info.end() || !info->second.derived)
+          return refuse("unsupported_result_type");
+      } else if (r->type() != Item::FUNC_ITEM) {
+        return refuse("unsupported_result_type");
+      }
       *kind = Kind::INT;
       *cast = "BIGINT";
       return false;
@@ -969,63 +1402,300 @@ bool Generator::output_kind(Item *item, Kind *kind, std::string *cast) {
   }
 }
 
-bool Generator::generate(LEX *lex, std::string *sql,
-                         std::vector<Kind> *kinds) {
-  if (lex->sql_command != SQLCOM_SELECT)
-    return refuse("unsupported_statement");
-  Query_expression *unit = lex->unit;
-  if (!unit->is_simple()) return refuse("set_operation");
-  Query_block *qb = unit->first_query_block();
-  if (qb->leaf_table_count != 1 || qb->leaf_tables == nullptr)
-    return refuse("not_single_table");
-  Table_ref *tr = qb->leaf_tables;
-  if (!tr->is_base_table() || tr->table == nullptr)
-    return refuse("not_a_base_table");
-  m_table = tr->table;
-  const std::string db = m_table->s->db.str;
-  const std::string name = m_table->s->table_name.str;
-  TableState state;
-  if (!Registry::instance().snapshot(db, name, &state) || !state.usable())
-    return refuse("not_loaded:" + db + "." + name);
+// A base or materialized derived table of the FROM clause: its alias, and
+// its primary key columns (base tables) for the PAD SPACE tie-break.
+bool Generator::table_ref(Table_ref *tr, std::string *out) {
+  if (tr->is_table_function()) return refuse("table_function");
+  if (tr->is_recursive_reference()) return refuse("recursive_cte");
+  TABLE *table = tr->table;
+  if (table == nullptr) return refuse("table_not_open");
+  TableInfo ti;
+  ti.alias = "t" + std::to_string(m_next_alias++);
+  if (tr->is_view_or_derived()) {
+    // Merged views and derived tables are join nests (from_list); this one
+    // is materialized: a subquery in FROM, columns named as MySQL names them.
+    Query_expression *unit = tr->derived_query_expression();
+    if (unit == nullptr) return refuse("derived_without_query");
+    if (unit->is_recursive()) return refuse("recursive_cte");
+    if (unit->m_lateral_deps != 0) return refuse("lateral_derived_table");
+    std::vector<std::string> names;
+    for (uint i = 0; i < table->visible_field_count(); i++)
+      names.emplace_back(table->visible_field_ptr()[i]->field_name);
+    Block inner;
+    Block *outer = m_block;
+    const enum_field_types temporal = m_temporal;
+    m_block = &inner;
+    m_temporal = MYSQL_TYPE_NULL;
+    std::string sql;
+    // Columns of weight collations carry their weights when they can.
+    const bool failed =
+        unit->is_simple()
+            ? block_sql(unit->first_query_block(), &names, nullptr, &sql,
+                        nullptr, nullptr, &ti.weights, false)
+            : setop_sql(unit->set_operation(), &names, nullptr, nullptr, &sql,
+                        &ti.weights, false);
+    m_block = outer;
+    m_temporal = temporal;
+    if (failed) return true;
+    if (unit->m_reject_multiple_rows)
+      // A scalar subquery the server made a table: MySQL raises
+      // ER_SUBQUERY_NO_1_ROW when it has more than one row (the executor
+      // maps DuckDB's error back to it).
+      sql = "SELECT * EXCLUDE (\"__duckdb_rows\") FROM (SELECT *, count(*) "
+            "OVER () AS \"__duckdb_rows\" FROM (" +
+            sql +
+            ") AS r) AS r WHERE CASE WHEN \"__duckdb_rows\" > 1 THEN "
+            "error('" +
+            std::string(kDuckDBMultipleRows) + "') ELSE TRUE END";
+    *out = "(" + sql + ") AS " + ti.alias;
+    ti.derived = true;
+    ti.scalar = tr->m_was_scalar_subquery;
+  } else {
+    const std::string db = table->s->db.str;
+    const std::string name = table->s->table_name.str;
+    TableState state;
+    if (!Registry::instance().snapshot(db, name, &state) || !state.usable())
+      return refuse("not_loaded:" + db + "." + name);
+    if (table->s->primary_key == MAX_KEY) return refuse("no_primary_key");
+    const KEY &pk = table->key_info[table->s->primary_key];
+    std::string negated;
+    bool integer_key = true;
+    for (const std::string &w : split_list(state.weight_columns))
+      ti.weights.insert(w);
+    for (unsigned i = 0; i < pk.user_defined_key_parts; i++) {
+      const Field *f = pk.key_part[i].field;
+      ti.pk_fields.push_back(f);
+      const std::string c = ti.alias + "." + quote_ident(f->field_name);
+      ti.pk_parts += (i ? ", " : "") + c;
+      // HUGEINT: negating an unsigned BIGINT stays unsigned in DuckDB.
+      negated += (i ? ", " : "") + ("-CAST(" + c + " AS HUGEINT)");
+      integer_key = integer_key && f->result_type() == INT_RESULT;
+    }
+    ti.pk = pk.user_defined_key_parts == 1 ? ti.pk_parts
+                                           : "row(" + ti.pk_parts + ")";
+    if (integer_key) ti.pk_negated = negated;
+    const std::string lake =
+        "lake." + quote_ident(db) + "." + quote_ident(name);
+    // LIVE scope hides archived rows. Filtering in a subquery keeps the
+    // filter on the table itself, wherever it is in the join (in WHERE it
+    // would turn a LEFT JOIN into an inner join).
+    *out = state.retain_history && !m_full
+               ? "(SELECT * FROM " + lake +
+                     " WHERE \"__archived_at\" IS NULL) AS " + ti.alias
+               : lake + " AS " + ti.alias;
+  }
+  m_info[table] = ti;
+  m_block->tables.insert(table);
+  return false;
+}
+
+// A join list (stored in reverse order by the parser). Inner joins, CROSS
+// JOIN and LEFT JOIN (RIGHT JOIN is already a LEFT JOIN) are printed as
+// joins; semi-join nests (IN / EXISTS subqueries the optimizer flattened)
+// become EXISTS and anti-join nests (NOT EXISTS, NOT IN) NOT EXISTS in the
+// block's WHERE, so only at the top of the block.
+bool Generator::from_list(mem_root_deque<Table_ref *> &list, bool under_outer,
+                          bool in_semi, std::string *out) {
+  std::string from;
+  for (auto it = list.rbegin(); it != list.rend(); ++it) {
+    Table_ref *e = *it;
+    if (e->is_sj_or_aj_nest()) {
+      if (under_outer || in_semi) return refuse("semijoin_not_at_top_level");
+      Block::Semi s;
+      s.nest = e;
+      s.anti = e->is_aj_nest();
+      if (from_list(e->nested_join->m_tables, false, true, &s.from))
+        return true;
+      if (s.from.empty()) return refuse("empty_semijoin_nest");
+      m_block->semi.push_back(s);
+      continue;
+    }
+    std::string item;
+    if (e->nested_join != nullptr) {
+      std::string nest;
+      if (from_list(e->nested_join->m_tables, under_outer || e->outer_join,
+                    in_semi, &nest))
+        return true;
+      if (nest.empty()) return refuse("empty_join_nest");
+      item = "(" + nest + ")";
+    } else if (table_ref(e, &item)) {
+      return true;
+    }
+    std::string on;
+    if (e->join_cond() != nullptr && expr(e->join_cond(), &on)) return true;
+    if (from.empty()) {
+      if (e->outer_join || !on.empty())
+        return refuse("join_condition_on_first_table");
+      from = item;
+    } else if (e->outer_join) {
+      from += " LEFT JOIN " + item + " ON " + (on.empty() ? "TRUE" : on);
+    } else if (!on.empty()) {
+      from += " JOIN " + item + " ON " + on;
+    } else {
+      from += " CROSS JOIN " + item;
+    }
+  }
+  *out = from;
+  return false;
+}
+
+// The top-level AND parts of a condition, each with the tables it uses;
+// multiple equalities are split into pairs anchored on a column outside
+// `avoid` (the semi-join tables) when there is one.
+bool Generator::conjuncts(Item *cond, table_map avoid,
+                          std::vector<Conj> *out) {
+  // Conditions MySQL added to an IN subquery for its in-to-exists strategy:
+  // we print the IN predicate itself (MySQL removes them the same way when
+  // it changes strategy).
+  if (cond->created_by_in2exists()) return false;
+  cond = cond->real_item();
+  if (cond->created_by_in2exists()) return false;
+  if (cond->type() == Item::COND_ITEM &&
+      down_cast<Item_func *>(cond)->functype() == Item_func::COND_AND_FUNC) {
+    for (Item &arg : *down_cast<Item_cond *>(cond)->argument_list())
+      if (conjuncts(&arg, avoid, out)) return true;
+    return false;
+  }
+  if (cond->type() == Item::FUNC_ITEM &&
+      down_cast<Item_func *>(cond)->functype() == Item_func::MULTI_EQ_FUNC)
+    return multi_eq(down_cast<Item_multi_eq *>(cond), avoid, out);
+  std::string s;
+  if (expr(cond, &s)) return true;
+  out->push_back({s, cond->used_tables() & ~PSEUDO_TABLE_BITS});
+  return false;
+}
+
+// Two columns MySQL compares the same way DuckDB does.
+bool Generator::comparable(Item *a, Item *b) {
+  if (is_string(a) || is_string(b))
+    return is_string(a) && is_string(b) && str_mode(a) == str_mode(b) &&
+           str_mode(a) != StrMode::REFUSE &&
+           (str_mode(a) != StrMode::WEIGHT ||
+            a->collation.collation == b->collation.collation);
+  if (a->is_temporal() || b->is_temporal()) {
+    const bool da = is_date_or_datetime(a->data_type());
+    const bool db = is_date_or_datetime(b->data_type());
+    return (da && db) || a->data_type() == b->data_type();
+  }
+  return true;
+}
+
+// The optimizer's equality propagation: f1 = f2 = ... [= const], as pairs.
+bool Generator::multi_eq(Item_multi_eq *eq, table_map avoid,
+                         std::vector<Conj> *out) {
+  std::vector<Item *> fields;
+  for (Item_field &f : eq->get_fields()) fields.push_back(&f);
+  if (fields.empty()) return refuse("empty_multiple_equality");
+  size_t anchor = 0;
+  for (size_t i = 0; i < fields.size(); i++)
+    if ((fields[i]->used_tables() & avoid) == 0) {
+      anchor = i;
+      break;
+    }
+  Item *first = fields[anchor];
+  const bool str = is_string(first);
+  if (str && str_mode(first) == StrMode::REFUSE)
+    return refuse_collation(first);
+  const enum_field_types t = first->data_type();
+  const CHARSET_INFO *fcs = first->collation.collation;
+  auto print = [&](Item *it, std::string *s) {
+    return str ? string_key(it, fcs, false, it->max_length, s) : expr(it, s);
+  };
+  std::string f0;
+  if (print(first, &f0)) return true;
+  const table_map t0 = first->used_tables() & ~PSEUDO_TABLE_BITS;
+  for (size_t i = 0; i < fields.size(); i++) {
+    if (i == anchor) continue;
+    if (!comparable(first, fields[i]))
+      return refuse("multiple_equality_types");
+    std::string a;
+    if (print(fields[i], &a)) return true;
+    out->push_back({"(" + f0 + " = " + a + ")",
+                    t0 | (fields[i]->used_tables() & ~PSEUDO_TABLE_BITS)});
+  }
+  if (Item *c = eq->const_arg(); c != nullptr) {
+    std::string cs;
+    if (t == MYSQL_TYPE_TIMESTAMP || is_date_or_datetime(t)) {
+      if (typed_literal(c, t, &cs)) return true;
+    } else if (str != is_string(c)) {
+      return refuse("multiple_equality_types");
+    } else if (print(c, &cs)) {
+      return true;
+    }
+    out->push_back({"(" + f0 + " = " + cs + ")", t0});
+  }
+  return false;
+}
+
+// One query block: FROM (joins), WHERE (with EXISTS / NOT EXISTS for the
+// semi- and anti-join nests), GROUP BY, select list, HAVING, ORDER BY,
+// LIMIT. `names`: the columns of a derived table (select values named, kept
+// in their DuckDB type); otherwise the top block (values cast for reading
+// back, kinds filled).
+bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names,
+                          std::vector<Kind> *kinds, std::string *sql,
+                          const std::vector<Item *> *targets,
+                          const std::string *from_sql,
+                          std::set<std::string> *weights_out,
+                          bool weights_required) {
   if (qb->active_options() & OPTION_FOUND_ROWS)
     return refuse("sql_calc_found_rows");
   if (qb->olap != UNSPECIFIED_OLAP_TYPE) return refuse("rollup");
   if (qb->has_windows()) return refuse("window");
-  if (m_table->s->primary_key == MAX_KEY) return refuse("no_primary_key");
-  {
-    const KEY &pk = m_table->key_info[m_table->s->primary_key];
-    std::string cols, negated;
-    bool numeric_key = true;
-    for (unsigned i = 0; i < pk.user_defined_key_parts; i++) {
-      const Field *f = pk.key_part[i].field;
-      const std::string c = "t." + quote_ident(f->field_name);
-      cols += (i ? ", " : "") + c;
-      // HUGEINT: negating an unsigned BIGINT stays unsigned in DuckDB.
-      negated += (i ? ", " : "") + ("-CAST(" + c + " AS HUGEINT)");
-      numeric_key = numeric_key && f->result_type() == INT_RESULT;
-    }
-    m_pk = pk.user_defined_key_parts == 1 ? cols : "row(" + cols + ")";
-    m_pk_parts = cols;
-    if (numeric_key) m_pk_negated = negated;
-  }
+  m_block->qb = qb;
 
-  // History scope (DWL#5): LIVE hides archived rows; FULL shows them and
-  // needs DUCKDB_HISTORY_READER at query time too (a session can inherit
-  // FULL from the global value).
-  const bool full = history_scope_full(m_thd);
-  if (full && !m_thd->security_context()
-                   ->has_global_grant(STRING_WITH_LEN("DUCKDB_HISTORY_READER"))
-                   .first)
-    return refuse("history_scope_full_without_privilege");
+  std::string from;
+  if (from_sql != nullptr)
+    from = *from_sql;
+  else if (from_list(qb->m_table_nest, false, false, &from))
+    return true;
+  // A block without tables (SELECT 1, as a set operation operand) has no
+  // FROM.
+  if (from.empty() && qb->leaf_table_count != 0) return refuse("no_table");
 
-  // WHERE, on rows before grouping.
-  std::string where = state.retain_history && !full
-                          ? std::string("t.\"__archived_at\" IS NULL")
-                          : std::string();
+  // WHERE, on rows before grouping. A semi-join's condition was merged into
+  // WHERE: each AND part that uses a semi-join's tables goes into its EXISTS
+  // (for a semi-join, a part on the outer tables alone is the same there or
+  // in WHERE).
+  table_map semi_tables = 0;
+  for (const Block::Semi &s : m_block->semi)
+    if (!s.anti) semi_tables |= s.nest->nested_join->used_tables;
+  std::vector<std::string> where;
+  std::vector<std::vector<std::string>> semi_conds(m_block->semi.size());
   if (qb->where_cond() != nullptr) {
-    std::string w;
-    if (expr(qb->where_cond(), &w)) return true;
-    where += (where.empty() ? "" : " AND ") + w;
+    // Split in AND parts (in-to-exists conditions are left out).
+    std::vector<Conj> parts;
+    if (conjuncts(qb->where_cond(), semi_tables, &parts)) return true;
+    for (const Conj &c : parts) {
+      int hit = -1;
+      for (size_t i = 0; i < m_block->semi.size(); i++) {
+        const Block::Semi &s = m_block->semi[i];
+        if (s.anti || (c.tables & s.nest->nested_join->used_tables) == 0)
+          continue;
+        if (hit >= 0) return refuse("condition_across_semijoins");
+        hit = static_cast<int>(i);
+      }
+      if (hit < 0)
+        where.push_back(c.sql);
+      else
+        semi_conds[hit].push_back(c.sql);
+    }
+  }
+  for (size_t i = 0; i < m_block->semi.size(); i++) {
+    const Block::Semi &s = m_block->semi[i];
+    std::vector<std::string> conds = semi_conds[i];
+    if (s.anti) {
+      // An anti-join keeps its condition, as a LEFT JOIN's ON.
+      std::string c;
+      if (s.nest->join_cond() != nullptr && expr(s.nest->join_cond(), &c))
+        return true;
+      if (!c.empty()) conds.push_back(c);
+    }
+    std::string body = "SELECT 1 FROM " + s.from;
+    for (size_t j = 0; j < conds.size(); j++)
+      body += (j == 0 ? " WHERE " : " AND ") + conds[j];
+    where.push_back(std::string(s.anti ? "NOT EXISTS (" : "EXISTS (") + body +
+                    ")");
   }
 
   // GROUP BY. PAD SPACE strings group on rtrim(); a plain column of the
@@ -1033,42 +1703,96 @@ bool Generator::generate(LEX *lex, std::string *sql,
   std::string group;
   for (ORDER *o = qb->group_list.first; o != nullptr; o = o->next) {
     Item *g = (*o->item)->real_item();
+    if (g->type() == Item::FIELD_ITEM)
+      m_block->grouped.insert(down_cast<Item_field *>(g)->field);
     std::string e;
-    if (expr(g, &e)) return true;
-    if (is_string(g)) {
-      const StrMode mode = str_mode(g);
-      if (mode == StrMode::REFUSE) return refuse_collation(g);
-      if (mode == StrMode::PAD) {
-        if (g->type() != Item::FIELD_ITEM)
-          return refuse("group_by_padded_expression");
-        m_group_pad.push_back(down_cast<Item_field *>(g)->field);
-        e = pad_equal_key(e);
-      }
+    if (is_string(g) && (str_mode(g) == StrMode::PAD ||
+                         str_mode(g) == StrMode::WEIGHT)) {
+      // Grouped on the equality key (rtrim / weight); the value shown is
+      // decided by grouped_value().
+      if (g->type() != Item::FIELD_ITEM)
+        return refuse(std::string("group_by_expression (") +
+                      g->collation.collation->m_coll_name + ")");
+      m_block->group_pad.push_back(down_cast<Item_field *>(g)->field);
+      if (string_key(g, g->collation.collation, false, g->max_length, &e))
+        return true;
+    } else {
+      if (is_string(g) && str_mode(g) == StrMode::REFUSE)
+        return refuse_collation(g);
+      if (expr(g, &e)) return true;
     }
     group += (group.empty() ? "" : ", ") + e;
   }
-  m_post_group = !group.empty();
+  m_block->post_group = !group.empty();
 
-  // Select list, each value cast to the type we read back.
+  // Select list: the top block casts each value to the type we read back; a
+  // derived table keeps DuckDB types and names its columns.
   const bool distinct = qb->is_distinct();
   std::string select;
+  size_t col = 0;
   for (Item *item : qb->visible_fields()) {
     if (distinct && is_string(item) && str_mode(item) != StrMode::RAW)
-      return str_mode(item) == StrMode::REFUSE
-                 ? refuse_collation(item)
-                 : refuse("distinct_padded_string");
+      return str_mode(item) == StrMode::PAD
+                 ? refuse("distinct_padded_string")
+                 : refuse_collation(item);
     std::string e, cast;
     Kind kind;
     if (output_kind(item, &kind, &cast) || expr(item, &e)) return true;
-    select += (select.empty() ? "" : ", ") +
-              (kind == Kind::DECIMAL ? "CAST(CAST(" + e + " AS " + cast + ")"
-                                     : "CAST(" + e + " AS " + cast + ")");
-    kinds->push_back(kind);
+    if (targets != nullptr) {
+      // An operand of a set operation: cast to the column type MySQL
+      // computed for the result. Mixing kinds (number and string, temporal
+      // and other) is refused: MySQL's conversions differ (decided
+      // 2026-11-13).
+      if (col >= targets->size()) return refuse("set_operation_columns");
+      Kind target;
+      std::string target_cast;
+      if (output_kind((*targets)[col], &target, &target_cast)) return true;
+      // A NULL literal takes any type (is_null() of a column would read
+      // the current row: only the item type is checked).
+      if (item->real_item()->type() != Item::NULL_ITEM &&
+          !same_class(kind, target))
+        return refuse("set_operation_mixed_types");
+      kind = target;
+      cast = target_cast;
+    }
+    std::string value;
+    if (names == nullptr) {
+      value = kind == Kind::DECIMAL ? "CAST(CAST(" + e + " AS " + cast + ")"
+                                    : "CAST(" + e + " AS " + cast + ")";
+      kinds->push_back(kind);
+    } else {
+      if (col >= names->size()) return refuse("derived_column_count");
+      if (kind == Kind::DECIMAL) cast = cast.substr(0, cast.find(')') + 1);
+      value = "CAST(" + e + " AS " + cast + ") AS " + quote_ident((*names)[col]);
+      // A string of a weight collation carries its weight, for grouping and
+      // ordering on this column outside (derived table, set operation).
+      Item *type_item = targets != nullptr ? (*targets)[col] : item;
+      if (weights_out != nullptr && is_string(type_item) &&
+          str_mode(type_item) == StrMode::WEIGHT) {
+        std::string w;
+        const std::string saved_reason = *m_reason;
+        if (!weight_expr(item, type_item->collation.collation, &w)) {
+          value += ", " + w + " AS " +
+                   quote_ident(std::string(kWeightPrefix) + (*names)[col]);
+          weights_out->insert((*names)[col]);
+        } else if (weights_required) {
+          return true;
+        } else {
+          *m_reason = saved_reason;  // best effort: no weight for it
+        }
+      }
+    }
+    col++;
+    select += (select.empty() ? "" : ", ") + value;
   }
 
   std::string having;
-  if (qb->having_cond() != nullptr && expr(qb->having_cond(), &having))
-    return true;
+  if (qb->having_cond() != nullptr) {
+    std::vector<Conj> parts;
+    if (conjuncts(qb->having_cond(), 0, &parts)) return true;
+    for (const Conj &c : parts)
+      having += (having.empty() ? "" : " AND ") + c.sql;
+  }
 
   // MySQL sorts NULL first ascending and last descending; DuckDB sorts NULL
   // last by default.
@@ -1082,12 +1806,16 @@ bool Generator::generate(LEX *lex, std::string *sql,
   }
 
   *sql = std::string("SELECT ") + (distinct ? "DISTINCT " : "") + select +
-         " FROM lake." + quote_ident(db) + "." + quote_ident(name) + " AS t";
-  if (!where.empty()) *sql += " WHERE " + where;
+         (from.empty() ? "" : " FROM " + from);
+  for (size_t i = 0; i < where.size(); i++)
+    *sql += (i == 0 ? " WHERE " : " AND ") + where[i];
   if (!group.empty()) *sql += " GROUP BY " + group;
   if (!having.empty()) *sql += " HAVING " + having;
   if (!order.empty()) *sql += " ORDER BY " + order;
-  if (qb->select_limit != nullptr) {
+  // A LIMIT 1 MySQL added to a subquery predicate (m_internal_limit, for its
+  // EXISTS strategy) is not the query's: it would cut an IN list to one
+  // value.
+  if (qb->select_limit != nullptr && !qb->m_internal_limit) {
     if (!qb->select_limit->const_item()) return refuse("limit_not_constant");
     *sql += " LIMIT " + std::to_string(qb->select_limit->val_uint());
   }
@@ -1096,6 +1824,240 @@ bool Generator::generate(LEX *lex, std::string *sql,
     *sql += " OFFSET " + std::to_string(qb->offset_limit->val_uint());
   }
   return false;
+}
+
+// IS [NOT] TRUE / FALSE and NOT, as MySQL's Bool_test (IS TRUE: NULL is
+// false).
+std::string Generator::truth(const std::string &e, Item::Bool_test test,
+                             bool *ok) {
+  *ok = true;
+  switch (test) {
+    case Item::BOOL_IDENTITY:
+      return e;
+    case Item::BOOL_NEGATED:
+      return "(NOT " + e + ")";
+    case Item::BOOL_IS_TRUE:
+      return "coalesce(" + e + ", FALSE)";
+    case Item::BOOL_IS_FALSE:
+      return "coalesce(NOT " + e + ", FALSE)";
+    case Item::BOOL_NOT_TRUE:
+      return "(NOT coalesce(" + e + ", FALSE))";
+    case Item::BOOL_NOT_FALSE:
+      return "coalesce(" + e + ", TRUE)";
+    default:
+      *ok = false;
+      return e;
+  }
+}
+
+// The query of a subquery predicate or scalar subquery, inside the current
+// block: it may refer to the enclosing blocks' tables (correlated).
+bool Generator::subquery_sql(Query_expression *unit, std::string *sql) {
+  if (unit == nullptr) return refuse("subquery_without_query");
+  if (unit->is_recursive()) return refuse("recursive_cte");
+  size_t columns = 0;
+  if (unit->is_simple()) {
+    for (Item *item : unit->first_query_block()->visible_fields()) {
+      (void)item;
+      columns++;
+    }
+  } else {
+    for (Item *type : *unit->set_operation()->types_array())
+      if (!type->hidden) columns++;
+  }
+  std::vector<std::string> names;
+  for (size_t i = 0; i < columns; i++)
+    names.push_back("c" + std::to_string(i + 1));
+  Block inner;
+  inner.parent = m_block;
+  Block *outer = m_block;
+  const enum_field_types temporal = m_temporal;
+  m_block = &inner;
+  m_temporal = MYSQL_TYPE_NULL;
+  const bool failed =
+      unit->is_simple()
+          ? block_sql(unit->first_query_block(), &names, nullptr, sql)
+          : setop_sql(unit->set_operation(), &names, nullptr, nullptr, sql);
+  m_block = outer;
+  m_temporal = temporal;
+  return failed;
+}
+
+// Subquery items the server left as expressions: scalar subqueries,
+// [NOT] EXISTS, [NOT] IN, with MySQL's truth test. DuckDB evaluates IN and
+// NOT IN with the same three-valued logic (NULL when there is no match and
+// the subquery or the operand has a NULL; FALSE for an empty subquery).
+bool Generator::subquery(Item_subselect *sub, std::string *out) {
+  std::string q;
+  switch (sub->subquery_type()) {
+    case Item_subselect::SCALAR_SUBQUERY: {
+      auto *s = down_cast<Item_singlerow_subselect *>(sub);
+      if (s->is_maxmin()) return refuse("quantified_subquery");
+      if (s->cols() != 1) return refuse("row_subquery");
+      if (subquery_sql(sub->query_expr(), &q)) return true;
+      // More than one row: DuckDB raises an error, mapped to MySQL's.
+      *out = "(" + q + ")";
+      return false;
+    }
+    case Item_subselect::EXISTS_SUBQUERY: {
+      if (subquery_sql(sub->query_expr(), &q)) return true;
+      bool ok = true;
+      *out = truth("EXISTS (" + q + ")",
+                   down_cast<Item_exists_subselect *>(sub)->value_transform,
+                   &ok);
+      return ok ? false : refuse("truth_test");
+    }
+    case Item_subselect::IN_SUBQUERY: {
+      auto *in = down_cast<Item_in_subselect *>(sub);
+      Item *left = in->left_expr != nullptr ? in->left_expr->real_item()
+                                            : nullptr;
+      if (left == nullptr) return refuse("in_subquery_operand");
+      if (left->type() == Item::CACHE_ITEM &&
+          down_cast<Item_cache *>(left)->get_example() != nullptr)
+        left = down_cast<Item_cache *>(left)->get_example()->real_item();
+      if (left->type() == Item::ROW_ITEM) return refuse("row_in_subquery");
+      Query_expression *unit = sub->query_expr();
+      if (!unit->is_simple()) return refuse("in_subquery_set_operation");
+      Item *inner = nullptr;
+      for (Item *item : unit->first_query_block()->visible_fields())
+        if (inner == nullptr) inner = item->real_item();
+      if (inner == nullptr) return refuse("in_subquery_columns");
+      // Compared as MySQL compares them: byte strings, same kinds.
+      if (is_string(left) && is_string(inner)) {
+        if (str_mode(left) == StrMode::REFUSE) return refuse_collation(left);
+        if (str_mode(left) != StrMode::RAW || str_mode(inner) != StrMode::RAW)
+          return refuse("in_subquery_collation");
+      }
+      if (!comparable(left, inner)) return refuse("in_subquery_types");
+      std::string l;
+      if (expr(left, &l) || subquery_sql(unit, &q)) return true;
+      bool ok = true;
+      *out = truth("(" + l + " IN (" + q + "))", in->value_transform, &ok);
+      return ok ? false : refuse("truth_test");
+    }
+    default:
+      // ALL / ANY: the server rewrites the usual cases into joins.
+      return refuse("quantified_subquery");
+  }
+}
+
+// A set operation (UNION, INTERSECT, EXCEPT, or a parenthesized query with
+// its own ORDER BY / LIMIT): `SELECT ... FROM ((c0) OP (c1) ...) AS tN
+// [ORDER BY] [LIMIT]`, printed by the post-processing block whose only
+// table is the result. The operands' columns are cast to the result types
+// and named c1, c2, ...; operators are left-associative in both:
+// - UNION: DISTINCT up to the last DISTINCT operand, ALL after it;
+// - INTERSECT: DISTINCT if any operator is (the parser folds it so);
+// - EXCEPT: ALL before the first DISTINCT operand, DISTINCT from it on.
+bool Generator::setop_sql(Query_term_set_op *t,
+                          const std::vector<std::string> *names,
+                          const std::vector<Item *> *targets,
+                          std::vector<Kind> *kinds, std::string *sql,
+                          std::set<std::string> *weights_out,
+                          bool weights_required) {
+  Query_block *post = t->query_block();
+  if (post == nullptr || post->get_table_list() == nullptr ||
+      post->get_table_list()->table == nullptr)
+    return refuse("set_operation_without_result_table");
+  TABLE *result = post->get_table_list()->table;
+  std::vector<Item *> types;
+  for (Item *type : *t->types_array())
+    if (!type->hidden) types.push_back(type);
+  std::vector<std::string> cols;
+  for (size_t i = 0; i < types.size(); i++)
+    cols.push_back("c" + std::to_string(i + 1));
+
+  const Query_term_type op = t->term_type();
+  const size_t n = t->child_count();
+  // Comparing rows: strings must compare as bytes.
+  const bool compares = op == QT_INTERSECT || op == QT_EXCEPT ||
+                        (op == QT_UNION && t->last_distinct() > 0);
+  if (compares)
+    for (Item *type : types)
+      if (is_string(type) && str_mode(type) != StrMode::RAW)
+        return str_mode(type) == StrMode::PAD
+                   ? refuse("set_operation_padded_string")
+                   : refuse_collation(type);
+
+  std::string chain;
+  for (size_t i = 0; i < n; i++) {
+    Query_term *c = t->child(i);
+    std::string csql;
+    Block inner;
+    Block *outer = m_block;
+    m_block = &inner;
+    // Every operand carries the weights of the result's weight-collation
+    // string columns (the same columns in each, for ORDER BY on them).
+    std::set<std::string> child_weights;
+    const bool failed =
+        c->term_type() == QT_QUERY_BLOCK
+            ? block_sql(down_cast<Query_block *>(c), &cols, nullptr, &csql,
+                        &types, nullptr, &child_weights, true)
+            : setop_sql(down_cast<Query_term_set_op *>(c), &cols, &types,
+                        nullptr, &csql, &child_weights, true);
+    m_block = outer;
+    if (failed) return true;
+    if (i > 0) {
+      const int64_t idx = static_cast<int64_t>(i);
+      switch (op) {
+        case QT_UNION:
+          chain += idx <= t->last_distinct() ? " UNION " : " UNION ALL ";
+          break;
+        case QT_INTERSECT:
+          chain += t->last_distinct() > 0 ? " INTERSECT " : " INTERSECT ALL ";
+          break;
+        case QT_EXCEPT:
+          chain += idx >= t->first_distinct() ? " EXCEPT " : " EXCEPT ALL ";
+          break;
+        default:
+          return refuse("set_operation_type");
+      }
+    }
+    chain += "(" + csql + ")";
+  }
+
+  TableInfo ti;
+  ti.alias = "t" + std::to_string(m_next_alias++);
+  ti.derived = true;
+  ti.positional = true;
+  for (size_t i = 0; i < types.size(); i++)
+    if (is_string(types[i]) && str_mode(types[i]) == StrMode::WEIGHT)
+      ti.weights.insert(cols[i]);
+  m_info[result] = ti;
+  Block block;
+  block.tables.insert(result);
+  Block *outer = m_block;
+  m_block = &block;
+  const std::string from = "(" + chain + ") AS " + ti.alias;
+  const bool failed = block_sql(post, names, kinds, sql, targets, &from,
+                                weights_out, weights_required);
+  m_block = outer;
+  return failed;
+}
+
+bool Generator::generate(LEX *lex, std::string *sql,
+                         std::vector<Kind> *kinds) {
+  if (lex->sql_command != SQLCOM_SELECT)
+    return refuse("unsupported_statement");
+  Query_expression *unit = lex->unit;
+
+  // History scope (DWL#5): LIVE hides archived rows; FULL shows them and
+  // needs DUCKDB_HISTORY_READER at query time too (a session can inherit
+  // FULL from the global value).
+  m_full = history_scope_full(m_thd);
+  if (m_full && !m_thd->security_context()
+                     ->has_global_grant(STRING_WITH_LEN("DUCKDB_HISTORY_READER"))
+                     .first)
+    return refuse("history_scope_full_without_privilege");
+
+  Block top;
+  m_block = &top;
+  const bool failed =
+      unit->is_simple()
+          ? block_sql(unit->first_query_block(), nullptr, kinds, sql)
+          : setop_sql(unit->set_operation(), nullptr, nullptr, kinds, sql);
+  m_block = nullptr;
+  return failed;
 }
 
 void note_refusal(THD *thd, OffloadContext *ctx, const std::string &reason) {
@@ -1265,6 +2227,98 @@ bool store_cell(THD *thd, Item_cache *h, Item *not_null, Kind kind,
   return true;
 }
 
+// EXPLAIN (any format): the DuckDB SQL and DuckDB's own plan as notes. MySQL
+// prints its plan for the query; DuckDB plans the SQL itself. SHOW WARNINGS
+// shows at most 512 bytes of a message, so long text is split in numbered
+// notes (at line ends when possible, never inside a UTF-8 character).
+void push_notes(THD *thd, const std::string &title, const std::string &text) {
+  constexpr size_t kChunk = 480;  // + the title, under 512 bytes
+  std::vector<std::string> parts;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = std::min(text.size(), pos + kChunk);
+    if (end < text.size()) {
+      const size_t nl = text.rfind('\n', end);
+      if (nl != std::string::npos && nl > pos + kChunk / 2) {
+        end = nl + 1;
+      } else {
+        while (end > pos && (static_cast<unsigned char>(text[end]) & 0xC0) ==
+                                0x80)
+          end--;
+      }
+    }
+    parts.push_back(text.substr(pos, end - pos));
+    pos = end;
+  }
+  for (size_t i = 0; i < parts.size(); i++) {
+    std::string msg = title;
+    if (parts.size() > 1)
+      msg += " (" + std::to_string(i + 1) + "/" +
+             std::to_string(parts.size()) + ")";
+    msg += ":\n" + parts[i];
+    push_warning(thd, Sql_condition::SL_NOTE, ER_SECONDARY_ENGINE_PLUGIN,
+                 msg.c_str());
+  }
+}
+
+void explain_notes(THD *thd, OffloadContext *ctx) {
+  push_notes(thd, "DuckDB SQL", ctx->sql);
+  std::string plan, err;
+  const bool failed = ctx->con->execute(
+      [&](duckdb_connection c, std::string *e) {
+        duckdb_result res;
+        if (duckdb_query(c, ("EXPLAIN " + ctx->sql).c_str(), &res) ==
+            DuckDBError) {
+          const char *m = duckdb_result_error(&res);
+          *e = m != nullptr ? m : "EXPLAIN failed";
+          duckdb_destroy_result(&res);
+          return true;
+        }
+        const idx_t columns = duckdb_column_count(&res);
+        for (idx_t r = 0; r < duckdb_row_count(&res); r++) {
+          char *v = duckdb_value_varchar(&res, columns - 1, r);
+          if (v != nullptr) plan += v;
+          duckdb_free(v);
+        }
+        duckdb_destroy_result(&res);
+        return false;
+      },
+      &err);
+  push_notes(thd, "DuckDB plan", failed ? "not available: " + err : plan);
+}
+
+// A DuckDB error during execution. When MySQL has the same error, the client
+// gets MySQL's code with both messages (decided 2026-11-13); otherwise
+// ER_SECONDARY_ENGINE_PLUGIN with DuckDB's message.
+void report_duckdb_error(const std::string &msg) {
+  const std::string text = msg.substr(0, 400);
+  if (msg.find(kDuckDBMultipleRows) != std::string::npos ||
+      msg.find("More than one row returned by a subquery") !=
+          std::string::npos) {
+    my_printf_error(ER_SUBQUERY_NO_1_ROW,
+                    "Subquery returns more than 1 row (DuckDB error: %s)",
+                    MYF(0), text.c_str());
+    return;
+  }
+  if (msg.find("INTERRUPT Error") != std::string::npos) {
+    // max_execution_time or KILL QUERY interrupted DuckDB.
+    THD *thd = current_thd;
+    if (thd != nullptr && thd->killed == THD::KILL_TIMEOUT) {
+      my_printf_error(ER_QUERY_TIMEOUT,
+                      "Query execution was interrupted, maximum statement "
+                      "execution time exceeded (DuckDB error: %s)",
+                      MYF(0), text.c_str());
+      return;
+    }
+    my_printf_error(ER_QUERY_INTERRUPTED,
+                    "Query execution was interrupted (DuckDB error: %s)",
+                    MYF(0), text.c_str());
+    return;
+  }
+  my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+           ("DuckDB error: " + text).c_str());
+}
+
 // JOIN::override_executor_func: runs the whole statement in DuckDB and sends
 // the rows. Called once per query block; single-table queries have one.
 bool execute_offloaded(JOIN *join, Query_result *result) {
@@ -1275,11 +2329,13 @@ bool execute_offloaded(JOIN *join, Query_result *result) {
 
   mem_root_deque<Item *> holders(thd->mem_root);
   std::vector<Item_cache *> caches;
-  // Typed like the items the server sent as metadata (join->fields: with
-  // GROUP BY these can be temporary table columns, e.g. BIGINT for an INT
-  // expression), so each value is sent as the client was told.
+  // Typed like the items the server sent as metadata (the query
+  // expression's field list: with GROUP BY these can be temporary table
+  // columns, e.g. BIGINT for an INT expression; for a set operation the
+  // result columns), so each value is sent as the client was told.
   size_t i = 0;
-  for (Item *item : *join->fields) {
+  for (Item *item :
+       *join->query_block->master_query_expression()->get_field_list()) {
     if (item->hidden) continue;
     if (i >= ctx->kinds.size()) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
@@ -1317,9 +2373,7 @@ bool execute_offloaded(JOIN *join, Query_result *result) {
   };
   auto fail = [&](const std::string &msg) {
     cleanup();
-    if (!thd->is_error())
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               ("DuckDB: " + msg).c_str());
+    if (!thd->is_error()) report_duckdb_error(msg);
     return true;
   };
 
@@ -1393,8 +2447,54 @@ bool execute_offloaded(JOIN *join, Query_result *result) {
 
 // Before preparing for the secondary engine: the engine must be open and the
 // query expensive enough (as the MOCK engine does).
+// MySQL's plan for InnoDB reads a big loaded table where its row estimate
+// comes from sampled index statistics (full scan, full index scan,
+// non-unique lookup): the cost can be far too low (DWL#6 6d-3: 382 instead
+// of 52,560 rows per key). Primary key / unique lookups and index ranges
+// (index dives) keep MySQL's estimate. The table size is InnoDB's table
+// estimate, accurate enough at this scale and free during planning.
+bool big_table_scan(THD *thd, std::string *which) {
+  const unsigned long long min_rows = offload_min_rows(thd);
+  if (min_rows == 0) return false;
+  for (const Query_block *qb = thd->lex->all_query_blocks_list; qb != nullptr;
+       qb = qb->next_select_in_list()) {
+    const JOIN *join = qb->join;
+    if (join == nullptr || join->qep_tab == nullptr) continue;
+    for (uint i = 0; i < join->primary_tables; i++) {
+      const QEP_TAB &tab = join->qep_tab[i];
+      const TABLE *table = tab.table();
+      if (table == nullptr || table->file == nullptr ||
+          !table->s->has_secondary_engine())
+        continue;
+      const join_type type = tab.type();
+      if (type != JT_ALL && type != JT_INDEX_SCAN && type != JT_REF &&
+          type != JT_REF_OR_NULL)
+        continue;
+      if (table->file->stats.records < min_rows) continue;
+      *which = std::string(table->s->db.str) + "." + table->s->table_name.str;
+      return true;
+    }
+  }
+  return false;
+}
+
 bool pre_prepare(THD *thd) {
   if (!Lake::instance().is_open()) return false;
+  std::string big;
+  if (thd->m_current_query_cost <=
+          static_cast<double>(thd->variables.secondary_engine_cost_threshold) &&
+      big_table_scan(thd, &big)) {
+    Opt_trace_context *const trace = &thd->opt_trace;
+    if (trace->is_started()) {
+      const Opt_trace_object wrapper(trace);
+      Opt_trace_object oto(trace, "duckdb_offload_candidate");
+      oto.add_alnum("reason",
+                    "scan of a large loaded table (duckdb_offload_min_rows)");
+      oto.add_utf8("table", big.c_str());
+      oto.add("cost", thd->m_current_query_cost);
+    }
+    return true;
+  }
   if (thd->m_current_query_cost <=
       static_cast<double>(thd->variables.secondary_engine_cost_threshold)) {
     Opt_trace_context *const trace = &thd->opt_trace;
@@ -1416,6 +2516,7 @@ bool prepare(THD *thd, LEX *lex) {
   auto *ctx = new (thd->mem_root) OffloadContext;
   if (ctx == nullptr) return true;
   lex->set_secondary_engine_execution_context(ctx);
+  ctx->disable_semijoin_materialization(thd);
   // The handler cannot read rows: no constant tables, no subquery evaluated
   // during optimization (as the MOCK engine).
   lex->add_statement_options(OPTION_NO_CONST_TABLES |
@@ -1436,6 +2537,7 @@ bool wrote_in_transaction(THD *thd) {
 bool optimize(THD *thd, LEX *lex) {
   OffloadContext *ctx = context(thd);
   if (ctx == nullptr) return true;
+  ctx->restore_optimizer_switch();  // the server's optimization is done
   std::string reason;
   if (wrote_in_transaction(thd)) {
     reason = "written_in_transaction";
@@ -1488,8 +2590,12 @@ bool optimize(THD *thd, LEX *lex) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ctx->reason.c_str());
     return true;
   }
-  lex->unit->first_query_block()->join->override_executor_func =
-      execute_offloaded;
+  if (lex->is_explain()) explain_notes(thd, ctx);
+  // The server calls the executor of each query block of a set operation;
+  // the first call runs the whole statement.
+  for (Query_block *qb = lex->unit->first_query_block(); qb != nullptr;
+       qb = qb->next_query_block())
+    if (qb->join != nullptr) qb->join->override_executor_func = execute_offloaded;
   g_offloaded++;
   Opt_trace_context *const trace = &thd->opt_trace;
   if (trace->is_started()) {
@@ -1500,14 +2606,15 @@ bool optimize(THD *thd, LEX *lex) {
   return false;
 }
 
-bool compare_cost(THD *thd, const JOIN &, double optimizer_cost,
-                  bool *use_best_so_far, bool *cheaper,
+// DuckDB makes its own plan from the SQL: the server's join order is not
+// used, so its own comparison stands (`cheaper` is already set, per JOIN; a
+// statement-wide best cost made every plan of a second JOIN "not cheaper"
+// and the planner found none).
+bool compare_cost(THD *, const JOIN &, double optimizer_cost,
+                  bool *use_best_so_far, bool *,
                   double *secondary_engine_cost) {
   *use_best_so_far = false;
   *secondary_engine_cost = optimizer_cost;
-  OffloadContext *ctx = context(thd);
-  *cheaper = ctx == nullptr || optimizer_cost < ctx->best_cost;
-  if (ctx != nullptr && *cheaper) ctx->best_cost = optimizer_cost;
   return false;
 }
 

@@ -38,11 +38,11 @@
 #include "sql/sql_class.h"
 #include "sql/sql_error.h"
 #include "sql/table.h"
-#include "sql/replication.h"  // Binlog_storage_observer
 #include "sql/sql_plugin.h"   // plugin_lock_by_name, plugin_ref_to_int
 #include "string_with_len.h"   // STRING_WITH_LEN
 #include "storage/duckdb/duckdb_binlog_reader.h"
 #include "storage/duckdb/duckdb_executor.h"
+#include "storage/duckdb/duckdb_guard.h"
 #include "storage/duckdb/duckdb_lake.h"
 #include "storage/duckdb/duckdb_load.h"
 #include "storage/duckdb/duckdb_log.h"
@@ -62,6 +62,7 @@ namespace {
 // System variables; the server adds the duckdb_ prefix.
 bool srv_enable = true;
 char *srv_data_path = nullptr;
+bool srv_lake_relocate = true;
 unsigned long long srv_memory_limit = 0;  // 0: not set
 unsigned int srv_threads = 0;             // 0: not set
 bool srv_encryption = false;
@@ -102,8 +103,8 @@ unsigned int max_threads() {
 }
 
 LakeSettings lake_settings() {
-  return {srv_data_path, srv_memory_limit, srv_threads, srv_executor_threads,
-          srv_executor_stack_size};
+  return {srv_data_path,        srv_memory_limit,        srv_threads,
+          srv_executor_threads, srv_executor_stack_size, srv_lake_relocate};
 }
 
 // The server calls our entry points (handler methods, variable callbacks,
@@ -129,22 +130,9 @@ BinlogReader::Status safe_status() {
   }
 }
 
-// The binlog storage observer. after_sync runs in the commit stage of every
-// transaction: we only record the position, and we never fail the commit.
-int after_sync(Binlog_storage_param *, const char *log_file,
-               my_off_t log_pos) {
-  try {
-    BinlogReader::instance().notify_synced(log_file, log_pos);
-  } catch (...) {
-    // Never affect the commit. The reader catches up at the next sync.
-  }
-  return 0;
-}
-
-Binlog_storage_observer storage_observer = {sizeof(Binlog_storage_observer),
-                                            nullptr, after_sync};
+// The binlog reader is woken by the transaction observer's after_commit
+// (duckdb_offload.cc), after the InnoDB commit.
 st_plugin_int *plugin_handle = nullptr;
-bool observer_registered = false;
 
 // For a storage engine, init() receives the handlerton, not the plugin. The
 // observer registration needs our st_plugin_int: we look it up by name (our
@@ -333,7 +321,9 @@ int check_apply_start_position_impl(MYSQL_THD thd, SYS_VAR *, void *save,
                         ER_SECONDARY_ENGINE_PLUGIN,
                         ER_THD(thd, ER_SECONDARY_ENGINE_PLUGIN), msg.c_str());
   }
-  *static_cast<const char **>(save) = thd->strmake(str, len);
+  // A command, not a setting: the variable stays empty once it ran (the
+  // error log records what was done).
+  *static_cast<const char **>(save) = thd->strmake("", 0);
   return 0;
 }
 
@@ -360,7 +350,9 @@ int check_discard_stale_copy_impl(MYSQL_THD thd, SYS_VAR *, void *save,
     return 1;
   }
   if (discard_stale_copy(thd, std::string(str, len))) return 1;
-  *static_cast<const char **>(save) = thd->strmake(str, len);
+  // A command, not a setting: the variable stays empty once it ran (the
+  // error log records what was done).
+  *static_cast<const char **>(save) = thd->strmake("", 0);
   return 0;
 }
 
@@ -391,6 +383,14 @@ int check_history_scope_impl(MYSQL_THD thd, SYS_VAR *, void *save,
   }
   if (index != 0 && index != 1) {
     my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "duckdb_history_scope", "?");
+    return 1;
+  }
+  // DWL#7: without the guard a FULL query could run on InnoDB and miss the
+  // archived rows.
+  if (index == 1 && !guard_active()) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "duckdb_history_scope=FULL requires the duckdb_guard plugin, "
+             "which is not active");
     return 1;
   }
   if (index == 1 &&
@@ -432,6 +432,15 @@ MYSQL_SYSVAR_BOOL(enable, srv_enable, PLUGIN_VAR_OPCMDARG,
                   "Enable the DuckDB secondary engine. When OFF the server "
                   "behaves as if the plugin were not loaded.",
                   check_enable, nullptr, true);
+
+MYSQL_SYSVAR_BOOL(lake_relocate, srv_lake_relocate, PLUGIN_VAR_OPCMDARG,
+                  "When the lake catalog stores another data path than "
+                  "duckdb_data_path (the lake was moved or restored "
+                  "elsewhere): ON accepts it if every data file the catalog "
+                  "uses is under duckdb_data_path and updates the stored "
+                  "path; OFF refuses to open the lake. Used when the lake "
+                  "opens (startup, duckdb_enable=ON).",
+                  nullptr, nullptr, true);
 
 MYSQL_SYSVAR_STR(data_path, srv_data_path,
                  PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG |
@@ -546,6 +555,15 @@ MYSQL_THDVAR_BOOL(offload_wait_applied, PLUGIN_VAR_OPCMDARG,
                   "reads its own writes.",
                   nullptr, nullptr, true);
 
+MYSQL_THDVAR_ULONGLONG(offload_min_rows, PLUGIN_VAR_OPCMDARG,
+                       "Besides secondary_engine_cost_threshold, a query is "
+                       "tried in DuckDB when MySQL's plan reads a loaded "
+                       "table of at least this many rows by a full scan, a "
+                       "full index scan or a non-unique index lookup (row "
+                       "estimates from sampled statistics). 0 disables the "
+                       "rule.",
+                       nullptr, nullptr, 1000000, 0, ULLONG_MAX, 0);
+
 MYSQL_THDVAR_BOOL(history_check_only, PLUGIN_VAR_OPCMDARG,
                   "With ON, ALTER TABLE ... SECONDARY_LOAD of a history table "
                   "only checks that it can take over a history copy "
@@ -588,6 +606,7 @@ MYSQL_SYSVAR_ULONGLONG(executor_stack_size, srv_executor_stack_size,
                        nullptr, nullptr, 8ULL << 20, kMinStack, kMaxStack, 0);
 
 SYS_VAR *duckdb_system_variables[] = {MYSQL_SYSVAR(enable),
+                                      MYSQL_SYSVAR(lake_relocate),
                                       MYSQL_SYSVAR(data_path),
                                       MYSQL_SYSVAR(memory_limit),
                                       MYSQL_SYSVAR(threads),
@@ -605,6 +624,7 @@ SYS_VAR *duckdb_system_variables[] = {MYSQL_SYSVAR(enable),
                                       MYSQL_SYSVAR(discard_stale_copy),
                                       MYSQL_SYSVAR(history_scope),
                                       MYSQL_SYSVAR(offload_wait_applied),
+                                      MYSQL_SYSVAR(offload_min_rows),
                                       nullptr};
 
 int show_executor_busy(THD *, SHOW_VAR *var, char *buff) {
@@ -710,6 +730,14 @@ int show_purge_transactions(THD *, SHOW_VAR *var, char *buff) {
   return show_number(var, buff, safe_status().purge_transactions);
 }
 
+int show_guard_forced(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, guard_status().forced);
+}
+
+int show_guard_rejected(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, guard_status().rejected);
+}
+
 int show_offloaded(THD *, SHOW_VAR *var, char *buff) {
   return show_number(var, buff, offload_status().offloaded);
 }
@@ -801,6 +829,10 @@ SHOW_VAR duckdb_status_variables[] = {
      SHOW_SCOPE_GLOBAL},
     {"duckdb_offload_queries", reinterpret_cast<char *>(&show_offloaded),
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_guard_forced", reinterpret_cast<char *>(&show_guard_forced),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_guard_rejected", reinterpret_cast<char *>(&show_guard_rejected),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_offload_refused", reinterpret_cast<char *>(&show_offload_refused),
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_offload_last_refusal",
@@ -868,10 +900,6 @@ int duckdb_init_impl(MYSQL_PLUGIN p) {
   auto fail = [] {
     release_privilege();
     unregister_offload_observer(plugin_handle);
-    if (observer_registered) {
-      unregister_binlog_storage_observer(&storage_observer, plugin_handle);
-      observer_registered = false;
-    }
     deinit_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs);
     return 1;
   };
@@ -946,15 +974,7 @@ int duckdb_init_impl(MYSQL_PLUGIN p) {
   hton->binlog_func = duckdb_binlog_func;
 
   plugin_handle = own_plugin();
-  if (plugin_handle == nullptr ||
-      register_binlog_storage_observer(&storage_observer, plugin_handle) !=
-          0) {
-    DUCKDB_LOG_ERROR(
-        "cannot register the binlog storage observer. Plugin not loaded.");
-    return fail();
-  }
-  observer_registered = true;
-  if (register_offload_observer(plugin_handle)) {
+  if (plugin_handle == nullptr || register_offload_observer(plugin_handle)) {
     DUCKDB_LOG_ERROR(
         "cannot register the transaction observer. Plugin not loaded.");
     return fail();
@@ -986,10 +1006,6 @@ int duckdb_deinit_impl(MYSQL_PLUGIN) {
     refresh_status();
   }
   unregister_offload_observer(plugin_handle);
-  if (observer_registered) {
-    unregister_binlog_storage_observer(&storage_observer, plugin_handle);
-    observer_registered = false;
-  }
   release_privilege();
   deinit_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs);
   return 0;
@@ -1004,10 +1020,6 @@ void cleanup_failed_init() {
   } catch (...) {
   }
   unregister_offload_observer(plugin_handle);
-  if (observer_registered) {
-    unregister_binlog_storage_observer(&storage_observer, plugin_handle);
-    observer_registered = false;
-  }
   release_privilege();
   if (log_bi != nullptr)
     deinit_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs);
@@ -1041,6 +1053,10 @@ int duckdb_deinit(MYSQL_PLUGIN p) {
 
 bool history_check_only(THD *thd) {
   return thd != nullptr && THDVAR(thd, history_check_only);
+}
+
+unsigned long long offload_min_rows(THD *thd) {
+  return thd != nullptr ? THDVAR(thd, offload_min_rows) : 0;
 }
 
 bool offload_wait_applied(THD *thd) {
@@ -1173,4 +1189,22 @@ mysql_declare_plugin(duckdb){
     duckdb_se::duckdb_system_variables,
     nullptr,
     0,
-} mysql_declare_plugin_end;
+},
+    // DWL#7: keeps FULL scope queries off InnoDB.
+    {
+        MYSQL_AUDIT_PLUGIN,
+        &duckdb_se::guard_descriptor,
+        "duckdb_guard",
+        "Marco Tusa",
+        "Keeps queries that read history tables under "
+        "duckdb_history_scope=FULL in the DuckDB secondary engine",
+        PLUGIN_LICENSE_GPL,
+        duckdb_se::guard_init,
+        nullptr,
+        duckdb_se::guard_deinit,
+        0x0001,
+        nullptr,
+        nullptr,
+        nullptr,
+        0,
+    } mysql_declare_plugin_end;

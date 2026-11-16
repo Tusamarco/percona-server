@@ -1,0 +1,54 @@
+-- Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+--
+-- This program is free software; you can redistribute it and/or modify
+-- it under the terms of the GNU General Public License as published by
+-- the Free Software Foundation; version 2 of the License.
+--
+-- This program is distributed in the hope that it will be useful,
+-- but WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-- GNU General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License
+-- along with this program; if not, write to the Free Software
+-- Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+--
+-- DWL#6 step 6c-3: subqueries, compared between InnoDB and DuckDB (one per
+-- line), on the tables of duckdb_offload_setup.sql (manual-test-plan.md
+-- section 26). dim.region has NULLs (grp 3, 9); p6.qty has NULLs.
+-- rewritten by the server into joins with derived tables
+SELECT COUNT(*) FROM p6 WHERE grp IN (SELECT grp FROM dim WHERE region = 1) OR qty > 990;
+SELECT COUNT(*) FROM p6 WHERE amount > (SELECT AVG(amount) FROM p6);
+SELECT COUNT(*) FROM p6 WHERE grp = (SELECT MIN(grp) FROM dim WHERE region = 2);
+SELECT d.grp, EXISTS (SELECT 1 FROM p6 WHERE p6.grp = d.grp) FROM dim d ORDER BY 1;
+SELECT d.grp, d.grp IN (SELECT grp FROM p6) FROM dim d ORDER BY 1;
+SELECT COUNT(*) FROM p6 WHERE qty > ALL (SELECT qty FROM p6 WHERE grp = 1 AND qty IS NOT NULL);
+SELECT COUNT(*) FROM p6 WHERE qty > ANY (SELECT qty FROM p6 WHERE grp = 1);
+SELECT COUNT(*) FROM p6 WHERE qty < ALL (SELECT qty FROM p6 WHERE grp = 9);
+SELECT COUNT(*) FROM p6 WHERE EXISTS (SELECT 1 FROM dim WHERE dim.grp = p6.grp) OR p6.qty < -990;
+SELECT d.grp, (SELECT MAX(p6.qty) FROM p6 WHERE p6.grp = d.grp AND p6.id < 100) FROM dim d WHERE d.grp < 5 ORDER BY 1;
+SELECT d.name FROM dim d WHERE (SELECT COUNT(*) FROM p6 WHERE p6.grp = d.grp) > 2857 ORDER BY 1;
+SELECT grp, COUNT(*) FROM p6 GROUP BY grp HAVING COUNT(*) > (SELECT COUNT(*) FROM dim) * 400 ORDER BY 1;
+SELECT grp, COUNT(*), (SELECT COUNT(*) FROM dim) FROM p6 GROUP BY grp ORDER BY 1;
+-- left as subquery expressions: IN / NOT IN with NULLs, truth tests
+SELECT d.grp, d.region IN (SELECT region FROM dim WHERE grp < 3) FROM dim d ORDER BY 1;
+SELECT d.grp, d.region NOT IN (SELECT region FROM dim WHERE grp < 3) FROM dim d ORDER BY 1;
+SELECT d.grp, d.region IN (SELECT region FROM dim WHERE grp > 7) FROM dim d ORDER BY 1;
+SELECT d.grp, d.region NOT IN (SELECT region FROM dim WHERE grp > 7) FROM dim d ORDER BY 1;
+SELECT d.grp, d.region IN (SELECT region FROM dim WHERE grp > 100) FROM dim d ORDER BY 1;
+SELECT d.grp, d.region NOT IN (SELECT region FROM dim WHERE grp > 100) FROM dim d ORDER BY 1;
+SELECT COUNT(*) FROM dim d WHERE d.region NOT IN (SELECT qty FROM p6 WHERE qty > 990);
+SELECT COUNT(*) FROM dim d WHERE d.region NOT IN (SELECT region FROM dim WHERE grp > 7);
+SELECT COUNT(*) FROM dim d WHERE d.region NOT IN (SELECT region FROM dim WHERE grp < 3);
+SELECT COUNT(*) FROM dim d WHERE d.region NOT IN (SELECT region FROM dim WHERE grp > 100);
+SELECT d.grp, (d.region IN (SELECT region FROM dim WHERE grp > 7)) IS TRUE, (d.region IN (SELECT region FROM dim WHERE grp > 7)) IS NOT FALSE FROM dim d ORDER BY 1;
+SELECT d.grp FROM dim d WHERE (d.region NOT IN (SELECT region FROM dim WHERE grp > 7)) IS NOT TRUE ORDER BY 1;
+SELECT COUNT(*) FROM p6 WHERE p6.qty NOT IN (SELECT region FROM dim) AND p6.id < 500;
+SELECT d.grp, d.region IN (SELECT e.region FROM dim e WHERE e.grp <> d.grp) FROM dim d ORDER BY 1;
+-- scalar subqueries in ORDER BY, correlated and nested
+SELECT d.grp FROM dim d ORDER BY (SELECT COUNT(*) FROM p6 WHERE p6.grp = d.grp), d.grp;
+SELECT d.grp, (SELECT MAX(e.grp) FROM dim e WHERE e.grp < d.grp AND e.region IN (SELECT region FROM dim f WHERE f.grp > 1)) FROM dim d ORDER BY 1;
+SELECT x.grp, x.c FROM (SELECT d.grp, d.region IN (SELECT region FROM dim WHERE grp > 7) AS c FROM dim d) x ORDER BY 1;
+SELECT d.grp FROM dim d WHERE d.grp IN (SELECT grp FROM p6 WHERE p6.qty > 995) OR d.region IS NULL ORDER BY 1;
+SELECT d.grp, EXISTS (SELECT 1 FROM hist h WHERE h.grp = d.grp AND h.v < 10) FROM dim d ORDER BY 1;
+SELECT COUNT(*) FROM dim d WHERE d.region NOT IN (SELECT qty FROM p6 WHERE qty IS NULL OR qty > 990);

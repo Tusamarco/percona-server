@@ -29,7 +29,10 @@
 #include "decimal.h"
 #include "field_types.h"
 #include "my_time.h"
+#include "my_sys.h"
+#include "mysql/strings/m_ctype.h"
 #include "storage/duckdb/duckdb_changes.h"
+#include "storage/duckdb/duckdb_collation.h"
 #include "storage/duckdb/duckdb_ddl.h"
 #include "storage/duckdb/duckdb_row_decoder.h"
 
@@ -666,6 +669,47 @@ TEST(DuckdbDdl, EncodeDecodeRenames) {
   EXPECT_EQ(decode_renames(encode_renames(r)), r);
   EXPECT_TRUE(decode_renames("").empty());
   EXPECT_TRUE(encode_renames({}).empty());
+}
+
+
+// DWL#6 step A1: weight strings follow the MySQL collation.
+TEST(DuckdbCollation, Weights) {
+  const CHARSET_INFO *ai = get_charset_by_name("utf8mb4_0900_ai_ci", MYF(0));
+  const CHARSET_INFO *gen = get_charset_by_name("utf8mb4_general_ci", MYF(0));
+  const CHARSET_INFO *bin = get_charset_by_name("utf8mb4_bin", MYF(0));
+  const CHARSET_INFO *l1 = get_charset_by_name("latin1_swedish_ci", MYF(0));
+  const CHARSET_INFO *l1bin = get_charset_by_name("latin1_bin", MYF(0));
+  ASSERT_NE(ai, nullptr);
+  ASSERT_NE(gen, nullptr);
+  ASSERT_NE(bin, nullptr);
+  ASSERT_NE(l1, nullptr);
+  ASSERT_NE(l1bin, nullptr);
+  auto w = [](const CHARSET_INFO *cs, const std::string &s) {
+    return collation_weight(cs, s.data(), s.size());
+  };
+  // Which collations need weights.
+  EXPECT_TRUE(needs_weight(ai));
+  EXPECT_TRUE(needs_weight(gen));
+  EXPECT_TRUE(needs_weight(l1));
+  EXPECT_TRUE(needs_weight(l1bin));  // latin1 bytes do not sort as UTF-8
+  EXPECT_FALSE(needs_weight(bin));
+  EXPECT_FALSE(needs_weight(&my_charset_bin));
+  // Accent and case insensitive, NO PAD.
+  EXPECT_EQ(w(ai, "a"), w(ai, "A"));
+  EXPECT_EQ(w(ai, "a"), w(ai, "\xC3\xA1"));  // a with acute accent
+  EXPECT_LT(w(ai, "a"), w(ai, "B"));
+  EXPECT_LT(w(ai, "Z"), w(ai, "zz"));
+  EXPECT_NE(w(ai, "a"), w(ai, "a "));
+  EXPECT_EQ(w(ai, ""), std::string());
+  // PAD SPACE: trailing spaces do not count.
+  EXPECT_EQ(w(gen, "a"), w(gen, "a  "));
+  EXPECT_EQ(w(gen, "abc"), w(gen, "ABC"));
+  EXPECT_LT(w(gen, "abc"), w(gen, "abd"));
+  // A UTF-8 value read back from DuckDB weighs as the original bytes.
+  std::string from_utf8;
+  ASSERT_FALSE(collation_weight_utf8(l1, "\xC3\xA9t\xC3\xA9", &from_utf8));
+  EXPECT_EQ(from_utf8, w(l1, "\xE9t\xE9"));  // latin1 bytes
+  EXPECT_EQ(w(l1, "ETE"), w(l1, "ete"));
 }
 
 }  // namespace

@@ -17,10 +17,23 @@ Decisions (2026-11-09):
 
 - Row values are decoded by our own decoder from the packed row image, using
   the Table_map column types and metadata; no THD, no opened tables (4b).
-- The reader is notified by `after_sync`, not `after_flush`: a synced
-  transaction is always committed by InnoDB crash recovery, so DuckDB never
-  gets ahead of InnoDB. `sync_binlog=1` is required to load history tables;
-  classic tables get a warning.
+- The reader is notified by the transaction observer's `after_commit`, after
+  the InnoDB commit (changed 2026-11-13; before: `after_sync`). A transaction
+  is in the binary log before InnoDB commits it (flush, sync, then commit;
+  with semi-sync AFTER_SYNC the commit waits for a replica, up to
+  `rpl_semi_sync_source_timeout`): reading at `after_sync` showed it in
+  DuckDB before InnoDB did. With `binlog_order_commits=ON` (required at
+  SECONDARY_LOAD) the server commits a group in InnoDB, then calls
+  `after_commit` for each transaction in binary log order
+  (sql/binlog.cc, `ordered_commit`), so the reader never reads past what
+  InnoDB has committed.
+- SECONDARY_LOAD (and the refresh after DDL, which runs it) cannot miss a
+  transaction that is in the binary log but not yet committed in InnoDB: it
+  holds MDL_SHARED_NO_WRITE (sql/sql_table.cc), which waits for every
+  transaction that wrote the table to end, before it reads InnoDB and takes
+  the binary log position.
+- Durability: `sync_binlog=1` is required to load history tables; classic
+  tables get a warning. See "Durability settings".
 - The load records the binary log file and position (with the GTID set).
   The applier keeps one global position; events before a table's load
   position are skipped. Before 4c the reader starts at the earliest load
@@ -206,10 +219,36 @@ the most expensive step. We keep its principle in the prepare workers.
 
 ### Notification
 
-A `Binlog_storage_observer` registered with `register_binlog_storage_observer()`
-(sql/replication.h), the API used by semisync. Its `after_flush` callback gives
-the binlog file name and position after each group commit. The callback only
+A `Trans_observer` registered with `register_trans_observer()`
+(sql/replication.h), the API used by semisync. Its `after_commit` callback
+gives the binlog file name and position of each transaction after its InnoDB
+commit (before 2026-11-13: `Binlog_storage_observer::after_sync`, before the
+InnoDB commit). The callback only
 stores the position and wakes the reader; it does no work.
+
+### Durability settings
+
+After a crash, InnoDB commits every prepared transaction found in the binary
+log, so InnoDB and DuckDB agree, provided both are durable:
+
+- `sync_binlog=1`: otherwise an operating system crash or power loss can lose
+  the end of the binary log that the applier already applied; InnoDB then
+  rolls those transactions back, and the copy keeps them.
+- `innodb_flush_log_at_trx_commit=1`: otherwise InnoDB can lose committed
+  transactions that the binary log (and the copy) still have.
+
+A crash of mysqld alone (not of the machine) loses nothing either way. With
+other settings, after an operating system crash a classic copy is repaired
+with SECONDARY_UNLOAD + SECONDARY_LOAD; a history copy cannot be repaired
+(its archived rows exist only in DuckDB), which is why `sync_binlog=1` is
+required for it. `innodb_flush_log_at_trx_commit` is documented, not
+checked, in the POC.
+
+Known limitation: when the reader is started at runtime (`duckdb_enable`
+OFF then ON, `duckdb_apply_start_position`), it takes the current end of the
+binary log as committed; a transaction between its binary log sync and its
+InnoDB commit at that very moment can be shown by DuckDB before InnoDB. At
+server startup crash recovery has committed everything first.
 
 ### Reader
 
@@ -268,6 +307,33 @@ GTIDs the source does not have. Either run them on the replica with
 `SET sql_log_bin = 0`, or define `SECONDARY_ENGINE` on the source (allowed
 without the plugin installed there). The plugin's own internal statements
 (refresh after DDL, step 4d) always run with `sql_log_bin = 0`.
+The same applies to `GRANT DUCKDB_HISTORY_READER` on a replica whose source
+has no plugin (the source does not know the privilege, so the grant cannot
+come from there).
+
+`read_only` / `super_read_only` (usual on replicas): the applier's DML
+writes only to DuckDB and is not affected. The refresh after DDL runs
+`ALTER TABLE ... SECONDARY_LOAD` in an internal session, which the server's
+read-only check (`check_readonly()`, sql/auth/sql_authorization.cc) refuses
+with error 1290 unless the THD has `skip_readonly_check`, the flag the
+replication applier's internal table writes use. The server clears that
+flag at the start of every statement (`THD::reset_for_next_command`), so it
+cannot be set once on the session. The `duckdb_guard` audit plugin sets it
+at the pre-parse event, which comes after the reset and before the check,
+for THDs registered by `run_internal_statements()` only
+(`is_internal_session()`; one atomic load for every other statement).
+Session service THDs are created with auditing off (sql/srv_session.cc), so
+the internal session turns it on (`mysql_audit_enable_auditing()`): audit
+plugins see its statements. Consequence: with the guard disabled, a refresh
+on a `super_read_only` server fails and the copy becomes stale. Verified on
+2026-11-16 (MTR `super_read_only`, test plan section 18): MODIFY, ADD
+COLUMN, RENAME, TRUNCATE refreshed on a classic and a history table, user
+statements still refused.
+
+Verified on 2026-11-15 (test plan section 18): source without the plugin,
+replica with it, DML, transactions in pieces, replicated DDL, 4 parallel
+workers, replica stop and restart during writes, tagged purges; DuckDB equal
+to InnoDB and no errant GTIDs.
 
 Before 4d, DDL replicated on a table with `SECONDARY_ENGINE=duckdb` stopped
 the replica (`ER_SECONDARY_ENGINE_DDL`). Since 4d the engine sets

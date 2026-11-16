@@ -52,6 +52,9 @@ const char *const *Registry::migration_sql() {
       // DWL#3 step 3b: primary key, for the structure check of a takeover.
       "ALTER TABLE lake.__mysql.tables ADD COLUMN IF NOT EXISTS "
       "pk_columns VARCHAR",
+      // DWL#6 step A: the columns with a weight column in the copy.
+      "ALTER TABLE lake.__mysql.tables ADD COLUMN IF NOT EXISTS "
+      "weight_columns VARCHAR",
       // DWL#5 had a configurable purge tag for one day (2026-11-12); the
       // tag is fixed now and its history table is not used.
       "DROP TABLE IF EXISTS lake.__mysql.purge_tags",
@@ -64,7 +67,7 @@ bool Registry::reload(duckdb_connection con, std::string *err) {
   if (duckdb_query(con,
                    "SELECT db, tbl, retain_history, state, load_gtid_set, "
                    "load_binlog_file, load_binlog_pos, pending_renames, "
-                   "pk_columns FROM lake.__mysql.tables",
+                   "pk_columns, weight_columns FROM lake.__mysql.tables",
                    &res) == DuckDBError) {
     const char *msg = duckdb_result_error(&res);
     *err = msg != nullptr ? msg : "cannot read lake.__mysql.tables";
@@ -81,6 +84,7 @@ bool Registry::reload(duckdb_connection con, std::string *err) {
     char *gtids = duckdb_value_varchar(&res, 4, r);
     const Key key(db != nullptr ? db : "", tbl != nullptr ? tbl : "");
     LoadedTable &t = m_tables[key];
+    t.present = true;
     t.retain_history = duckdb_value_boolean(&res, 2, r);
     t.stale = state != nullptr && std::string(state) == "stale";
     t.refresh_pending =
@@ -91,6 +95,9 @@ bool Registry::reload(duckdb_connection con, std::string *err) {
     char *pk = duckdb_value_varchar(&res, 8, r);
     t.pk_columns = pk != nullptr ? pk : "";
     duckdb_free(pk);
+    char *wc = duckdb_value_varchar(&res, 9, r);
+    t.weight_columns = wc != nullptr ? wc : "";
+    duckdb_free(wc);
     t.load_gtid_set = gtids != nullptr ? gtids : "";
     if (duckdb_value_is_null(&res, 5, r)) {
       t.load_position = BinlogPos();
@@ -109,30 +116,37 @@ bool Registry::reload(duckdb_connection con, std::string *err) {
     duckdb_free(gtids);
   }
   duckdb_destroy_result(&res);
-  // Entries no longer in the lake are dropped. No handler uses them: the lake
-  // was closed, so no table could be opened.
-  for (auto it = m_tables.begin(); it != m_tables.end();)
-    it = seen.count(it->first) ? std::next(it) : m_tables.erase(it);
+  // Entries no longer in the lake are marked not present (never freed: a
+  // cached secondary TABLE may still point to their lock).
+  for (auto &entry : m_tables)
+    if (seen.count(entry.first) == 0) entry.second.present = false;
   return false;
+}
+
+LoadedTable *Registry::live(const Key &key) {
+  auto it = m_tables.find(key);
+  return it == m_tables.end() || !it->second.present ? nullptr : &it->second;
 }
 
 LoadedTable *Registry::find(const std::string &db, const std::string &table) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  auto it = m_tables.find(Key(db, table));
-  return it == m_tables.end() ? nullptr : &it->second;
+  return live(Key(db, table));
 }
 
 void Registry::add(const std::string &db, const std::string &table,
                    bool retain_history, const std::string &load_gtid_set,
                    const BinlogPos &load_position,
-                   const std::string &pk_columns) {
+                   const std::string &pk_columns,
+                   const std::string &weight_columns) {
   std::lock_guard<std::mutex> guard(m_mutex);
   LoadedTable &t = m_tables[Key(db, table)];
+  t.present = true;
   t.retain_history = retain_history;
   t.stale = false;
   t.refresh_pending = false;
   t.pending_renames.clear();
   t.pk_columns = pk_columns;
+  t.weight_columns = weight_columns;
   t.load_gtid_set = load_gtid_set;
   t.load_position = load_position;
 }
@@ -140,14 +154,15 @@ void Registry::add(const std::string &db, const std::string &table,
 bool Registry::snapshot(const std::string &db, const std::string &table,
                         TableState *state) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  auto it = m_tables.find(Key(db, table));
-  if (it == m_tables.end()) return false;
-  state->retain_history = it->second.retain_history;
-  state->stale = it->second.stale;
-  state->refresh_pending = it->second.refresh_pending;
-  state->pending_renames = it->second.pending_renames;
-  state->pk_columns = it->second.pk_columns;
-  state->load_position = it->second.load_position;
+  const LoadedTable *t = live(Key(db, table));
+  if (t == nullptr) return false;
+  state->retain_history = t->retain_history;
+  state->stale = t->stale;
+  state->refresh_pending = t->refresh_pending;
+  state->pending_renames = t->pending_renames;
+  state->pk_columns = t->pk_columns;
+  state->weight_columns = t->weight_columns;
+  state->load_position = t->load_position;
   return true;
 }
 
@@ -156,7 +171,8 @@ bool Registry::earliest_load_position(BinlogPos *pos) {
   bool found = false;
   for (const auto &entry : m_tables) {
     const LoadedTable &t = entry.second;
-    if (t.stale || t.refresh_pending || t.load_position.empty()) continue;
+    if (!t.present || t.stale || t.refresh_pending || t.load_position.empty())
+      continue;
     if (!found || t.load_position < *pos) *pos = t.load_position;
     found = true;
   }
@@ -169,7 +185,9 @@ std::vector<std::string> Registry::loaded_before(const BinlogPos &pos) {
   for (const auto &entry : m_tables) {
     const LoadedTable &t = entry.second;
     // A table loaded before 4a has no load position: it may be behind too.
-    if (t.stale || t.refresh_pending || !(t.load_position < pos)) continue;
+    if (!t.present || t.stale || t.refresh_pending ||
+        !(t.load_position < pos))
+      continue;
     names.push_back(entry.first.first + "." + entry.first.second);
   }
   return names;
@@ -177,25 +195,25 @@ std::vector<std::string> Registry::loaded_before(const BinlogPos &pos) {
 
 void Registry::mark_stale(const std::string &db, const std::string &table) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  auto it = m_tables.find(Key(db, table));
-  if (it != m_tables.end()) it->second.stale = true;
+  if (LoadedTable *t = live(Key(db, table)); t != nullptr) t->stale = true;
 }
 
 bool Registry::rename(const std::string &db, const std::string &table,
                       const std::string &new_db, const std::string &new_table) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  auto it = m_tables.find(Key(db, table));
-  if (it == m_tables.end() || m_tables.count(Key(new_db, new_table)) > 0)
-    return true;
+  LoadedTable *from = live(Key(db, table));
+  if (from == nullptr || live(Key(new_db, new_table)) != nullptr) return true;
   LoadedTable &to = m_tables[Key(new_db, new_table)];
-  to.retain_history = it->second.retain_history;
-  to.stale = it->second.stale;
-  to.refresh_pending = it->second.refresh_pending;
-  to.pending_renames = it->second.pending_renames;
-  to.pk_columns = it->second.pk_columns;
-  to.load_gtid_set = it->second.load_gtid_set;
-  to.load_position = it->second.load_position;
-  m_tables.erase(it);
+  to.present = true;
+  to.retain_history = from->retain_history;
+  to.stale = from->stale;
+  to.refresh_pending = from->refresh_pending;
+  to.pending_renames = from->pending_renames;
+  to.pk_columns = from->pk_columns;
+  to.weight_columns = from->weight_columns;
+  to.load_gtid_set = from->load_gtid_set;
+  to.load_position = from->load_position;
+  from->present = false;
   return false;
 }
 
@@ -203,22 +221,22 @@ void Registry::mark_refresh_pending(const std::string &db,
                                     const std::string &table,
                                     const std::string &pending_renames) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  auto it = m_tables.find(Key(db, table));
-  if (it == m_tables.end()) return;
-  it->second.refresh_pending = true;
-  it->second.pending_renames = pending_renames;
+  LoadedTable *t = live(Key(db, table));
+  if (t == nullptr) return;
+  t->refresh_pending = true;
+  t->pending_renames = pending_renames;
 }
 
 void Registry::set_pk_columns(const std::string &db, const std::string &table,
                               const std::string &pk_columns) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  auto it = m_tables.find(Key(db, table));
-  if (it != m_tables.end()) it->second.pk_columns = pk_columns;
+  if (LoadedTable *t = live(Key(db, table)); t != nullptr)
+    t->pk_columns = pk_columns;
 }
 
 void Registry::remove(const std::string &db, const std::string &table) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  m_tables.erase(Key(db, table));
+  if (LoadedTable *t = live(Key(db, table)); t != nullptr) t->present = false;
 }
 
 }  // namespace duckdb_se

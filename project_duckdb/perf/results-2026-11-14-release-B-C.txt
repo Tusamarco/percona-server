@@ -1,0 +1,17 @@
+query ran_in       innodb_s   duckdb_s  speedup  note
+q01   InnoDB          3.953      6.058     0.7x  not offloaded (cost below threshold, or: collation:name (utf8mb4_0900_ai_ci))
+q02   DuckDB         17.614      0.040   436.4x  
+q03   DuckDB          7.263      0.097    75.2x  
+q04   InnoDB         25.254     25.233     1.0x  not offloaded (cost below threshold, or: collation:model (utf8mb4_0900_ai_ci))
+q05   InnoDB          0.036      0.036     1.0x  not offloaded (cost below threshold, or: collation:model (utf8mb4_0900_ai_ci))
+q06   InnoDB          0.020      0.020     1.0x  not offloaded (cost below threshold, or: collation:model (utf8mb4_0900_ai_ci))
+q07   DuckDB         39.209      0.142   275.7x  
+q08   DuckDB          2.479      0.045    55.7x  
+q09   DuckDB         21.198      0.104   204.3x  
+q10   InnoDB         34.710     34.793     1.0x  not offloaded (cost below threshold, or: collation:p (utf8mb4_0900_ai_ci))
+q11   DuckDB          4.131      0.057    73.1x  
+q12   InnoDB          0.010      0.009     1.1x  not offloaded (cost below threshold, or: collation:p (utf8mb4_0900_ai_ci))
+q13   InnoDB          0.007      0.007     1.0x  not offloaded (cost below threshold, or: collation:p (utf8mb4_0900_ai_ci))
+q14   InnoDB          0.007      0.007     1.0x  not offloaded (cost below threshold, or: collation:p (utf8mb4_0900_ai_ci))
+q15   InnoDB         22.051     21.983     1.0x  not offloaded (cost below threshold, or: collation:name (utf8mb4_0900_ai_ci))
+q16   InnoDB         20.992     21.121     1.0x  not offloaded (cost below threshold, or: window)

@@ -1,6 +1,49 @@
 # DWL#7: FULL scope guard plugin
 
-Affects: Percona Server 9.7 — Status: Design, under review
+Affects: Percona Server 9.7 — Status: implemented, verified on a throwaway instance (2026-11-15); MTR in the suite step
+
+## Implementation (2026-11-15)
+
+The open points were verified in the 9.7 source: table access events still
+reach audit plugins (`THD::check_event_subscribers` maps event tracking to the
+plugin API); they are raised in `open_tables()` (sql/sql_base.cc) before
+`open_secondary_engine_tables()`; a statement marked secondary-only fails
+with `use_secondary_engine=OFF` and is otherwise forced (no cost threshold,
+no fallback); `SET_VAR` hints are applied before `open_tables()`
+(sql/sql_parse.cc).
+
+- `storage/duckdb/duckdb_guard.h/.cc`: `duckdb_guard`, a `MYSQL_AUDIT_PLUGIN`
+  in the same `mysql_declare_plugin` block as `duckdb`, subscribed to table
+  access READ, UPDATE and DELETE (an UPDATE raises UPDATE for its target
+  table, a DELETE or TRUNCATE raises DELETE for every table of the statement,
+  sql/sql_audit.cc; under FULL an UPDATE or DELETE event on a history table
+  is always an error). For a table in the registry with `retain_history` under FULL
+  scope (session or SET_VAR): a statement that is not a SELECT, or
+  `use_secondary_engine=OFF`, or a closed lake (`duckdb_enable=OFF`), or a
+  stale / refresh-pending copy is stopped with an error naming the table;
+  otherwise `lex->set_execute_only_in_secondary_engine(true,
+  TEMPORARY_TABLE_USAGE)` (the reason value only affects a server message
+  our checks precede).
+- Second role (2026-11-16): subscribed to the parse class, PREPARSE
+  subclass, to let the engine's internal session (refresh after DDL) pass
+  `read_only` / `super_read_only` (`thd->set_skip_readonly_check()` for a THD
+  registered by `run_internal_statements()`; DWL-04, Replicas). Every
+  statement raises the event; for all but the internal session the cost is
+  one atomic load.
+- System threads (replication applier) are not checked. Views raise events
+  for their tables; stored routines per statement.
+- The server never clears the mark: the guard remembers the statements it
+  marked per connection and clears its own mark when the same (prepared)
+  statement runs under LIVE; forgotten at `close_connection`.
+- `duckdb_history_scope=FULL` is refused when the guard is not active
+  (e.g. `--duckdb-guard=OFF`).
+- Status: `duckdb_guard_forced`, `duckdb_guard_rejected`.
+- Verified: FULL + OFF error; FULL + ON below the cost threshold forced to
+  DuckDB (hist 100 = 70 live + 30 archived; LIVE 70); FULL with a window
+  function: error `window` instead of a fallback; SET_VAR hint; INSERT ...
+  SELECT under FULL stopped (nothing inserted); view and stored procedure;
+  prepared statement FULL 100, then LIVE 70, OFF 70; duckdb_enable=OFF and a
+  stale copy stopped; guard disabled: FULL refused; all offload lists pass.
 
 ## Description
 
@@ -42,7 +85,10 @@ statement to run in the secondary engine or fail.
    error carries the engine's rejection reason (DWL#6).
 5. Statements that write and also read a history table under FULL scope
    (INSERT ... SELECT, UPDATE or DELETE with subquery, CREATE ... SELECT) fail
-   with an error (POC).
+   with an error (POC). This includes every UPDATE, DELETE and TRUNCATE of a
+   history table: they first read the rows they change, and that read sees
+   only the live rows (added 2026-11-16 after the replica test). A plain
+   INSERT reads nothing and is not checked.
 6. Statements under LIVE scope, and statements on tables without retain_history,
    are not affected.
 7. The engine refuses `duckdb_history_scope=FULL` when the guard plugin is not

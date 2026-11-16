@@ -34,7 +34,7 @@
 #include "sql/derror.h"
 #include "sql/field.h"
 #include "sql/handler.h"
-#include "sql/binlog.h"  // mysql_bin_log, Log_info
+#include "sql/binlog.h"  // mysql_bin_log, Log_info, opt_binlog_order_commits
 #include "sql/mysqld.h"  // opt_bin_log, binlog_row_metadata, global_system_variables
 #include "sql/rpl_log_encryption.h"  // rpl_encryption
 #include "sql/rpl_gtid.h"
@@ -49,6 +49,7 @@
 #include "sql/system_variables.h"
 #include "sql/table.h"
 #include "storage/duckdb/duckdb_binlog_reader.h"  // expiry_warning
+#include "storage/duckdb/duckdb_collation.h"
 #include "storage/duckdb/duckdb_lake.h"
 #include "storage/duckdb/duckdb_log.h"
 #include "storage/duckdb/duckdb_registry.h"
@@ -99,10 +100,14 @@ bool check_binlog_settings(THD *thd, bool retain_history, std::string *err) {
     *err = "SECONDARY_LOAD requires gtid_mode=ON";
   else if (rpl_encryption.is_enabled())
     *err = "SECONDARY_LOAD requires binlog_encryption=OFF in this version";
-  // The applier reads a transaction only after the binary log sync. With
-  // sync_binlog=1 a synced transaction is always committed by InnoDB crash
-  // recovery, so DuckDB never gets ahead of InnoDB. History tables hold data
-  // that exists nowhere else, so for them it is required.
+  // The applier reads a transaction after its InnoDB commit (after_commit);
+  // only with binlog_order_commits=ON are commits in binary log order.
+  else if (!opt_binlog_order_commits)
+    *err = "SECONDARY_LOAD requires binlog_order_commits=ON";
+  // With sync_binlog=1 (and innodb_flush_log_at_trx_commit=1) a transaction
+  // in the binary log is never lost by InnoDB after a crash, so DuckDB never
+  // keeps a transaction InnoDB does not have. History tables hold data that
+  // exists nowhere else, so for them it is required.
   else if (sync_binlog_period != 1 && retain_history)
     *err = "SECONDARY_LOAD of a table with retain_history requires "
            "sync_binlog=1";
@@ -272,7 +277,8 @@ bool copy_archived_rows(duckdb_connection c, const std::string &old_db,
                         const std::string &new_table,
                         const std::vector<std::pair<std::string, std::string>>
                             &new_columns,
-                        const ColumnRenames &renames, std::string *err) {
+                        const ColumnRenames &renames, size_t weight_columns,
+                        std::string *err) {
   std::set<std::string> old_columns;
   if (lake_columns(c, old_db, old_table, &old_columns, err)) return true;
   std::string select;
@@ -286,11 +292,88 @@ bool copy_archived_rows(duckdb_connection c, const std::string &old_db,
                   : "NULL";
   }
   select += ", t.\"__archived_at\"";
+  // Weights are recomputed after the copy (backfill_archived_weights): the
+  // collation may have changed, and older copies have none.
+  for (size_t i = 0; i < weight_columns; i++) select += ", NULL";
   return run_sql(c,
                  "INSERT INTO " + lake_table(db, new_table) + " SELECT " +
                      select + " FROM " + lake_table(old_db, old_table) +
                      " AS t WHERE t.\"__archived_at\" IS NOT NULL",
                  err);
+}
+
+// The weight columns of the archived rows (DWL#6 step A1), from their values:
+// a weight depends only on the value and the collation, so we compute it once
+// per distinct value and join on the value.
+bool backfill_archived_weights(duckdb_connection c, const std::string &db,
+                               const std::string &table,
+                               const std::vector<Field *> &weighted,
+                               std::string *err) {
+  const std::string target = lake_table(db, table);
+  for (Field *f : weighted) {
+    const std::string col = quote_ident(f->field_name);
+    const std::string wcol =
+        quote_ident(std::string(kWeightPrefix) + f->field_name);
+    duckdb_result res;
+    const std::string sql = "SELECT DISTINCT " + col + " FROM " + target +
+                            " WHERE \"__archived_at\" IS NOT NULL AND " + col +
+                            " IS NOT NULL";
+    if (duckdb_query(c, sql.c_str(), &res) == DuckDBError) {
+      const char *m = duckdb_result_error(&res);
+      *err = m != nullptr ? m : "cannot read archived values";
+      duckdb_destroy_result(&res);
+      return true;
+    }
+    const idx_t rows = duckdb_row_count(&res);
+    if (rows == 0) {
+      duckdb_destroy_result(&res);
+      continue;
+    }
+    if (run_sql(c,
+                "CREATE OR REPLACE TEMP TABLE __duckdb_weights (v VARCHAR, w "
+                "BLOB)",
+                err)) {
+      duckdb_destroy_result(&res);
+      return true;
+    }
+    duckdb_appender app = nullptr;
+    if (duckdb_appender_create_ext(c, "temp", "main", "__duckdb_weights",
+                                   &app) == DuckDBError) {
+      *err = duckdb_appender_error(app);
+      duckdb_appender_destroy(&app);
+      duckdb_destroy_result(&res);
+      return true;
+    }
+    bool failed = false;
+    for (idx_t r = 0; r < rows && !failed; r++) {
+      char *v = duckdb_value_varchar(&res, 0, r);
+      const std::string value = v != nullptr ? v : "";
+      duckdb_free(v);
+      std::string w;
+      if (collation_weight_utf8(f->charset(), value, &w)) {
+        *err = std::string("column ") + f->field_name +
+               ": an archived value cannot be converted to its character set";
+        failed = true;
+        break;
+      }
+      failed = duckdb_append_varchar_length(app, value.data(), value.size()) ==
+                   DuckDBError ||
+               duckdb_append_blob(app, w.data(), w.size()) == DuckDBError ||
+               duckdb_appender_end_row(app) == DuckDBError;
+    }
+    duckdb_destroy_result(&res);
+    if (!failed && duckdb_appender_close(app) == DuckDBError) failed = true;
+    if (failed && err->empty()) *err = duckdb_appender_error(app);
+    duckdb_appender_destroy(&app);
+    if (failed ||
+        run_sql(c,
+                "UPDATE " + target + " AS t SET " + wcol +
+                    " = m.w FROM __duckdb_weights m WHERE t." + col +
+                    " = m.v AND t.\"__archived_at\" IS NOT NULL",
+                err))
+      return true;
+  }
+  return false;
 }
 
 // Primary key column names, stored in lake.__mysql.tables.pk_columns.
@@ -379,7 +462,8 @@ bool compare_history_structure(
       "database_name = 'lake' AND schema_name = " +
       quote_literal(copy_db) + " AND table_name = " +
       quote_literal(copy_table) +
-      " AND column_name <> '__archived_at' ORDER BY column_index";
+      " AND column_name <> '__archived_at' AND NOT starts_with(column_name, "
+      "'__w_') ORDER BY column_index";
   if (duckdb_query(c, sql.c_str(), &res) == DuckDBError) {
     const char *msg = duckdb_result_error(&res);
     *err = msg != nullptr ? msg : "cannot read the history copy columns";
@@ -484,7 +568,9 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
   const std::string full = db + "." + name;
   const bool check_only = history_check_only(thd);
 
-  // Columns of the read set, with their DuckDB types.
+  // Columns of the read set, with their DuckDB types; string columns whose
+  // collation DuckDB cannot compare get a weight column (DWL#6 step A1).
+  std::vector<Field *> weighted;
   std::vector<Field *> fields;
   std::vector<std::pair<std::string, std::string>> column_types;
   std::string columns;
@@ -496,9 +582,17 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
     columns += quote_ident((*f)->field_name) + " " + type;
     column_types.emplace_back((*f)->field_name, type);
     fields.push_back(*f);
+    if (type == "VARCHAR" && needs_weight((*f)->charset()))
+      weighted.push_back(*f);
   }
   if (retain_history) columns += ", \"__archived_at\" TIMESTAMP";
+  for (Field *f : weighted)
+    columns +=
+        ", " + quote_ident(std::string(kWeightPrefix) + f->field_name) + " BLOB";
   const std::vector<std::string> pk_names = primary_key_names(table);
+  std::vector<std::string> weighted_names;
+  for (Field *f : weighted) weighted_names.emplace_back(f->field_name);
+  const std::string weight_names = join_names(weighted_names);
 
   // Which existing copy this load replaces:
   // - a refresh after DDL, requested by the binlog reader (DWL#4 step 4d);
@@ -613,6 +707,8 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
     types.push_back(duckdb_create_logical_type(chunk_type(*f)));
   if (retain_history)
     types.push_back(duckdb_create_logical_type(DUCKDB_TYPE_TIMESTAMP));
+  for (size_t i = 0; i < weighted.size(); i++)
+    types.push_back(duckdb_create_logical_type(DUCKDB_TYPE_BLOB));
   auto free_types = create_scope_guard([&types] {
     for (auto &type : types) duckdb_destroy_logical_type(&type);
   });
@@ -702,6 +798,20 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
     if (!err.empty()) break;
     if (retain_history)
       store_null(duckdb_data_chunk_get_vector(chunk, fields.size()), row);
+    // Weights from the value in its own character set.
+    const size_t first_weight = fields.size() + (retain_history ? 1 : 0);
+    for (size_t j = 0; j < weighted.size(); j++) {
+      duckdb_vector vec = duckdb_data_chunk_get_vector(chunk, first_weight + j);
+      Field *f = weighted[j];
+      if (f->is_null()) {
+        store_null(vec, row);
+        continue;
+      }
+      String buf;
+      const String *s = f->val_str(&buf);
+      const std::string w = collation_weight(f->charset(), s->ptr(), s->length());
+      duckdb_vector_assign_string_element_len(vec, row, w.data(), w.size());
+    }
     row++;
     rows++;
     if (row == capacity && flush()) break;
@@ -771,8 +881,11 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
               // Archived rows kept, then the new copy replaces the old one
               // (for adopt_history_from, the other table's copy).
               if ((keep_archived &&
-                   copy_archived_rows(c, src_db, src_table, db, build_name,
-                                      column_types, column_renames, e)) ||
+                   (copy_archived_rows(c, src_db, src_table, db, build_name,
+                                       column_types, column_renames,
+                                       weighted.size(), e) ||
+                    backfill_archived_weights(c, db, build_name, weighted,
+                                              e))) ||
                   run_sql(c, "DROP TABLE " + lake_table(src_db, src_table),
                           e) ||
                   (adopt && run_sql(c,
@@ -794,15 +907,16 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
                    run_sql(c,
                            "INSERT INTO lake.__mysql.tables (db, tbl, "
                            "retain_history, state, load_gtid_set, loaded_at, "
-                           "load_binlog_file, load_binlog_pos, pk_columns) "
-                           "VALUES (" +
+                           "load_binlog_file, load_binlog_pos, pk_columns, "
+                           "weight_columns) VALUES (" +
                                quote_literal(db) + ", " + quote_literal(name) +
                                ", " + (retain_history ? "true" : "false") +
                                ", 'loaded', " + quote_literal(gtids) +
                                ", now(), " +
                                quote_literal(load_position.file) + ", " +
                                std::to_string(load_position.pos) + ", " +
-                               quote_literal(join_names(pk_names)) + ")",
+                               quote_literal(join_names(pk_names)) + ", " +
+                               quote_literal(weight_names) + ")",
                            e) ||
                    run_sql(c, "COMMIT", e);
           },
@@ -812,7 +926,7 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
   // A refresh updates the entry in place: handlers keep its lock.
   if (adopt) Registry::instance().remove(src_db, src_table);
   Registry::instance().add(db, name, retain_history, gtids, load_position,
-                           join_names(pk_names));
+                           join_names(pk_names), weight_names);
   const double secs =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count();

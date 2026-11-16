@@ -32,6 +32,7 @@
 #include "field_types.h"  // MYSQL_TYPE_*
 #include "my_byteorder.h"
 #include "my_sys.h"  // get_charset, get_charset_by_csname
+#include "storage/duckdb/duckdb_collation.h"
 #include "my_time.h"
 #include "mysql/strings/m_ctype.h"
 
@@ -100,6 +101,10 @@ bool string_value(const ColumnInfo &c, const unsigned char *p, size_t len,
     return fail(err, "column " + c.name + ": unknown character set id " +
                          std::to_string(c.charset));
   v->kind = Value::Kind::TEXT;
+  if (needs_weight(cs)) {
+    v->w = collation_weight(cs, reinterpret_cast<const char *>(p), len);
+    v->weighted = true;
+  }
   if (strncmp(cs->csname, "utf8mb", 6) == 0 ||
       strcmp(cs->csname, "ascii") == 0) {
     v->s.assign(reinterpret_cast<const char *>(p), len);

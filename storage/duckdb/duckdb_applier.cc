@@ -15,11 +15,13 @@
 
 #include "storage/duckdb/duckdb_applier.h"
 
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "duckdb.h"
+#include "storage/duckdb/duckdb_collation.h"
 #include "storage/duckdb/duckdb_log.h"
 #include "storage/duckdb/duckdb_types.h"
 
@@ -29,6 +31,9 @@ namespace {
 
 // Lake column without a binlog column: the archive time of history tables.
 constexpr int kArchivedAtColumn = -1;
+// A weight column "__w_<column>" (DWL#6 step A1): kWeightBase - index of the
+// column whose value it weighs.
+constexpr int kWeightBase = -1000;
 
 // Each append converts the value to the column type; a value out of range is
 // an error (checked against the in-tree DuckDB).
@@ -108,9 +113,16 @@ bool map_columns(duckdb_connection c, const TableInfo &info,
       map->push_back(kArchivedAtColumn);
       continue;
     }
+    const bool weight = name.rfind(kWeightPrefix, 0) == 0;
+    const std::string column =
+        weight ? name.substr(strlen(kWeightPrefix)) : name;
     int found = -1;
     for (size_t i = 0; i < info.columns.size() && found < 0; i++)
-      if (info.columns[i].name == name) found = static_cast<int>(i);
+      if (info.columns[i].name == column) found = static_cast<int>(i);
+    if (weight && found >= 0) {
+      map->push_back(kWeightBase - found);
+      continue;
+    }
     if (found < 0) {
       *err = "column " + name + " of the DuckDB table is not in the binary log";
       return true;
@@ -229,9 +241,21 @@ bool apply_table(duckdb_connection c, const BatchTable &bt, bool debug_log,
     auto append_row = [&](const Row &row, uint64_t archived_at) {
       for (int col : map) {
         if (failed) return;
-        if (col == kArchivedAtColumn)
+        if (col == kArchivedAtColumn) {
           failed = append_archive_time(app, archived_at);
-        else
+        } else if (col <= kWeightBase) {
+          // The weight of a value; NULL for NULL (or for a value whose
+          // collation no longer needs one: a refresh follows that DDL).
+          const size_t idx = static_cast<size_t>(kWeightBase - col);
+          failed = idx >= row.size();
+          if (!failed) {
+            const Value &v = row[idx];
+            failed = v.kind != Value::Kind::TEXT || !v.weighted
+                         ? duckdb_append_null(app) == DuckDBError
+                         : duckdb_append_blob(app, v.w.data(), v.w.size()) ==
+                               DuckDBError;
+          }
+        } else
           failed = static_cast<size_t>(col) >= row.size() ||
                    append_value(app, row[col]);
       }

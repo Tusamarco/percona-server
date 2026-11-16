@@ -1,0 +1,60 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#6 step 6a: single-table queries, InnoDB and DuckDB results compared
+# (manual-test-plan.md section 21, duckdb_offload_6a_queries.sql).
+--source ../include/have_duckdb.inc
+--source ../include/tables_g.inc
+
+--let $query= SELECT COUNT(*) FROM g
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM g WHERE id BETWEEN 1000 AND 150000
+--source ../include/duckdb_compare.inc
+--let $query= SELECT grp, COUNT(*), SUM(amount), AVG(amount), MIN(amount), MAX(amount) FROM g GROUP BY grp ORDER BY grp
+--source ../include/duckdb_compare.inc
+--let $query= SELECT grp, COUNT(n), SUM(n), AVG(n) FROM g GROUP BY grp HAVING COUNT(n) > 100 ORDER BY grp DESC
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, grp, amount, d, dt, ts, s, n, ci FROM g WHERE id IN (5, 6, 7, 199999) ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, n FROM g WHERE n IS NULL AND id < 30 ORDER BY id LIMIT 3 OFFSET 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT n, COUNT(*) FROM g WHERE id < 100 GROUP BY n ORDER BY n
+--source ../include/duckdb_compare.inc
+--let $query= SELECT n, COUNT(*) FROM g WHERE id < 100 GROUP BY n ORDER BY n DESC
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(d), MAX(d), MIN(dt), MAX(dt), MIN(ts), MAX(ts) FROM g
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d, COUNT(*) FROM g WHERE d BETWEEN '2024-03-01' AND '2024-03-05' GROUP BY d ORDER BY d
+--source ../include/duckdb_compare.inc
+--let $query= SELECT s, COUNT(*) FROM g WHERE s = 's7' GROUP BY s
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(s), MAX(s) FROM g WHERE NOT (grp = 3 OR grp > 5)
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM g WHERE amount >= 100.50 AND grp <> 2
+--source ../include/duckdb_compare.inc
+--let $query= SELECT SUM(amount) FROM g WHERE id NOT IN (1, 2, 3) AND n NOT BETWEEN 3 AND 9
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM g WHERE d = '2024-3-1'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM g WHERE dt >= '2024-01-01 12:30:00' AND dt < '2024-01-01 13:00:00'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d, COUNT(*) FROM g WHERE d IN ('2024-01-05', '2024-02-29', 20240301) GROUP BY d ORDER BY d DESC
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM g WHERE d > '2024-12-01' OR dt <= '2024-01-01 10:05:00'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM g WHERE dt BETWEEN '2024-01-01 10:00:00' AND '2024-01-01 10:02:30' ORDER BY id LIMIT 5
+--source ../include/duckdb_compare.inc
+
+--source ../include/cleanup.inc

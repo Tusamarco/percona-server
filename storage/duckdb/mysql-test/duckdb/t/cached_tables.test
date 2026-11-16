@@ -1,0 +1,44 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DWL#6 step 6d-2 (section 27): the server keeps secondary tables cached;
+# the registry never frees their entries.
+--source ../include/have_duckdb.inc
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, 1), (2, 2);
+ALTER TABLE t1 SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+SET SESSION use_secondary_engine = FORCED;
+SELECT SUM(v) FROM t1;
+ALTER TABLE t1 SECONDARY_UNLOAD;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT SUM(v) FROM t1;
+ALTER TABLE t1 SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+SELECT SUM(v) FROM t1;
+SET GLOBAL duckdb_enable = OFF;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT SUM(v) FROM t1;
+SET GLOBAL duckdb_enable = ON;
+--source ../include/wait_applier.inc
+SELECT SUM(v) FROM t1;
+DROP TABLE t1;
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, 10);
+ALTER TABLE t1 SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+SELECT SUM(v) FROM t1;
+SET SESSION use_secondary_engine = ON;
+--source ../include/cleanup.inc

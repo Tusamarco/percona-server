@@ -1,0 +1,57 @@
+SELECT PLUGIN_NAME, PLUGIN_STATUS, PLUGIN_TYPE, PLUGIN_AUTHOR
+FROM information_schema.PLUGINS WHERE PLUGIN_NAME LIKE 'duckdb%' ORDER BY 1;
+PLUGIN_NAME	PLUGIN_STATUS	PLUGIN_TYPE	PLUGIN_AUTHOR
+duckdb	ACTIVE	STORAGE ENGINE	Marco Tusa
+duckdb_guard	ACTIVE	AUDIT	Marco Tusa
+SELECT ENGINE, SUPPORT FROM information_schema.ENGINES WHERE ENGINE = 'DUCKDB';
+ENGINE	SUPPORT
+duckdb	YES
+SHOW GLOBAL STATUS LIKE 'duckdb_enabled';
+Variable_name	Value
+duckdb_enabled	#
+# Variables (paths and sizes vary)
+SELECT VARIABLE_NAME FROM performance_schema.global_variables
+WHERE VARIABLE_NAME LIKE 'duckdb%' ORDER BY 1;
+VARIABLE_NAME
+duckdb_apply_batch_max_delay_ms
+duckdb_apply_batch_max_rows
+duckdb_apply_batch_max_trx
+duckdb_apply_debug_log
+duckdb_apply_gap_action
+duckdb_apply_start_position
+duckdb_data_path
+duckdb_discard_stale_copy
+duckdb_enable
+duckdb_encryption
+duckdb_executor_stack_size
+duckdb_executor_threads
+duckdb_history_check_only
+duckdb_history_scope
+duckdb_lake_relocate
+duckdb_memory_limit
+duckdb_offload_min_rows
+duckdb_offload_wait_applied
+duckdb_threads
+duckdb_unload_history_confirm
+# Load and unload
+CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(10)) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+ALTER TABLE t1 SECONDARY_LOAD;
+SELECT TABLE_NAME, CREATE_OPTIONS FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't1';
+TABLE_NAME	CREATE_OPTIONS
+t1	SECONDARY_ENGINE="duckdb" SECONDARY_LOAD="1"
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+2
+SET SESSION use_secondary_engine = ON;
+ALTER TABLE t1 SECONDARY_UNLOAD;
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*) FROM t1;
+ERROR HY000: Table has not been loaded
+SET SESSION use_secondary_engine = ON;
+# Refused loads
+CREATE TABLE t2 (v INT) SECONDARY_ENGINE = duckdb;
+ALTER TABLE t2 SECONDARY_LOAD;
+ERROR HY000: SECONDARY_LOAD requires a primary key

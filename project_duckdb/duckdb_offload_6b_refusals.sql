@@ -15,17 +15,12 @@
 --
 -- DWL#6 step 6b: queries that must be refused, on table p6 (manual-test-plan.md
 -- section 22). Run with EXPECT=refused ./duckdb_offload_compare.sh.
-SELECT ci, COUNT(*) FROM p6 GROUP BY ci ORDER BY ci;
-SELECT COUNT(*) FROM p6 WHERE ci = 'm';
 SELECT CASE WHEN qty < 0 THEN 'neg' ELSE 'pos' END AS k, COUNT(*) FROM p6 GROUP BY k ORDER BY k;
 SELECT HEX(b4), COUNT(*) FROM p6 GROUP BY b4 ORDER BY b4;
 SELECT COUNT(*) FROM p6 WHERE raw LIKE 'k_';
-SELECT id, qty / 3 FROM p6 WHERE id <= 5 ORDER BY id;
 SELECT id, TRUNCATE(amount, 1) FROM p6 WHERE id <= 5 ORDER BY id;
 SELECT id, ROUND(price) FROM p6 WHERE id <= 5 ORDER BY id;
 SELECT id, u + 1 FROM p6 WHERE id <= 5 ORDER BY id;
 SELECT DISTINCT b4 FROM p6 ORDER BY b4;
 SELECT id, HOUR(ts) FROM p6 WHERE id <= 5 ORDER BY id;
 SELECT COUNT(*) FROM p6 WHERE b4 = 1;
-SELECT COUNT(*) FROM p6 WHERE id IN (SELECT id FROM p6 WHERE grp = 1);
-SELECT COUNT(*) FROM p6 a JOIN p6 b ON a.id = b.id + 1;

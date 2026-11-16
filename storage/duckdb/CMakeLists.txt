@@ -33,8 +33,10 @@ MYSQL_ADD_PLUGIN(duckdb
   duckdb_applier.cc
   duckdb_binlog_reader.cc
   duckdb_changes.cc
+  duckdb_collation.cc
   duckdb_ddl.cc
   duckdb_executor.cc
+  duckdb_guard.cc
   duckdb_lake.cc
   duckdb_load.cc
   duckdb_offload.cc
@@ -70,6 +72,7 @@ IF(WITH_UNIT_TESTS)
   MYSQL_ADD_EXECUTABLE(duckdb_apply-t
     tests/duckdb_apply-t.cc
     duckdb_row_decoder.cc
+    duckdb_collation.cc
     duckdb_changes.cc
     duckdb_ddl.cc
     ADD_TEST duckdb_apply
