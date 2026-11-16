@@ -19,7 +19,7 @@
 --disable_warnings
 DROP VIEW IF EXISTS v6;
 DROP VIEW IF EXISTS vh;
-DROP TABLE IF EXISTS g, p6, n, dim, hist, nl, dv, cw, cwd, t1, t2, h1, h2, hcopy;
+DROP TABLE IF EXISTS g, p6, n, dim, hist, nl, dv, cw, cwd, yb, tt, et, eh, t1, t2, h1, h2, hcopy;
 DROP PROCEDURE IF EXISTS ph;
 --enable_warnings
 # Dropping a history table keeps its copy (stale): discard it.
@@ -28,5 +28,7 @@ SET SESSION duckdb_unload_history_confirm = ON;
 SET GLOBAL duckdb_discard_stale_copy = 'test.hist';
 --error 0, ER_SECONDARY_ENGINE_PLUGIN
 SET GLOBAL duckdb_discard_stale_copy = 'test.h1';
+--error 0, ER_SECONDARY_ENGINE_PLUGIN
+SET GLOBAL duckdb_discard_stale_copy = 'test.eh';
 SET SESSION duckdb_unload_history_confirm = OFF;
 --enable_query_log

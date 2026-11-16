@@ -59,6 +59,83 @@ std::string quote_literal(const std::string &value) {
   return out + "'";
 }
 
+std::string index_column_type(const Field &field) {
+  switch (field.real_type()) {
+    case MYSQL_TYPE_ENUM:
+      return "USMALLINT";
+    case MYSQL_TYPE_SET:
+      return "UBIGINT";
+    default:
+      return "";
+  }
+}
+
+bool index_from_value_sql(const Field &field, const std::string &value_sql,
+                          std::string *out, std::string *err) {
+  const bool is_set = field.real_type() == MYSQL_TYPE_SET;
+  if (!is_set && field.real_type() != MYSQL_TYPE_ENUM) {
+    *err = column_error(field, "not an ENUM or SET column");
+    return true;
+  }
+  const TYPELIB *lib = down_cast<const Field_enum &>(field).typelib;
+  std::string sum;
+  for (unsigned i = 0; i < lib->count; i++) {
+    // The element in UTF-8, as values are stored.
+    String utf8;
+    uint errors = 0;
+    if (utf8.copy(lib->type_names[i], lib->type_lengths[i], field.charset(),
+                  &my_charset_utf8mb4_bin, &errors) ||
+        errors != 0) {
+      *err = column_error(field, "element cannot be converted to UTF-8");
+      return true;
+    }
+    const std::string elem =
+        quote_literal(std::string(utf8.ptr(), utf8.length()));
+    if (is_set)
+      sum += (sum.empty() ? "" : " + ") + std::string("CASE WHEN list_contains("
+             "string_split(") + value_sql + ", ','), " + elem + ") THEN " +
+             std::to_string(1ULL << i) + "::UBIGINT ELSE 0::UBIGINT END";
+    else
+      sum += " WHEN " + elem + " THEN " + std::to_string(i + 1);
+  }
+  if (is_set)
+    *out = "CASE WHEN " + value_sql + " IS NULL THEN NULL ELSE " +
+           (sum.empty() ? std::string("0::UBIGINT") : "(" + sum + ")") +
+           " END";
+  else
+    *out = "CASE WHEN " + value_sql + " IS NULL THEN NULL ELSE CAST(CASE " +
+           value_sql + sum + " ELSE 0 END AS USMALLINT) END";
+  return false;
+}
+
+bool set_value_from_value_sql(const Field &field, const std::string &value_sql,
+                              std::string *out, std::string *err) {
+  if (field.real_type() != MYSQL_TYPE_SET) {
+    *err = column_error(field, "not a SET column");
+    return true;
+  }
+  const TYPELIB *lib = down_cast<const Field_enum &>(field).typelib;
+  std::string parts;
+  for (unsigned i = 0; i < lib->count; i++) {
+    String utf8;
+    uint errors = 0;
+    if (utf8.copy(lib->type_names[i], lib->type_lengths[i], field.charset(),
+                  &my_charset_utf8mb4_bin, &errors) ||
+        errors != 0) {
+      *err = column_error(field, "element cannot be converted to UTF-8");
+      return true;
+    }
+    const std::string elem =
+        quote_literal(std::string(utf8.ptr(), utf8.length()));
+    parts += ", CASE WHEN list_contains(string_split(" + value_sql +
+             ", ','), " + elem + ") THEN " + elem + " END";
+  }
+  *out = "CASE WHEN " + value_sql + " IS NULL THEN NULL ELSE " +
+         (parts.empty() ? std::string("''") : "concat_ws(','" + parts + ")") +
+         " END";
+  return false;
+}
+
 std::string duckdb_column_type(const Field &field, std::string *err) {
   const bool uns = field.is_unsigned();
   switch (field.real_type()) {
@@ -71,6 +148,16 @@ std::string duckdb_column_type(const Field &field, std::string *err) {
       return uns ? "UINTEGER" : "INTEGER";
     case MYSQL_TYPE_LONGLONG:
       return uns ? "UBIGINT" : "BIGINT";
+    case MYSQL_TYPE_YEAR:
+      // The year number: 0 (0000) or 1901..2155.
+      return "USMALLINT";
+    case MYSQL_TYPE_BIT:
+      // BIT(1..64) as its unsigned value.
+      return "UBIGINT";
+    case MYSQL_TYPE_TIME2:
+      // Signed microseconds: MySQL TIME spans -838:59:59..838:59:59, DuckDB
+      // TIME only 00:00:00..24:00:00.
+      return "BIGINT";
     case MYSQL_TYPE_NEWDECIMAL: {
       const auto &d = down_cast<const Field_new_decimal &>(field);
       if (d.precision > 38) {
@@ -85,6 +172,10 @@ std::string duckdb_column_type(const Field &field, std::string *err) {
       return "FLOAT";
     case MYSQL_TYPE_DOUBLE:
       return "DOUBLE";
+    case MYSQL_TYPE_ENUM:
+    case MYSQL_TYPE_SET:
+      // The value; the index is in the hidden column (index_column_type).
+      return "VARCHAR";
     case MYSQL_TYPE_STRING:
     case MYSQL_TYPE_VARCHAR:
     case MYSQL_TYPE_BLOB:
@@ -112,6 +203,11 @@ duckdb_type chunk_type(const Field &field) {
     case MYSQL_TYPE_LONG:
     case MYSQL_TYPE_LONGLONG:
       return field.is_unsigned() ? DUCKDB_TYPE_UBIGINT : DUCKDB_TYPE_BIGINT;
+    case MYSQL_TYPE_YEAR:
+    case MYSQL_TYPE_BIT:
+      return DUCKDB_TYPE_UBIGINT;
+    case MYSQL_TYPE_TIME2:
+      return DUCKDB_TYPE_BIGINT;
     case MYSQL_TYPE_FLOAT:
     case MYSQL_TYPE_DOUBLE:
       return DUCKDB_TYPE_DOUBLE;
@@ -120,6 +216,9 @@ duckdb_type chunk_type(const Field &field) {
     case MYSQL_TYPE_DATETIME2:
     case MYSQL_TYPE_TIMESTAMP2:
       return DUCKDB_TYPE_TIMESTAMP;
+    case MYSQL_TYPE_ENUM:
+    case MYSQL_TYPE_SET:
+      return DUCKDB_TYPE_VARCHAR;
     case MYSQL_TYPE_STRING:
     case MYSQL_TYPE_VARCHAR:
     case MYSQL_TYPE_BLOB:
@@ -157,6 +256,25 @@ bool store_field(duckdb_vector vec, idx_t row, Field &field,
         static_cast<int64_t *>(data)[row] = v;
       return false;
     }
+    case MYSQL_TYPE_YEAR:
+      // Field_year::val_int(): 0 for 0000, else the year.
+      static_cast<uint64_t *>(data)[row] =
+          static_cast<uint64_t>(field.val_int());
+      return false;
+    case MYSQL_TYPE_BIT:
+      // Field_bit::val_int(): the bits as an integer (up to 64).
+      static_cast<uint64_t *>(data)[row] =
+          static_cast<uint64_t>(field.val_int());
+      return false;
+    case MYSQL_TYPE_TIME2: {
+      Time_val t;
+      if (field.val_time(&t)) {
+        *err = column_error(field, "invalid TIME value");
+        return true;
+      }
+      static_cast<int64_t *>(data)[row] = t.to_microseconds();
+      return false;
+    }
     case MYSQL_TYPE_FLOAT:
     case MYSQL_TYPE_DOUBLE:
       static_cast<double *>(data)[row] = field.val_real();
@@ -167,10 +285,13 @@ bool store_field(duckdb_vector vec, idx_t row, Field &field,
       duckdb_vector_assign_string_element_len(vec, row, s->ptr(), s->length());
       return false;
     }
+    case MYSQL_TYPE_ENUM:
+    case MYSQL_TYPE_SET:
     case MYSQL_TYPE_STRING:
     case MYSQL_TYPE_VARCHAR:
     case MYSQL_TYPE_BLOB: {
-      // CHAR values come without trailing spaces, as MySQL returns them.
+      // CHAR values come without trailing spaces, as MySQL returns them;
+      // ENUM / SET give their string value (Field_enum::val_str).
       String buf;
       const String *s = field.val_str(&buf);
       if (field.charset() == &my_charset_bin ||

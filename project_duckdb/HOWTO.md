@@ -66,7 +66,7 @@ cd ../percona-server-9.7-build/mysql-test
 MTR_SHUTDOWN_TIMEOUT=120 ./mtr --suite=/opt/mysql_source/percona-server/storage/duckdb/mysql-test/duckdb --parallel=2
 ```
 
-16 tests (about 1.5 hours with a debug build); see
+20 tests (about 1.5 hours with a debug build); see
 `storage/duckdb/mysql-test/duckdb/README.md`.
 
 ### Results and checks
@@ -288,8 +288,8 @@ Requirements for a table:
 - no foreign keys (in either direction);
 - supported column types: integer types (signed and unsigned), DECIMAL up to
   precision 38, FLOAT, DOUBLE, CHAR, VARCHAR, TEXT types, BINARY, VARBINARY,
-  BLOB types, DATE, DATETIME, TIMESTAMP. Other types (JSON, ENUM, SET, BIT,
-  TIME, YEAR, spatial, VECTOR) make the load fail, naming the column;
+  BLOB types, DATE, DATETIME, TIMESTAMP, YEAR, BIT, TIME, ENUM, SET. Other
+  types (JSON, spatial, VECTOR) make the load fail, naming the column;
 - no zero dates or zero timestamps in the data;
 - columns marked `NOT SECONDARY` are not copied;
 - string columns whose collation DuckDB cannot compare natively (`_ci`,
@@ -594,6 +594,23 @@ query waits until the applier has applied this connection's last commit (at
 most 5 s, otherwise it runs on InnoDB). With OFF it may not see a commit made
 less than about a second earlier.
 
+### YEAR, BIT, TIME, ENUM and SET in queries
+
+They are offloaded with MySQL's results; what is not translated is refused
+(InnoDB with ON, an error with FORCED):
+
+| Type | Offloaded | Refused |
+|---|---|---|
+| YEAR | comparisons (constants as MySQL reads them: `y = 5` is 2005, `y = '0'` 2000, `y = 0` 0000), GROUP BY, ORDER BY, MIN/MAX, `y + 1`; a YEAR column is shown `0000`, an expression such as `MAX(y)` as `0`, as MySQL does | `y - 1900` (MySQL raises error 1690 for 0000), string contexts (`LIKE`, `IF(..., y, 'x')`), a YEAR column of a UNION |
+| BIT | comparisons with numbers and `b'..'` / `0x..` literals, `b + 0`, MIN/MAX (sent as bytes), GROUP BY, ORDER BY | `b64 + 1` (may pass 2^64-1), `b + 0.5`, `HEX(b)`, `BIN(b)`, string contexts |
+| TIME | comparisons with TIME columns and constants (`'12:30:45'`, `123045`, `'1 02:00:00'`, `12.5` converted to TIME as MySQL does), BETWEEN, IN, GROUP BY, ORDER BY, MIN/MAX, COUNT(DISTINCT); negative values and more than 24 hours | SUM/AVG and `t + 0` (MySQL uses the number HHMMSS), comparison with DATETIME, `HOUR()` and other functions, TIME expressions in the result (`IFNULL(t, ...)`) |
+| ENUM, SET | string comparisons with the column collation (`e = 'MEDIUM'` on `_ci`), IN, BETWEEN, LIKE (binary collations), MIN/MAX (by string, as MySQL), GROUP BY, COUNT(DISTINCT); `ORDER BY e` sorts by the element position, `e = 2`, `e + 0`, `s * 2` use the index / bitmask | SUM, `FIND_IN_SET`, `CONCAT`, ORDER BY an ENUM of a materialized derived table, the existing collation rules (LIKE on `_ci`, DISTINCT on PAD SPACE) |
+
+Unsigned arithmetic (`+`, `*`) is offloaded only when it cannot leave
+0..2^64-1 (unsigned columns and non-negative constants whose largest values
+keep the result within 64 bits); otherwise MySQL may raise error 1690 on
+rows DuckDB evaluates differently, so it is refused.
+
 ### Live data or full history (`duckdb_history_scope`)
 
 `duckdb_history_scope` decides what queries run in DuckDB see in history
@@ -765,6 +782,35 @@ Notes:
 
 ## 10. Monitoring and troubleshooting
 
+### Which tables are in the lake
+
+```sql
+SELECT TABLE_SCHEMA, TABLE_NAME, STATE, RETAIN_HISTORY, PRIMARY_KEY
+  FROM INFORMATION_SCHEMA.DUCKDB_TABLES ORDER BY 1, 2;
+```
+
+One row per copy in the lake (the plugin's registry,
+`lake.__mysql.tables`):
+
+| Column | Content |
+|---|---|
+| `TABLE_SCHEMA`, `TABLE_NAME` | the MySQL table (after a RENAME TABLE, the new name once the applier has read it) |
+| `STATE` | `LOADED` (kept current by the applier), `STALE` (kept but no longer updated: the history copy of a dropped table, or a refresh after DDL that failed; see the error log), `REFRESH_PENDING` (a refresh waits for a later RENAME) |
+| `RETAIN_HISTORY` | `YES` for history tables |
+| `PRIMARY_KEY` | primary key columns, `a, b`; NULL for copies loaded before the key was recorded (the applier fills it) |
+| `WEIGHT_COLUMNS` | columns with a hidden weight column (non-binary collations, section 6); NULL if none or loaded before weights |
+| `LOAD_BINLOG_FILE`, `LOAD_BINLOG_POSITION`, `LOAD_GTID_SET` | binary log position and GTID set at load time: the applier skips what the load already contains |
+
+Tables with `SECONDARY_ENGINE=duckdb` that are not loaded have no row; a
+`STALE` row whose table no longer exists is a history copy waiting for a
+reattach or `duckdb_discard_stale_copy` (section 5). The table is empty while
+the lake is closed (`duckdb_enable=OFF`) and for accounts without the
+`PROCESS` privilege (as InnoDB's INFORMATION_SCHEMA tables).
+`INFORMATION_SCHEMA.TABLES` shows the same for one table in `CREATE_OPTIONS`
+(`SECONDARY_LOAD="1"`), without the state.
+
+### Status variables
+
 ```sql
 SHOW GLOBAL STATUS LIKE 'duckdb%';
 ```
@@ -876,7 +922,7 @@ Counters restart at 0 when the server starts.
   expiry, Phase 3).
 - A refresh after DDL reloads the whole table and pauses the applier for all
   tables while it runs.
-- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 16 tests) covers the
+- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 20 tests) covers the
   features; restarts with special options, replica, semi-sync, relocation
   and performance stay in `manual-test-plan.md`.
 - Replicas: tested with a source without the plugin (section 2, Replicas).

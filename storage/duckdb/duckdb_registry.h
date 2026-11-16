@@ -137,6 +137,15 @@ class Registry {
   /** Copies the entry's fields; false if the table is not in the registry. */
   bool snapshot(const std::string &db, const std::string &table,
                 TableState *state);
+  /** One table in the lake, for INFORMATION_SCHEMA.DUCKDB_TABLES. */
+  struct Listed {
+    std::string db;
+    std::string table;
+    TableState state;
+    std::string load_gtid_set;
+  };
+  /** Every table in the lake, sorted by schema and name. */
+  std::vector<Listed> list();
   /** Earliest load position among usable tables; false if there is none. */
   bool earliest_load_position(BinlogPos *pos);
   /**

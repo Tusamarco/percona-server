@@ -1304,10 +1304,90 @@ SHOW GLOBAL STATUS LIKE 'duckdb_guard%';
 --   EXPECTED ERROR 3877: ... requires the duckdb_guard plugin, which is not active
 ```
 
+## 35. INFORMATION_SCHEMA.DUCKDB_TABLES (2026-11-16)
+
+On any instance with loaded tables (MTR: `i_s_tables`):
+
+```sql
+SELECT PLUGIN_NAME, PLUGIN_STATUS, PLUGIN_TYPE FROM information_schema.PLUGINS
+ WHERE PLUGIN_NAME = 'DUCKDB_TABLES';                  -- ACTIVE, INFORMATION SCHEMA
+SELECT * FROM information_schema.DUCKDB_TABLES ORDER BY TABLE_SCHEMA, TABLE_NAME\G
+-- one row per loaded table: STATE LOADED, RETAIN_HISTORY YES for history
+-- tables, PRIMARY_KEY, WEIGHT_COLUMNS (the _ci / latin1 columns, not
+-- utf8mb4_bin), the load binlog file / position / GTID set.
+-- Compare with the tables having SECONDARY_LOAD="1":
+SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES
+ WHERE CREATE_OPTIONS LIKE '%SECONDARY_LOAD="1"%' ORDER BY 1, 2;
+```
+
+Checks: a RENAME TABLE shows the new name after the applier read it; a
+dropped history table shows `STALE` until discarded; an unloaded table has no
+row; an account without PROCESS sees no rows; `duckdb_enable=OFF`: no rows.
+
+## 36. YEAR and BIT (2026-11-16)
+
+Table yb of `duckdb_offload_setup.sql` (re-run the setup, or only its
+"YEAR and BIT" block, which needs table n); MTR: `offload_yb`.
+
+```bash
+MYSQL="mysql -S <socket> -u <user> -p<password> windmills_small" \
+  ./duckdb_offload_compare.sh duckdb_offload_yb_queries.sql        # 33/33
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_yb_refusals.sql  # 5/5
+```
+
+Checks: YEAR 0000 shown as `0000` for the column, `0` for MAX(y); BIT values
+as bytes (`SELECT b` in the mysql client prints raw bytes, compare with
+`HEX(b)` or `b + 0` under OFF); rows inserted, updated and deleted after the
+load (ids 2, 3, 4, 100, 101) are the same in DuckDB; `b64 + 0` from 2^63
+positive. Regression: all earlier lists (6b refusals now 9/9 with `u - 1`).
+
+## 37. TIME (2026-11-16)
+
+Table tt of `duckdb_offload_setup.sql` (its "TIME" block needs table n);
+MTR: `offload_time`.
+
+```bash
+MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_tt_queries.sql                 # 24/24
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_tt_refusals.sql  # 7/7
+```
+
+Checks: negative values, more than 24 hours, -838:59:59 / 838:59:59,
+fractions of TIME(3) and TIME(6) shown as InnoDB shows them; constants in
+every form MySQL accepts; rows changed after the load the same.
+
+## 38. ENUM and SET (2026-11-16)
+
+Table et of `duckdb_offload_setup.sql` (its "ENUM and SET" block needs
+table n); MTR: `offload_enum`.
+
+```bash
+MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_et_queries.sql                 # 28/28
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_et_refusals.sql  # 6/6
+```
+
+History across a definition change (needs DUCKDB_HISTORY_READER):
+
+```sql
+CREATE TABLE eh (id INT PRIMARY KEY, e ENUM('a','b','c'), s SET('x','y','z')) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO eh VALUES (1,'a','x'), (2,'b','x,z'), (3,'c','y'), (4,'a','z'), (5,'b',''), (6,NULL,NULL);
+ALTER TABLE eh SECONDARY_LOAD;
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge'; DELETE FROM eh WHERE id IN (1, 2); SET gtid_next = 'AUTOMATIC';
+ALTER TABLE eh MODIFY e ENUM('c','b','a','d'), MODIFY s SET('z','y','x');
+-- after the refresh (duckdb_apply_ddl_refreshes + 1, failures 0):
+SET SESSION duckdb_history_scope = FULL;
+SELECT id, e, e + 0, s, s + 0 FROM eh ORDER BY id;
+-- 1 a 3 x 4 | 2 b 2 z,x 5 | 3 c 1 y 2 | 4 a 3 z 1 | 5 b 2 '' 0 | 6 NULL ...
+-- LIVE: the same as InnoDB (ids 3-6)
+```
+
 ## Results log
 
 | Date | Build | Sections run | Result | Notes |
 |---|---|---|---|---|
+| 2026-11-16 | clang-21, C++23, debug | 37 TIME, 38 ENUM and SET (throwaway instance; MTR offload_time, offload_enum, offload_yb; unit tests) | pass after fixes | tt 24/24, refusals 7/7; et 28/28, refusals 6/6; yb 33/33, refusals 7/7; all earlier lists unchanged (6a 19, 6b 45, 6c 37, 6c-2 26, 6c-3 33, div 18, a2 32; refusals 9, 4, 6, 5, 7); history table eh across ENUM/SET reorder: archived indexes recomputed, SET text rewritten (x,z -> z,x), LIVE = InnoDB; unit tests 41 (YEAR, BIT, TIME2, ENUM, SET decoding). Found and fixed: a TIME column inside LIKE / IFNULL would have been translated as its microseconds (special_args() guard for TIME, ENUM, SET, YEAR, BIT); archived SET text kept the old element order. MTR type tests use only table n (the g setup took over 20 minutes with three workers on the HDD) |
+| 2026-11-16 | clang-21, C++23, debug | 36, YEAR and BIT (throwaway instance; MTR offload_yb, offload_refusals) | pass after fixes | yb 33/33 identical and offloaded (after load, inserts, updates, delete), refusals 5/5; regressions 6a 19/19, 6b 45/45, 6c 37/37, 6c-2 26/26, 6c-3 33/33, div 18/18, a2 32/32, refusals 6b 9/9 (u + 1 now exact, replaced by u - 1), 6c 4/4, 6c-2 6/6, 6c-3 5/5, a2 7/7. Found: MySQL sends a YEAR column zero-filled but a YEAR expression as a number (holder per case); an unsigned BIGINT from 2^63 was sent negative (existing bug, fixed); the first setup used ELT (strings: BIT stored ASCII bytes) |
+| 2026-11-16 | clang-21, C++23, debug | 35, INFORMATION_SCHEMA.DUCKDB_TABLES (MTR i_s_tables) | pass | plugin ACTIVE, type INFORMATION SCHEMA; t1 LOADED, PK id, weights s, l (not the utf8mb4_bin column); h1 LOADED YES, PK id1, id2; load file, position and GTID set present; not-loaded t2 absent; RENAME followed (t3); dropped h1 STALE; unload removes the row; no rows without PROCESS, 1 with it; duckdb_enable=OFF: 0 rows, ON: back |
 | 2026-11-16 | clang-21, C++23, debug | MTR suite (16 tests, --parallel=2, --testcase-timeout=45) | pass | all 16 pass after the guard and super_read_only changes (new test super_read_only). A first run timed out in guard's setup (200k-row INSERT took 15 min with swap full): not a plugin problem; tests took 1-22 min each on the loaded machine |
 | 2026-11-16 | clang-21, C++23, debug | 18 cases 7 and 10, guard and super_read_only fixes (replica pair 3402/3403, MTR guard, super_read_only) | pass after fixes | guard: UPDATE, DELETE, TRUNCATE, DELETE and UPDATE with a subquery on a history table stopped under FULL, nothing changed (MTR guard). super_read_only=ON on the replica: before the fix the refresh failed (1290) and mt and rh went stale; rh could not be reattached (MODIFY BIGINT + ADD COLUMN: 2 differences, archived rows lost on that test table). After: classic mt MODIFY BIGINT, RENAME, TRUNCATE of r1b, history rh2 MODIFY BIGINT + ADD COLUMN: 4 refreshes, 0 failures, DuckDB = InnoDB, FULL 842 with archived rows; SECONDARY_UNLOAD and INSERT by root refused (1290); no new replica GTID. Seen: srv_session THDs are not audited (m_audited=false): the internal session enables auditing |
 | 2026-11-15 | clang-21, C++23, debug | 18, replica (throwaway source 3402 without the plugin, replica 3403 with it) | pass, one open point | CREATE TABLE ... SECONDARY_ENGINE=duckdb and retain_history attribute accepted by the source without the plugin; load on the replica with sql_log_bin=0: gtid_executed equal. DML and a 55k-row transaction in 6 pieces (batch_max_rows 10000): DuckDB = InnoDB. MODIFY BIGINT, ADD COLUMN, RENAME, TRUNCATE: replication never stopped, 3 refreshes, 1 rename, 0 failures. 8 concurrent source sessions, 4 parallel workers (all used): equal, no errant GTID. STOP REPLICA during writes and a replica restart during writes: caught up, equal. Tagged purge: tag in the replica's GTID set, 1 purge, 100 archived rows; FULL 990 rows (890 live + 100 archived), FULL+OFF stopped. Joins, IN and scalar subqueries, COUNT(DISTINCT) equal; a grouped _ci name in a join and a UNION of _ci columns refused (documented). Seen: SECONDARY_LOAD/UNLOAD are binlogged (errant GTID without sql_log_bin=0); DUCKDB_HISTORY_READER must be granted on the replica locally. Open point: UPDATE of a history table under FULL not stopped by the guard (UPDATE event, not READ) |

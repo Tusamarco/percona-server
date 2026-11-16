@@ -133,6 +133,66 @@ CREATE TABLE cwd (id INT PRIMARY KEY, c VARCHAR(20) COLLATE utf8mb4_0900_ai_ci N
 INSERT INTO cwd VALUES (1, 'APPLE', 1), (2, 'banana', 1), (3, 'Cherry', 2), (4, 'durian', 2), (5, 'Elderberry', 3);
 ALTER TABLE cwd SECONDARY_LOAD;
 
+-- YEAR and BIT (2026-11-16): YEAR 0000 and the range ends, BIT(1), BIT(10),
+-- BIT(64) with its largest values, NULLs; d holds dates whose YEAR() equals y
+-- for some rows. Loaded first, changed after the load (applier).
+DROP TABLE IF EXISTS yb;
+CREATE TABLE yb (id INT PRIMARY KEY, y YEAR, b BIT(10), b1 BIT(1), b64 BIT(64), g INT, d DATE) SECONDARY_ENGINE = duckdb;
+-- (numbers, not strings: ELT would give '0', which YEAR reads as 2000 and
+-- BIT stores as the byte 0x30)
+INSERT INTO yb SELECT n + 1,
+  CASE WHEN n % 13 = 12 THEN NULL ELSE CASE n % 8 WHEN 0 THEN 0 WHEN 1 THEN 1901 WHEN 2 THEN 1970
+    WHEN 3 THEN 1999 WHEN 4 THEN 2000 WHEN 5 THEN 2005 WHEN 6 THEN 2069 ELSE 2155 END END,
+  IF(n % 11 = 10, NULL, (n * 37) % 1024), n % 2,
+  CASE WHEN n % 9 = 8 THEN NULL ELSE CASE n % 5 WHEN 0 THEN 0 WHEN 1 THEN 1
+    WHEN 2 THEN CAST(9223372036854775808 AS UNSIGNED) WHEN 3 THEN CAST(18446744073709551614 AS UNSIGNED)
+    ELSE CAST(18446744073709551615 AS UNSIGNED) END END,
+  n % 4, DATE_ADD('1999-06-01', INTERVAL (n % 3) * 366 DAY)
+  FROM n WHERE n < 60;
+ALTER TABLE yb SECONDARY_LOAD;
+INSERT INTO yb VALUES (100, 0, 0, 0, 0, 0, '2000-01-01'),
+  (101, 2155, b'1111111111', 1, CAST(18446744073709551615 AS UNSIGNED), 1, '2001-01-01');
+UPDATE yb SET y = 1999, b = b'1010' WHERE id IN (2, 3);
+DELETE FROM yb WHERE id = 4;
+
+-- TIME (2026-11-16): negative values, more than 24 hours, the range ends,
+-- fractions (TIME(3), TIME(6)), NULLs. Loaded first, changed after the load.
+DROP TABLE IF EXISTS tt;
+CREATE TABLE tt (id INT PRIMARY KEY, t TIME, t3 TIME(3), t6 TIME(6), g INT, dt DATETIME) SECONDARY_ENGINE = duckdb;
+INSERT INTO tt SELECT n + 1,
+  CASE WHEN n % 11 = 10 THEN NULL ELSE CASE n % 10 WHEN 0 THEN '00:00:00' WHEN 1 THEN '12:30:45' WHEN 2 THEN '-12:30:45'
+    WHEN 3 THEN '838:59:59' WHEN 4 THEN '-838:59:59' WHEN 5 THEN '24:00:00' WHEN 6 THEN '26:00:00'
+    WHEN 7 THEN '-00:00:01' WHEN 8 THEN '00:00:12' ELSE '100:00:00' END END,
+  CASE WHEN n % 7 = 6 THEN NULL ELSE SEC_TO_TIME((n % 13 - 6) * 3600.125 + n * 0.001) END,
+  CASE n % 5 WHEN 0 THEN '00:00:00.000001' WHEN 1 THEN '-00:00:00.000001' WHEN 2 THEN '23:59:59.999999'
+    WHEN 3 THEN '-838:59:59.000000' ELSE '00:00:12.500000' END,
+  n % 4, TIMESTAMP('2024-01-01 00:00:00') + INTERVAL n HOUR
+  FROM n WHERE n < 60;
+ALTER TABLE tt SECONDARY_LOAD;
+INSERT INTO tt VALUES (100, '-00:00:00.5', '-00:00:00.500', '-00:00:00.5', 0, '2024-01-01 00:00:00'),
+  (101, '838:59:59', '838:59:59.000', '838:59:59', 1, '2024-01-01 12:30:45');
+UPDATE tt SET t = '01:02:03', t3 = '-01:02:03.004' WHERE id IN (2, 3);
+DELETE FROM tt WHERE id = 4;
+
+-- ENUM and SET (2026-11-16): element order that differs from the alphabet,
+-- _ci, _bin and latin1 definitions, SET combinations and the empty set,
+-- NULLs, and the invalid value '' (index 0, inserted in a non-strict mode).
+DROP TABLE IF EXISTS et;
+CREATE TABLE et (id INT PRIMARY KEY, e ENUM('small', 'medium', 'large', 'x-large'),
+  es ENUM('b', 'a', 'c') COLLATE utf8mb4_bin, s SET('red', 'green', 'blue', 'alpha'),
+  l ENUM('été', 'ete2', 'Zed') CHARACTER SET latin1, g INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO et SELECT n + 1, IF(n % 9 = 8, NULL, n % 4 + 1), IF(n % 7 = 6, NULL, n % 3 + 1),
+  IF(n % 11 = 10, NULL, n % 16), IF(n % 5 = 4, NULL, n % 3 + 1), n % 3
+  FROM n WHERE n < 60;
+SET @old_mode = @@SESSION.sql_mode;
+SET SESSION sql_mode = '';
+INSERT INTO et VALUES (90, 'bogus', 'zz', 'red', 'Zed', 1);
+SET SESSION sql_mode = @old_mode;
+ALTER TABLE et SECONDARY_LOAD;
+INSERT INTO et VALUES (100, 'MEDIUM', 'c', 'blue,red', 'été', 0), (101, 'x-large', 'a', '', 'ete2', 2);
+UPDATE et SET e = 'large', s = 'alpha,green' WHERE id IN (2, 3);
+DELETE FROM et WHERE id = 4;
+
 SELECT 'g' AS t, COUNT(*) AS row_count FROM g UNION ALL SELECT 'p6', COUNT(*) FROM p6
   UNION ALL SELECT 'dim', COUNT(*) FROM dim UNION ALL SELECT 'hist', COUNT(*) FROM hist;  -- 200000, 20000, 7, 70
 SELECT table_name, create_options FROM information_schema.tables

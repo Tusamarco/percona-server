@@ -278,23 +278,44 @@ bool copy_archived_rows(duckdb_connection c, const std::string &old_db,
                         const std::vector<std::pair<std::string, std::string>>
                             &new_columns,
                         const ColumnRenames &renames, size_t weight_columns,
+                        const std::vector<Field *> &indexed,
                         std::string *err) {
   std::set<std::string> old_columns;
   if (lake_columns(c, old_db, old_table, &old_columns, err)) return true;
   std::string select;
+  std::map<std::string, std::string> value_of;  // new column -> its value SQL
   for (const auto &[column, type] : new_columns) {
     std::string source = column;
     for (const auto &[from, to] : renames)
       if (to == column) source = from;
     if (!select.empty()) select += ", ";
-    select += old_columns.count(source) > 0
-                  ? "CAST(t." + quote_ident(source) + " AS " + type + ")"
-                  : "NULL";
+    std::string v =
+        old_columns.count(source) > 0
+            ? "CAST(t." + quote_ident(source) + " AS " + type + ")"
+            : "NULL";
+    value_of[column] = v;
+    // A SET value written again in the current element order (its bitmask
+    // below is computed from the same elements).
+    for (Field *f : indexed)
+      if (f->real_type() == MYSQL_TYPE_SET && column == f->field_name &&
+          set_value_from_value_sql(*f, value_of[column], &v, err))
+        return true;
+    select += v;
   }
   select += ", t.\"__archived_at\"";
   // Weights are recomputed after the copy (backfill_archived_weights): the
   // collation may have changed, and older copies have none.
   for (size_t i = 0; i < weight_columns; i++) select += ", NULL";
+  // ENUM / SET index from the archived value with the current definition
+  // (a value no longer in it gets 0).
+  for (Field *f : indexed) {
+    std::string idx;
+    if (index_from_value_sql(*f, "CAST(" + value_of[f->field_name] +
+                                     " AS VARCHAR)",
+                             &idx, err))
+      return true;
+    select += ", " + idx;
+  }
   return run_sql(c,
                  "INSERT INTO " + lake_table(db, new_table) + " SELECT " +
                      select + " FROM " + lake_table(old_db, old_table) +
@@ -463,7 +484,8 @@ bool compare_history_structure(
       quote_literal(copy_db) + " AND table_name = " +
       quote_literal(copy_table) +
       " AND column_name <> '__archived_at' AND NOT starts_with(column_name, "
-      "'__w_') ORDER BY column_index";
+      "'__w_') AND NOT starts_with(column_name, '__n_') ORDER BY "
+      "column_index";
   if (duckdb_query(c, sql.c_str(), &res) == DuckDBError) {
     const char *msg = duckdb_result_error(&res);
     *err = msg != nullptr ? msg : "cannot read the history copy columns";
@@ -571,6 +593,7 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
   // Columns of the read set, with their DuckDB types; string columns whose
   // collation DuckDB cannot compare get a weight column (DWL#6 step A1).
   std::vector<Field *> weighted;
+  std::vector<Field *> indexed;  // ENUM and SET columns
   std::vector<Field *> fields;
   std::vector<std::pair<std::string, std::string>> column_types;
   std::string columns;
@@ -584,11 +607,16 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
     fields.push_back(*f);
     if (type == "VARCHAR" && needs_weight((*f)->charset()))
       weighted.push_back(*f);
+    if (!index_column_type(**f).empty()) indexed.push_back(*f);
   }
   if (retain_history) columns += ", \"__archived_at\" TIMESTAMP";
   for (Field *f : weighted)
     columns +=
         ", " + quote_ident(std::string(kWeightPrefix) + f->field_name) + " BLOB";
+  // ENUM / SET: the index or bitmask next to the value.
+  for (Field *f : indexed)
+    columns += ", " + quote_ident(std::string(kIndexPrefix) + f->field_name) +
+               " " + index_column_type(*f);
   const std::vector<std::string> pk_names = primary_key_names(table);
   std::vector<std::string> weighted_names;
   for (Field *f : weighted) weighted_names.emplace_back(f->field_name);
@@ -709,6 +737,8 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
     types.push_back(duckdb_create_logical_type(DUCKDB_TYPE_TIMESTAMP));
   for (size_t i = 0; i < weighted.size(); i++)
     types.push_back(duckdb_create_logical_type(DUCKDB_TYPE_BLOB));
+  for (size_t i = 0; i < indexed.size(); i++)
+    types.push_back(duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT));
   auto free_types = create_scope_guard([&types] {
     for (auto &type : types) duckdb_destroy_logical_type(&type);
   });
@@ -812,6 +842,18 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
       const std::string w = collation_weight(f->charset(), s->ptr(), s->length());
       duckdb_vector_assign_string_element_len(vec, row, w.data(), w.size());
     }
+    // ENUM index / SET bitmask (Field_enum::val_int).
+    const size_t first_index = first_weight + weighted.size();
+    for (size_t j = 0; j < indexed.size(); j++) {
+      duckdb_vector vec = duckdb_data_chunk_get_vector(chunk, first_index + j);
+      Field *f = indexed[j];
+      if (f->is_null()) {
+        store_null(vec, row);
+        continue;
+      }
+      static_cast<uint64_t *>(duckdb_vector_get_data(vec))[row] =
+          static_cast<uint64_t>(f->val_int());
+    }
     row++;
     rows++;
     if (row == capacity && flush()) break;
@@ -883,7 +925,7 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
               if ((keep_archived &&
                    (copy_archived_rows(c, src_db, src_table, db, build_name,
                                        column_types, column_renames,
-                                       weighted.size(), e) ||
+                                       weighted.size(), indexed, e) ||
                     backfill_archived_weights(c, db, build_name, weighted,
                                               e))) ||
                   run_sql(c, "DROP TABLE " + lake_table(src_db, src_table),

@@ -34,6 +34,9 @@ constexpr int kArchivedAtColumn = -1;
 // A weight column "__w_<column>" (DWL#6 step A1): kWeightBase - index of the
 // column whose value it weighs.
 constexpr int kWeightBase = -1000;
+// An ENUM index / SET bitmask column "__n_<column>": kIndexBase - index of
+// the column (the number is decoded with the value, Value::u).
+constexpr int kIndexBase = -100000;
 
 // Each append converts the value to the column type; a value out of range is
 // an error (checked against the in-tree DuckDB).
@@ -114,13 +117,20 @@ bool map_columns(duckdb_connection c, const TableInfo &info,
       continue;
     }
     const bool weight = name.rfind(kWeightPrefix, 0) == 0;
+    const bool index = name.rfind(kIndexPrefix, 0) == 0;
     const std::string column =
-        weight ? name.substr(strlen(kWeightPrefix)) : name;
+        weight  ? name.substr(strlen(kWeightPrefix))
+        : index ? name.substr(strlen(kIndexPrefix))
+                : name;
     int found = -1;
     for (size_t i = 0; i < info.columns.size() && found < 0; i++)
       if (info.columns[i].name == column) found = static_cast<int>(i);
     if (weight && found >= 0) {
       map->push_back(kWeightBase - found);
+      continue;
+    }
+    if (index && found >= 0) {
+      map->push_back(kIndexBase - found);
       continue;
     }
     if (found < 0) {
@@ -243,6 +253,18 @@ bool apply_table(duckdb_connection c, const BatchTable &bt, bool debug_log,
         if (failed) return;
         if (col == kArchivedAtColumn) {
           failed = append_archive_time(app, archived_at);
+        } else if (col <= kIndexBase) {
+          // The ENUM index / SET bitmask decoded with the value; NULL for
+          // NULL. A column that is no longer ENUM / SET: a refresh follows
+          // that DDL.
+          const size_t idx = static_cast<size_t>(kIndexBase - col);
+          failed = idx >= row.size();
+          if (!failed) {
+            const Value &v = row[idx];
+            failed = v.kind != Value::Kind::TEXT || !v.indexed
+                         ? duckdb_append_null(app) == DuckDBError
+                         : duckdb_append_uint64(app, v.u) == DuckDBError;
+          }
         } else if (col <= kWeightBase) {
           // The weight of a value; NULL for NULL (or for a value whose
           // collation no longer needs one: a refresh follows that DDL).

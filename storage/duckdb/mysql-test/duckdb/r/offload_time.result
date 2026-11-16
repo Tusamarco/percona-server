@@ -1,0 +1,53 @@
+# SELECT id, t, t3, t6 FROM tt ORDER BY id
+# SELECT t, COUNT(*) FROM tt GROUP BY t ORDER BY t
+# SELECT MIN(t), MAX(t), MIN(t3), MAX(t3), MIN(t6), MAX(t6), COUNT(t), COUNT(DISTINCT t) FROM tt
+# SELECT id FROM tt WHERE t = '12:30:45' ORDER BY id
+# SELECT id FROM tt WHERE t = 123045 ORDER BY id
+# SELECT id FROM tt WHERE t = 12 ORDER BY id
+# SELECT id FROM tt WHERE t = '1 02:00:00' ORDER BY id
+# SELECT id FROM tt WHERE t > '24:00:00' ORDER BY id
+# SELECT id FROM tt WHERE t < 0 ORDER BY id
+# SELECT id FROM tt WHERE t BETWEEN '-01:00:00' AND '01:00:00' ORDER BY id
+# SELECT id FROM tt WHERE t IN ('00:00:00', '838:59:59', '-838:59:59') ORDER BY id
+# SELECT id FROM tt WHERE t NOT IN ('00:00:00', '26:00:00') ORDER BY id
+# SELECT id FROM tt WHERE t3 = '-01:02:03.004' ORDER BY id
+# SELECT id FROM tt WHERE t3 > '01:00:00.124' ORDER BY id
+# SELECT id FROM tt WHERE t6 >= '00:00:00.000001' ORDER BY id
+# SELECT id FROM tt WHERE t6 = 12.5 ORDER BY id
+# SELECT id FROM tt WHERE t = t3 OR t6 < t ORDER BY id
+# SELECT id, t FROM tt ORDER BY t DESC, id LIMIT 7
+# SELECT DISTINCT t3 FROM tt ORDER BY t3
+# SELECT g, MIN(t), MAX(t3) FROM tt GROUP BY g ORDER BY g
+# SELECT a.id, b.id FROM tt a JOIN tt b ON a.t = b.t AND a.id < b.id WHERE a.id < 25 ORDER BY 1, 2
+# SELECT x.t FROM (SELECT t FROM tt WHERE id < 12) x ORDER BY x.t
+# SELECT id FROM tt WHERE t IS NULL OR t3 IS NULL ORDER BY id
+# SELECT COUNT(*) FROM tt WHERE t <> '00:00:00'
+# Refused
+# SELECT SUM(t), AVG(t) FROM tt
+SET SESSION use_secondary_engine = FORCED;
+SELECT SUM(t), AVG(t) FROM tt;
+Got one of the listed errors
+# SELECT id, t + 0 FROM tt ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, t + 0 FROM tt ORDER BY id;
+Got one of the listed errors
+# SELECT id FROM tt WHERE t < dt ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id FROM tt WHERE t < dt ORDER BY id;
+Got one of the listed errors
+# SELECT id, HOUR(t), TIME_TO_SEC(t) FROM tt ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, HOUR(t), TIME_TO_SEC(t) FROM tt ORDER BY id;
+Got one of the listed errors
+# SELECT id, IFNULL(t, '00:00:00') FROM tt ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, IFNULL(t, '00:00:00') FROM tt ORDER BY id;
+Got one of the listed errors
+# SELECT id FROM tt WHERE t LIKE '12%' ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id FROM tt WHERE t LIKE '12%' ORDER BY id;
+Got one of the listed errors
+# SELECT id FROM tt WHERE IFNULL(t, '00:00:00') = '00:00:00' ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id FROM tt WHERE IFNULL(t, '00:00:00') = '00:00:00' ORDER BY id;
+Got one of the listed errors

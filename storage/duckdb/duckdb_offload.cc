@@ -50,6 +50,7 @@
 #include "sql/item_subselect.h"
 #include "include/mem_root_deque.h"
 #include "sql/opt_trace.h"
+#include "sql/protocol.h"  // Protocol::store_short (YEAR holder)
 #include "sql/query_result.h"
 #include "sql/query_term.h"
 #include "sql/replication.h"  // Trans_observer
@@ -152,6 +153,8 @@ enum class Kind {
   DATE,       // DATE
   DATETIME,   // TIMESTAMP holding a DATETIME (no time zone)
   TIMESTAMP,  // TIMESTAMP holding a UTC instant (MySQL TIMESTAMP)
+  BIT,        // UBIGINT holding a BIT(n) value, sent as ceil(n/8) bytes
+  TIME,       // BIGINT holding a TIME as signed microseconds
 };
 
 // Per statement: the generated SQL, how to read each column, and the DuckDB
@@ -219,6 +222,28 @@ constexpr const char *kDuckDBMultipleRows =
 
 bool is_string(const Item *item) {
   return item->result_type() == STRING_RESULT && !item->is_temporal();
+}
+
+// Columns whose lake value is not what MySQL uses in every context: TIME
+// (signed microseconds; MySQL's string and number forms differ), ENUM and
+// SET (value plus hidden index), YEAR and BIT (numbers that MySQL shows as
+// '0000' or as bytes in string contexts).
+enum class SpecialColumn { NONE, NUMBER, OTHER };
+SpecialColumn special_column(const Item *item) {
+  if (item->type() != Item::FIELD_ITEM) return SpecialColumn::NONE;
+  const Field *f = down_cast<const Item_field *>(item)->field;
+  if (f == nullptr) return SpecialColumn::NONE;
+  switch (f->real_type()) {
+    case MYSQL_TYPE_YEAR:
+    case MYSQL_TYPE_BIT:
+      return SpecialColumn::NUMBER;
+    case MYSQL_TYPE_TIME2:
+    case MYSQL_TYPE_ENUM:
+    case MYSQL_TYPE_SET:
+      return SpecialColumn::OTHER;
+    default:
+      return SpecialColumn::NONE;
+  }
 }
 
 bool is_unicode_charset(const CHARSET_INFO *cs) {
@@ -310,6 +335,10 @@ int kind_class(Kind k) {
       return 3;
     case Kind::TIMESTAMP:
       return 4;
+    case Kind::BIT:
+      return 5;
+    case Kind::TIME:
+      return 6;
   }
   return -1;
 }
@@ -340,12 +369,16 @@ class Generator {
   bool operands(Item_func *fn, bool ordering, unsigned from, unsigned to,
                 std::vector<std::string> *ops);
   bool numeric(Item *item, std::string *out);
+  bool unsigned_arith(Item *left, Item *right, char op, std::string *out);
+  bool time_literal(Item *item, std::string *out);
+  bool special_args(Item_func *fn);
   int division_frac(int f1, int f2) const;
   bool internal_frac(Item *item, int *frac);
   bool exact_division(const std::string &a, int f1, const std::string &b,
                       int f2, int round_to, std::string *out);
   bool temporal_arg(Item *item, std::string *out);
   bool order_key(Item *item, std::string *out);
+  bool enum_index(Item *item, std::string *out);
   bool weight_expr(Item *item, const CHARSET_INFO *cs, std::string *out);
   bool string_key(Item *item, const CHARSET_INFO *cs, bool ordering,
                   size_t max_bytes, std::string *out);
@@ -459,6 +492,15 @@ bool Generator::typed_literal(Item *item, enum_field_types type,
   return false;
 }
 
+// A constant compared with a TIME column: converted to TIME as MySQL does
+// (Item::val_time), as signed microseconds.
+bool Generator::time_literal(Item *item, std::string *out) {
+  Time_val t;
+  if (item->val_time(&t) || item->null_value) return refuse("time_literal");
+  *out = "CAST(" + std::to_string(t.to_microseconds()) + " AS BIGINT)";
+  return false;
+}
+
 bool Generator::literal(Item *item, std::string *out) {
   if (item->is_null()) {
     *out = "NULL";
@@ -521,7 +563,7 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
   Item **args = fn->arguments();
   enum_field_types temporal = MYSQL_TYPE_NULL;
   bool timestamp = false, strings = false, numbers = false, pad = false;
-  bool const_numbers = false;
+  bool const_numbers = false, time = false;
   size_t max_bytes = 0;
   for (unsigned i = from; i < to; i++) {
     Item *a = args[i]->real_item();
@@ -533,7 +575,9 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
       continue;
     }
     const enum_field_types t = a->data_type();
-    if (t == MYSQL_TYPE_TIMESTAMP) {
+    if (t == MYSQL_TYPE_TIME) {
+      time = true;
+    } else if (t == MYSQL_TYPE_TIMESTAMP) {
       timestamp = true;
     } else if (is_date_or_datetime(t)) {
       if (temporal == MYSQL_TYPE_NULL || t == MYSQL_TYPE_DATETIME)
@@ -546,10 +590,49 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
       numbers = true;
     }
   }
+  // TIME (signed microseconds in the lake) only with TIME columns and
+  // constants, which MySQL compares as TIME (each converted to TIME).
+  if (time && (timestamp || temporal != MYSQL_TYPE_NULL || strings || numbers))
+    return refuse("mixed_time_comparison");
   if (timestamp && (temporal != MYSQL_TYPE_NULL || strings || numbers))
     return refuse("mixed_timestamp_comparison");
   if (temporal != MYSQL_TYPE_NULL && (strings || numbers))
     return refuse("mixed_temporal_comparison");
+  // ENUM / SET columns compared with number constants: MySQL compares as
+  // DOUBLE, the column giving its index / bitmask (val_real).
+  if (strings && const_numbers && !numbers) {
+    bool all_enum = true;
+    for (unsigned i = from; i < to; i++) {
+      Item *a = args[i]->real_item();
+      if (a->const_item()) {
+        all_enum = all_enum && !is_string(a);
+        continue;
+      }
+      all_enum = all_enum && special_column(a) == SpecialColumn::OTHER &&
+                 !a->is_temporal();
+    }
+    if (all_enum) {
+      for (unsigned i = from; i < to; i++) {
+        Item *a = args[i]->real_item();
+        std::string s;
+        if (a->const_item()) {
+          if (a->is_null()) {
+            s = "NULL";
+          } else {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "CAST(%.17g AS DOUBLE)", a->val_real());
+            s = buf;
+          }
+        } else {
+          std::string n;
+          if (enum_index(a, &n)) return true;
+          s = "CAST(" + n + " AS DOUBLE)";
+        }
+        ops->push_back(s);
+      }
+      return false;
+    }
+  }
   // MySQL compares a string with a number as DOUBLE; DuckDB would cast the
   // string to the number's type (and fail on 'ab').
   if (strings && (numbers || const_numbers))
@@ -573,7 +656,9 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
   for (unsigned i = from; i < to && !failed; i++) {
     Item *a = args[i]->real_item();
     std::string s;
-    if (m_temporal != MYSQL_TYPE_NULL && a->const_item()) {
+    if (time && a->const_item()) {
+      failed = a->is_null() ? literal(a, &s) : time_literal(a, &s);
+    } else if (m_temporal != MYSQL_TYPE_NULL && a->const_item()) {
       failed = a->is_null() ? literal(a, &s) : typed_literal(a, m_temporal, &s);
     } else if (numbers && a->const_item() && is_string(a)) {
       // A number compared with a string constant: MySQL compares as DOUBLE.
@@ -679,6 +764,13 @@ bool Generator::exact_division(const std::string &a, int f1,
 // signed/unsigned rules).
 bool Generator::numeric(Item *item, std::string *out) {
   Item *a = item->real_item();
+  // An ENUM / SET column as a number is its index / bitmask (val_real).
+  if (special_column(a) == SpecialColumn::OTHER && !a->is_temporal()) {
+    std::string n;
+    if (enum_index(a, &n)) return true;
+    *out = "CAST(" + n + " AS DOUBLE)";
+    return false;
+  }
   if (a->is_temporal() || a->result_type() == STRING_RESULT)
     return refuse("arithmetic_on_non_number");
   if (a->result_type() == INT_RESULT && a->unsigned_flag && !a->const_item())
@@ -689,6 +781,73 @@ bool Generator::numeric(Item *item, std::string *out) {
   return false;
 }
 
+// The largest value an unsigned integer column can hold (BIT(n), YEAR,
+// unsigned TINYINT..BIGINT); 0 if it is not one.
+unsigned __int128 unsigned_column_max(const Item *item) {
+  if (item->type() != Item::FIELD_ITEM) return 0;
+  const Field *f = down_cast<const Item_field *>(item)->field;
+  if (f == nullptr) return 0;
+  switch (f->real_type()) {
+    case MYSQL_TYPE_BIT: {
+      const uint32 bits = f->field_length;
+      if (bits < 1 || bits > 64) return 0;
+      return (static_cast<unsigned __int128>(1) << bits) - 1;
+    }
+    case MYSQL_TYPE_YEAR:
+      return 2155;
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG: {
+      if (!f->is_unsigned()) return 0;
+      const uint32 bytes = f->pack_length();
+      if (bytes < 1 || bytes > 8) return 0;
+      return (static_cast<unsigned __int128>(1) << (8 * bytes)) - 1;
+    }
+    default:
+      return 0;
+  }
+}
+
+// Unsigned integer + or * (the result is unsigned when an operand is,
+// Item_func_plus/mul): MySQL raises error 1690 when the result leaves
+// 0..2^64-1, and which rows DuckDB evaluates may differ from MySQL, so we
+// translate only what cannot leave the range: unsigned columns (BIT, YEAR,
+// unsigned integers) and non-negative integer constants whose largest values
+// keep the result within 64 bits (b + 0, y + 1, u * 2 of a small type).
+bool Generator::unsigned_arith(Item *left, Item *right, char op,
+                               std::string *out) {
+  constexpr unsigned __int128 kMax = ~static_cast<uint64_t>(0);
+  unsigned __int128 max[2];
+  std::string sql[2];
+  Item *ops[2] = {left->real_item(), right->real_item()};
+  for (int i = 0; i < 2; i++) {
+    Item *a = ops[i];
+    if (a->const_item()) {
+      if (a->type() != Item::INT_ITEM || a->is_null())
+        return refuse("arithmetic_on_unsigned");
+      const longlong v = a->val_int();
+      if (!a->unsigned_flag && v < 0) return refuse("arithmetic_on_unsigned");
+      max[i] = static_cast<uint64_t>(v);
+      sql[i] = std::to_string(static_cast<uint64_t>(v));
+    } else {
+      max[i] = unsigned_column_max(a);
+      if (max[i] == 0) return refuse("arithmetic_on_unsigned");
+      std::string e;
+      if (expr(a, &e)) return true;
+      sql[i] = e;
+    }
+  }
+  // max[i] <= 2^64 - 1, so neither sum nor product overflows 128 bits.
+  const unsigned __int128 bound =
+      op == '+' ? max[0] + max[1] : max[0] * max[1];
+  if (bound > kMax) return refuse("arithmetic_on_unsigned");
+  *out = "(CAST(" + sql[0] + " AS UBIGINT) " + op + " CAST(" + sql[1] +
+         " AS UBIGINT))";
+  return false;
+}
+
 // The argument of a date function: a DATE or DATETIME column or expression.
 // TIMESTAMP (UTC in DuckDB) and strings are refused.
 bool Generator::temporal_arg(Item *item, std::string *out) {
@@ -696,6 +855,30 @@ bool Generator::temporal_arg(Item *item, std::string *out) {
   if (!is_date_or_datetime(a->data_type()) || a->const_item())
     return refuse("date_function_argument");
   return expr(a, out);
+}
+
+// The hidden index column of an ENUM / SET column of this block's base
+// tables (ENUM index, SET bitmask): what MySQL sorts on and uses as a
+// number. In the grouped part of a block the column is grouped on its value,
+// which has one index (ENUM / SET elements are distinct under the
+// collation): min() picks it. Columns of derived tables and set operations
+// carry no index: refused.
+bool Generator::enum_index(Item *item, std::string *out) {
+  Item *e = item->real_item();
+  if (special_column(e) != SpecialColumn::OTHER ||
+      down_cast<Item_field *>(e)->field->real_type() == MYSQL_TYPE_TIME2)
+    return refuse("enum_index");
+  const Field *f = down_cast<Item_field *>(e)->field;
+  const auto info = m_info.find(f->table);
+  if (info == m_info.end() || info->second.derived ||
+      info->second.positional || info->second.scalar ||
+      m_block->tables.count(f->table) == 0)
+    return refuse("enum_order_outside_base_table");
+  const std::string col = info->second.alias + "." +
+                          quote_ident(std::string(kIndexPrefix) + f->field_name);
+  *out = m_block->post_group && m_block->agg_depth == 0 ? "min(" + col + ")"
+                                                        : col;
+  return false;
 }
 
 // An ORDER BY expression or MIN/MAX argument: PAD SPACE strings use the
@@ -915,10 +1098,53 @@ bool Generator::aggregate(Item_sum *s, std::string *out) {
   }
 }
 
+// Such columns are translated only by the functions that know them:
+// comparisons and IN/BETWEEN (operands(): constants converted as MySQL
+// does), arithmetic (numeric(), unsigned_arith()), IS [NOT] NULL. Elsewhere
+// (LIKE, CASE, IF, IFNULL, COALESCE, string and date functions) they are
+// refused, except YEAR and BIT where the function's result is an integer.
+bool Generator::special_args(Item_func *fn) {
+  switch (fn->functype()) {
+    case Item_func::EQ_FUNC:
+    case Item_func::NE_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+    case Item_func::BETWEEN:
+    case Item_func::IN_FUNC:
+    case Item_func::ISNULL_FUNC:
+    case Item_func::ISNOTNULL_FUNC:
+    case Item_func::PLUS_FUNC:
+    case Item_func::MINUS_FUNC:
+    case Item_func::MUL_FUNC:
+    case Item_func::DIV_FUNC:
+    case Item_func::MOD_FUNC:
+    case Item_func::NEG_FUNC:
+      return false;
+    default:
+      break;
+  }
+  Item **args = fn->arguments();
+  for (unsigned i = 0; i < fn->argument_count(); i++) {
+    const SpecialColumn k = special_column(args[i]->real_item());
+    // LIKE on ENUM / SET matches the string value, as stored.
+    if (k == SpecialColumn::OTHER && fn->functype() == Item_func::LIKE_FUNC &&
+        !args[i]->real_item()->is_temporal())
+      continue;
+    if (k == SpecialColumn::OTHER ||
+        (k == SpecialColumn::NUMBER && fn->result_type() != INT_RESULT))
+      return refuse(std::string("column_type_in_function:") +
+                    fn->func_name());
+  }
+  return false;
+}
+
 bool Generator::function(Item_func *fn, std::string *out) {
   Item **args = fn->arguments();
   const unsigned n = fn->argument_count();
   const std::string name = fn->func_name();
+  if (special_args(fn)) return true;
   auto compare = [&](const char *op) {
     std::vector<std::string> ops;
     const bool ordering = op[0] == '<' || op[0] == '>';
@@ -930,6 +1156,9 @@ bool Generator::function(Item_func *fn, std::string *out) {
   auto arith = [&](const char *op) {
     if (fn->result_type() == DECIMAL_RESULT && fn->decimal_precision() > 38)
       return refuse("decimal_precision_above_38");
+    if (fn->result_type() == INT_RESULT && fn->unsigned_flag &&
+        (op[0] == '+' || op[0] == '*'))
+      return unsigned_arith(args[0], args[1], op[0], out);
     std::string l, r;
     if (numeric(args[0], &l) || numeric(args[1], &r)) return true;
     *out = "(" + l + " " + op + " " + r + ")";
@@ -1340,21 +1569,40 @@ bool Generator::output_kind(Item *item, Kind *kind, std::string *cast) {
       *kind = Kind::DATE;
       *cast = "DATE";
       return false;
-    case MYSQL_TYPE_YEAR:
-      // YEAR() of a date is an integer, also as a column of a derived table
-      // (cast to BIGINT by our SQL); a YEAR column is not translated.
-      if (Item *r = item->real_item(); r->type() == Item::FIELD_ITEM) {
-        const auto info = m_info.find(down_cast<Item_field *>(r)->field->table);
-        if (info == m_info.end() || !info->second.derived)
-          return refuse("unsupported_result_type");
-      } else if (r->type() != Item::FUNC_ITEM) {
+    case MYSQL_TYPE_YEAR: {
+      // The year number (0 for 0000). A YEAR column (base table, derived
+      // table, view) is sent zero-filled, "0000" (Field_year::
+      // send_to_protocol), a YEAR expression (MAX(y), YEAR(d)) as a plain
+      // integer, "0" (Item::send): make_holder() picks the holder.
+      const Item::Type t = item->real_item()->type();
+      if (t != Item::FIELD_ITEM && t != Item::FUNC_ITEM &&
+          t != Item::SUM_FUNC_ITEM)
         return refuse("unsupported_result_type");
-      }
       *kind = Kind::INT;
       *cast = "BIGINT";
       return false;
-    case MYSQL_TYPE_TIME:
-    case MYSQL_TYPE_BIT:
+    }
+    case MYSQL_TYPE_BIT: {
+      // A BIT column or MIN/MAX of one: MySQL sends the value's bytes,
+      // big-endian, ceil(n/8) of them (max_length is n).
+      const Item::Type t = item->real_item()->type();
+      if ((t != Item::FIELD_ITEM && t != Item::SUM_FUNC_ITEM) ||
+          item->max_length < 1 || item->max_length > 64)
+        return refuse("unsupported_result_type");
+      *kind = Kind::BIT;
+      *cast = "UBIGINT";
+      return false;
+    }
+    case MYSQL_TYPE_TIME: {
+      // A TIME column or MIN/MAX of one (signed microseconds in the lake).
+      // Other TIME expressions (IF, CASE, functions) are not translated.
+      const Item::Type t = item->real_item()->type();
+      if (t != Item::FIELD_ITEM && t != Item::SUM_FUNC_ITEM)
+        return refuse("unsupported_result_type");
+      *kind = Kind::TIME;
+      *cast = "BIGINT";
+      return false;
+    }
     case MYSQL_TYPE_JSON:
     case MYSQL_TYPE_ENUM:
     case MYSQL_TYPE_SET:
@@ -1615,7 +1863,9 @@ bool Generator::multi_eq(Item_multi_eq *eq, table_map avoid,
   }
   if (Item *c = eq->const_arg(); c != nullptr) {
     std::string cs;
-    if (t == MYSQL_TYPE_TIMESTAMP || is_date_or_datetime(t)) {
+    if (t == MYSQL_TYPE_TIME) {
+      if (c->is_null() ? literal(c, &cs) : time_literal(c, &cs)) return true;
+    } else if (t == MYSQL_TYPE_TIMESTAMP || is_date_or_datetime(t)) {
       if (typed_literal(c, t, &cs)) return true;
     } else if (str != is_string(c)) {
       return refuse("multiple_equality_types");
@@ -1799,7 +2049,13 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
   std::string order;
   for (ORDER *o = qb->order_list.first; o != nullptr; o = o->next) {
     std::string s;
-    if (order_key(*o->item, &s)) return true;
+    // MySQL sorts ENUM / SET on the index, not the string.
+    const bool by_index =
+        special_column((*o->item)->real_item()) == SpecialColumn::OTHER &&
+        down_cast<Item_field *>((*o->item)->real_item())->field->real_type() !=
+            MYSQL_TYPE_TIME2;
+    if (by_index ? enum_index(*o->item, &s) : order_key(*o->item, &s))
+      return true;
     const bool desc = o->direction == ORDER_DESC;
     order += (order.empty() ? "" : ", ") + s +
              (desc ? " DESC NULLS LAST" : " ASC NULLS FIRST");
@@ -2077,14 +2333,42 @@ void note_refusal(THD *thd, OffloadContext *ctx, const std::string &reason) {
 
 // ---- execution --------------------------------------------------------
 
+// A YEAR column's holder: sent zero-filled to 4 digits, as
+// Field_year::send_to_protocol does ("0000"); Item::send would send "0".
+class Year_column_holder : public Item_cache_int {
+ public:
+  Year_column_holder() : Item_cache_int(MYSQL_TYPE_YEAR) {}
+  bool send(Protocol *protocol, String *) override {
+    const longlong nr = val_int();
+    if (null_value) return protocol->store_null();
+    return protocol->store_short(nr, 4);
+  }
+};
+
 // A value holder per select-list item, typed like the item, filled per row.
 Item_cache *make_holder(Item *item, Kind kind) {
   Item_cache *h = nullptr;
   switch (kind) {
     case Kind::INT:
     case Kind::UINT:
-      h = new Item_cache_int(item->data_type());
+      if (item->data_type() == MYSQL_TYPE_YEAR &&
+          item->real_item()->type() == Item::FIELD_ITEM)
+        h = new Year_column_holder();
+      else
+        h = new Item_cache_int(item->data_type());
       break;
+    case Kind::BIT:
+      h = new Item_cache_str(item);
+      break;
+    case Kind::TIME: {
+      // As the DATE holder: attributes copied by hand.
+      auto *t = new Item_cache_time();
+      if (t == nullptr) return nullptr;
+      t->max_length = item->max_length;
+      t->decimals = item->decimals;
+      t->collation.set(item->collation);
+      return t;
+    }
     case Kind::DOUBLE:
       h = new Item_cache_real();
       break;
@@ -2118,8 +2402,10 @@ Item_cache *make_holder(Item *item, Kind kind) {
 // mismatch is a query error, never a wrong read.
 duckdb_type expected_type(Kind kind) {
   switch (kind) {
-    case Kind::INT: return DUCKDB_TYPE_BIGINT;
-    case Kind::UINT: return DUCKDB_TYPE_UBIGINT;
+    case Kind::INT:
+    case Kind::TIME: return DUCKDB_TYPE_BIGINT;
+    case Kind::UINT:
+    case Kind::BIT: return DUCKDB_TYPE_UBIGINT;
     case Kind::DOUBLE: return DUCKDB_TYPE_DOUBLE;
     case Kind::DECIMAL: return DUCKDB_TYPE_VARCHAR;
     case Kind::STRING: return DUCKDB_TYPE_VARCHAR;
@@ -2160,11 +2446,42 @@ bool store_cell(THD *thd, Item_cache *h, Item *not_null, Kind kind,
     case Kind::UINT:
       down_cast<Item_cache_int *>(h)->store_value(
           not_null, static_cast<longlong>(static_cast<uint64_t *>(data)[row]));
+      // store_value() copies unsigned_flag from not_null (signed): values
+      // from 2^63 would be sent as negative numbers.
+      h->unsigned_flag = true;
       return false;
     case Kind::DOUBLE:
       down_cast<Item_cache_real *>(h)->store_value(
           not_null, static_cast<double *>(data)[row]);
       return false;
+    case Kind::TIME: {
+      const int64_t micros = static_cast<int64_t *>(data)[row];
+      const uint64_t abs_us = micros < 0 ? 0 - static_cast<uint64_t>(micros)
+                                         : static_cast<uint64_t>(micros);
+      Time_val t;
+      if (Time_val::make_time(micros < 0,
+                              static_cast<uint32_t>(abs_us / 3600000000ULL),
+                              static_cast<uint32_t>(abs_us / 60000000ULL % 60),
+                              static_cast<uint32_t>(abs_us / 1000000ULL % 60),
+                              static_cast<uint32_t>(abs_us % 1000000ULL), &t))
+        return true;
+      down_cast<Item_cache_time *>(h)->store_value(t);
+      return false;
+    }
+    case Kind::BIT: {
+      // Field_bit::val_str: the value big-endian over ceil(n/8) bytes.
+      uint64_t bits = static_cast<uint64_t *>(data)[row];
+      const size_t n = (h->max_length + 7) / 8;
+      if (n < 1 || n > 8) return true;
+      char bytes[8];
+      for (size_t k = n; k-- > 0;) {
+        bytes[k] = static_cast<char>(bits & 0xFF);
+        bits >>= 8;
+      }
+      buf->copy(bytes, n, &my_charset_bin);
+      down_cast<Item_cache_str *>(h)->store_value(not_null, *buf);
+      return false;
+    }
     case Kind::DECIMAL: {
       const std::string text = duckdb_text(v, row);
       my_decimal d;

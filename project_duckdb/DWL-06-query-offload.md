@@ -686,6 +686,83 @@ machine, 8 cores; buffer pool 4G, duckdb_memory_limit 4G, duckdb_threads 6;
   `ts UNION ALL dt` returned TIMESTAMP values in UTC instead of the session
   time zone (one hour off). A NULL literal is recognized by its item type.
 
+### YEAR and BIT (2026-11-16)
+
+Load and applier: DWL-03 (YEAR as USMALLINT, BIT as UBIGINT). Offload:
+
+- Column references need nothing new (they are numbers). Constants in
+  comparisons come as MySQL resolved them (`y = 5` is 2005, `y = '0'` 2000,
+  `y = 0` 0000), so translating the resolved item gives MySQL's result.
+- YEAR results: MySQL sends a YEAR **column** zero-filled (`0000`,
+  `Field_year::send_to_protocol`), also through GROUP BY, DISTINCT, derived
+  tables and views, but a YEAR **expression** (`MAX(y)`, `IFNULL(y, 1)`) as a
+  plain number (`0`, `Item::send`). A column gets `Year_column_holder`
+  (`store_short(nr, 4)`), an expression the integer holder. A YEAR column of
+  a set operation (UNION) is refused (`unsupported_result_type`).
+- BIT results (a column, MIN/MAX of one): `Kind::BIT`, read as UBIGINT and
+  sent as its ceil(n/8) bytes, big-endian, as `Field_bit::val_str`.
+- Unsigned arithmetic: MySQL raises error 1690 when an unsigned result
+  leaves 0..2^64-1, and DuckDB may evaluate other rows than MySQL (filter
+  order, TopN), so only `+` and `*` that cannot leave the range are
+  translated: operands are unsigned columns (BIT, YEAR, unsigned integers)
+  or non-negative integer constants, and the type maximums keep the result
+  within 64 bits (`b + 0`, `y + 1`, `u * 3` of an INT UNSIGNED). Subtraction,
+  possible overflow, signed operands and DECIMAL context stay refused
+  (`arithmetic_on_unsigned`).
+- Fixed: an unsigned BIGINT result from 2^63 was sent as a negative number
+  (`Item_cache_int::store_value` copies `unsigned_flag` from the item it is
+  given; the holder now keeps it set).
+- Tests: `duckdb_offload_yb_queries.sql` (33, identical and offloaded),
+  `duckdb_offload_yb_refusals.sql` (5), MTR `offload_yb`; the 6b refusal
+  `u + 1` (now exact) was replaced by `u - 1`.
+
+### TIME (2026-11-16)
+
+- Lake value: signed microseconds (BIGINT). `Kind::TIME`: read as BIGINT,
+  returned through `Item_cache_time` (`Time_val::make_time`).
+- Comparisons (`operands()`, multiple equalities): a TIME column only with
+  TIME columns and constants; each constant is converted with
+  `Item::val_time` (MySQL compares TIME with a constant as TIME), so
+  `'12:30:45'`, `123045`, `12`, `'1 02:00:00'`, `12.5` give MySQL's rows.
+  TIME with DATETIME, strings or numeric columns: refused
+  (`mixed_time_comparison`).
+- Results: a TIME column, MIN/MAX of one. TIME expressions (IF, CASE,
+  IFNULL) are refused. SUM/AVG (MySQL sums HHMMSS numbers) and arithmetic
+  were already refused for temporal arguments.
+
+### ENUM and SET (2026-11-16)
+
+- Lake: the string value (weighted like VARCHAR) and `__n_<col>` (index /
+  bitmask). The generator knows every ENUM / SET column of a loaded table has
+  `__n_<col>` (no older copies exist: these types were refused before).
+- String contexts use the value: comparisons with strings (collation and
+  weights as for VARCHAR), IN, BETWEEN, LIKE, MIN/MAX (MySQL compares ENUM
+  and SET by string value in MIN/MAX, verified), GROUP BY, DISTINCT,
+  COUNT(DISTINCT), the result (data type STRING).
+- The index (`enum_index()`): `ORDER BY e` (MySQL sorts on the element
+  position; `min(__n_e)` in the grouped part of a block: one index per
+  value, elements being distinct under the collation), comparisons with
+  number constants (`e = 2`: MySQL compares as DOUBLE, `val_real` is the
+  index), arithmetic (`e + 0` is DOUBLE). Columns of materialized derived
+  tables and set operations carry no index: ORDER BY / numeric use refused.
+
+### Columns with a special lake value (2026-11-16)
+
+TIME (microseconds), ENUM / SET (value + index), YEAR and BIT (numbers MySQL
+shows as `0000` or bytes in string contexts) are translated only where the
+generator knows their meaning: comparisons, IN, BETWEEN, IS [NOT] NULL,
+arithmetic (each with its own rules above), LIKE for ENUM / SET.
+`special_args()` refuses them as arguments of other functions
+(`column_type_in_function:<name>`: LIKE on TIME, IFNULL, CASE, CONCAT,
+FIND_IN_SET, HOUR, ...), except YEAR and BIT where the function's result is
+an integer (`IFNULL(y, 1999)`). Without this, `t LIKE '12%'` would have
+matched the microseconds.
+
+Tests: `duckdb_offload_tt_*` (24 / 7), `duckdb_offload_et_*` (28 / 6),
+`duckdb_offload_yb_*` (33 / 7); MTR `offload_time`, `offload_enum` (with a
+history table across an ENUM / SET definition change), `offload_yb`; unit
+tests for the decoder (41 in all).
+
 ### Open points
 
 - FULL scope fallback to InnoDB: closed by the DWL#7 guard (2026-11-15).

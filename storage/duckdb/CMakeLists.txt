@@ -37,6 +37,7 @@ MYSQL_ADD_PLUGIN(duckdb
   duckdb_ddl.cc
   duckdb_executor.cc
   duckdb_guard.cc
+  duckdb_i_s.cc
   duckdb_lake.cc
   duckdb_load.cc
   duckdb_offload.cc

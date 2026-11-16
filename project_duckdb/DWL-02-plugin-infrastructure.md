@@ -16,9 +16,13 @@ DWL#6).
 
 ### PLUGIN LIBRARY
 
-`ha_duckdb.so` declares two plugins in one `mysql_declare_plugin` block:
-`duckdb` (MYSQL_STORAGE_ENGINE_PLUGIN, secondary engine) and `duckdb_guard`
-(audit plugin, implemented in DWL#7). Both load with one `plugin-load-add`.
+`ha_duckdb.so` declares three plugins in one `mysql_declare_plugin` block:
+`duckdb` (MYSQL_STORAGE_ENGINE_PLUGIN, secondary engine), `duckdb_guard`
+(audit plugin, implemented in DWL#7) and `DUCKDB_TABLES`
+(MYSQL_INFORMATION_SCHEMA_PLUGIN, 2026-11-16: `INFORMATION_SCHEMA.DUCKDB_TABLES`,
+the registry as a table, `storage/duckdb/duckdb_i_s.cc`; rows from
+`Registry::list()`, empty while the lake is closed, PROCESS required as for
+InnoDB's INFORMATION_SCHEMA tables). All load with one `plugin-load-add`.
 
 ### SYSTEM VARIABLES
 

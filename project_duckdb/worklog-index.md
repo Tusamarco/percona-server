@@ -19,10 +19,12 @@ MySQL WL numbers.
 | [DWL#6](DWL-06-query-offload.md) | Query offload through the external executor | 6a (single table, external executor, read your own writes) and 6b (expressions, PAD SPACE collations, TIMESTAMP constants) verified on the reference instance; 6c-1 (joins, semi/anti joins, derived tables, views, CTEs) and 6c-2 (UNION, INTERSECT, EXCEPT) verified on the reference instance; 6c-3 (subqueries) implemented, verified on a throwaway instance; 6d design | DWL#3, DWL#4, DWL#5 |
 | [DWL#7](DWL-07-full-scope-guard.md) | FULL scope guard plugin | Implemented (duckdb_guard audit plugin), verified on a throwaway instance | DWL#6 |
 
-Next (agreed 2026-11-15): replica test (test plan section 18), then
-`INFORMATION_SCHEMA.DUCKDB_TABLES` (the registry as a view: copies with
-their state, history flag, load position, primary key, weight columns), then
-more translations.
+Done 2026-11-15/16: replica test (test plan section 18, with the guard and
+super_read_only fixes), `INFORMATION_SCHEMA.DUCKDB_TABLES` (the registry as a
+table: copies with their state, history flag, primary key, weight columns,
+load position; section 35), the types YEAR, BIT, TIME, ENUM and SET
+(DWL-03, DWL-06; sections 36-38). Next: more translations (string
+functions, DATE_FORMAT, date arithmetic, LIKE on _ci, window functions).
 
 Development order follows the table. DWL#6 must not be enabled before DWL#4:
 without the applier, DML on InnoDB does not reach DuckDB and offloaded queries

@@ -28,6 +28,7 @@
 
 #include "decimal.h"
 #include "field_types.h"
+#include "my_temporal.h"  // Time_val
 #include "my_time.h"
 #include "my_sys.h"
 #include "mysql/strings/m_ctype.h"
@@ -150,6 +151,113 @@ TEST(DuckdbRowDecoder, Decimal) {
   const Value v = t.decode();
   EXPECT_EQ(v.kind, Value::Kind::TEXT);
   EXPECT_EQ(v.s, "-123.456");
+}
+
+TEST(DuckdbRowDecoder, YearBitTime) {
+  {  // YEAR: 0 is 0000, otherwise 1900 + byte
+    OneColumn t(column("y", MYSQL_TYPE_YEAR, 0));
+    const unsigned char b = 0;
+    t.add(&b, 1);
+    const Value v = t.decode();
+    EXPECT_EQ(v.kind, Value::Kind::UINT);
+    EXPECT_EQ(v.u, 0u);
+  }
+  {
+    OneColumn t(column("y", MYSQL_TYPE_YEAR, 0));
+    const unsigned char b = 255;
+    t.add(&b, 1);
+    EXPECT_EQ(t.decode().u, 2155u);
+  }
+  {  // BIT(10): metadata bits % 8 = 2, bytes = 1; value big-endian, 2 bytes
+    OneColumn t(column("b", MYSQL_TYPE_BIT, (1 << 8) | 2));
+    const unsigned char b[] = {0x03, 0xFF};
+    t.add(b, 2);
+    const Value v = t.decode();
+    EXPECT_EQ(v.kind, Value::Kind::UINT);
+    EXPECT_EQ(v.u, 1023u);
+  }
+  {  // BIT(64)
+    OneColumn t(column("b", MYSQL_TYPE_BIT, 8 << 8));
+    const unsigned char b[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE};
+    t.add(b, 8);
+    EXPECT_EQ(t.decode().u, 18446744073709551614ULL);
+  }
+  {  // TIME(3) negative, more than 24 hours: signed microseconds
+    Time_val tv;
+    ASSERT_FALSE(Time_val::make_time(true, 837, 59, 59, 500000, &tv));
+    unsigned char b[5];
+    tv.store_time(b, 3);
+    OneColumn t(column("t", MYSQL_TYPE_TIME2, 3));
+    t.add(b, 5);
+    const Value v = t.decode();
+    EXPECT_EQ(v.kind, Value::Kind::INT);
+    EXPECT_EQ(v.i, -(((837LL * 60 + 59) * 60 + 59) * 1000000 + 500000));
+  }
+  {  // TIME(0) zero
+    Time_val tv;
+    ASSERT_FALSE(Time_val::make_time(false, 0, 0, 0, 0, &tv));
+    unsigned char b[3];
+    tv.store_time(b, 0);
+    OneColumn t(column("t", MYSQL_TYPE_TIME2, 0));
+    t.add(b, 3);
+    EXPECT_EQ(t.decode().i, 0);
+  }
+}
+
+TEST(DuckdbRowDecoder, EnumSet) {
+  // ENUM('small','medium','large'): metadata real type ENUM, pack length 1
+  ColumnInfo e = column("e", MYSQL_TYPE_STRING, (MYSQL_TYPE_ENUM << 8) | 1,
+                        false, kUtf8mb4);
+  e.enum_set = MYSQL_TYPE_ENUM;
+  e.elements = {"small", "medium", "large"};
+  {
+    OneColumn t(e);
+    const unsigned char b = 2;
+    t.add(&b, 1);
+    const Value v = t.decode();
+    EXPECT_EQ(v.kind, Value::Kind::TEXT);
+    EXPECT_EQ(v.s, "medium");
+    EXPECT_TRUE(v.indexed);
+    EXPECT_EQ(v.u, 2u);
+    EXPECT_TRUE(v.weighted);  // utf8mb4_0900_ai_ci
+  }
+  {  // index 0: the invalid value ''
+    OneColumn t(e);
+    const unsigned char b = 0;
+    t.add(&b, 1);
+    const Value v = t.decode();
+    EXPECT_EQ(v.s, "");
+    EXPECT_EQ(v.u, 0u);
+  }
+  {  // index past the elements: an error
+    OneColumn t(e);
+    const unsigned char b = 4;
+    t.add(&b, 1);
+    const unsigned char *pos = t.image.data();
+    std::vector<Value> row;
+    std::string err;
+    EXPECT_TRUE(decode_row(t.table, t.present, &pos,
+                           t.image.data() + t.image.size(), &row, &err));
+  }
+  // SET('red','green','blue'), pack length 1: bits in element order
+  ColumnInfo s = column("s", MYSQL_TYPE_STRING, (MYSQL_TYPE_SET << 8) | 1,
+                        false, kUtf8mb4);
+  s.enum_set = MYSQL_TYPE_SET;
+  s.elements = {"red", "green", "blue"};
+  {
+    OneColumn t(s);
+    const unsigned char b = 5;  // red, blue
+    t.add(&b, 1);
+    const Value v = t.decode();
+    EXPECT_EQ(v.s, "red,blue");
+    EXPECT_EQ(v.u, 5u);
+  }
+  {
+    OneColumn t(s);
+    const unsigned char b = 0;  // empty set
+    t.add(&b, 1);
+    EXPECT_EQ(t.decode().s, "");
+  }
 }
 
 TEST(DuckdbRowDecoder, Strings) {

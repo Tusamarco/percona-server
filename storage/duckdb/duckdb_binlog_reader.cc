@@ -828,11 +828,21 @@ bool BinlogReader::table_info(const bev::Table_map_event &ev, TableInfo *info,
       if (pair.first == index) return pair.second;
     return opt.m_default_charset.default_charset;
   };
+  auto enum_set_charset_of = [&opt](size_t index) -> unsigned int {
+    if (!opt.m_enum_and_set_column_charset.empty())
+      return index < opt.m_enum_and_set_column_charset.size()
+                 ? opt.m_enum_and_set_column_charset[index]
+                 : 0;
+    for (const auto &pair : opt.m_enum_and_set_default_charset.charset_pairs)
+      if (pair.first == index) return pair.second;
+    return opt.m_enum_and_set_default_charset.default_charset;
+  };
 
   const unsigned char *meta = ev.m_field_metadata;
   const unsigned char *meta_end = meta + ev.m_field_metadata_size;
   size_t numeric = 0;
   size_t character = 0;
+  size_t enum_set = 0, enums = 0, sets = 0;
   for (unsigned long i = 0; i < ev.m_colcnt; i++) {
     ColumnInfo c;
     c.name = opt.m_column_name[i];
@@ -847,6 +857,27 @@ bool BinlogReader::table_info(const bev::Table_map_event &ev, TableInfo *info,
       numeric++;
     }
     if (type_is_character(c.type, c.metadata)) c.charset = charset_of(character++);
+    if (c.type == MYSQL_TYPE_STRING) {
+      unsigned int real_type, length;
+      decode_string_metadata(c.metadata, &real_type, &length);
+      if (real_type == MYSQL_TYPE_ENUM || real_type == MYSQL_TYPE_SET) {
+        // Elements and charset of ENUM / SET columns, counted among ENUM and
+        // SET columns in column order.
+        const bool is_enum = real_type == MYSQL_TYPE_ENUM;
+        const auto &lists =
+            is_enum ? opt.m_enum_str_value : opt.m_set_str_value;
+        size_t &next = is_enum ? enums : sets;
+        if (next >= lists.size()) {
+          *err = "column " + c.name +
+                 ": ENUM/SET values missing from the binary log "
+                 "(binlog_row_metadata=FULL is required)";
+          return true;
+        }
+        c.enum_set = real_type;
+        c.elements = lists[next++];
+        c.charset = enum_set_charset_of(enum_set++);
+      }
+    }
     info->columns.push_back(std::move(c));
   }
   for (const auto &pk : opt.m_primary_key) info->primary_key.push_back(pk.first);

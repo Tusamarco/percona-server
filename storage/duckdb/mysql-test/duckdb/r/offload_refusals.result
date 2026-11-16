@@ -18,9 +18,9 @@ Got one of the listed errors
 SET SESSION use_secondary_engine = FORCED;
 SELECT id, ROUND(price) FROM p6 WHERE id <= 5 ORDER BY id;
 Got one of the listed errors
-# SELECT id, u + 1 FROM p6 WHERE id <= 5 ORDER BY id
+# SELECT id, u - 1 FROM p6 WHERE id <= 5 ORDER BY id
 SET SESSION use_secondary_engine = FORCED;
-SELECT id, u + 1 FROM p6 WHERE id <= 5 ORDER BY id;
+SELECT id, u - 1 FROM p6 WHERE id <= 5 ORDER BY id;
 Got one of the listed errors
 # SELECT DISTINCT b4 FROM p6 ORDER BY b4
 SET SESSION use_secondary_engine = FORCED;

@@ -212,7 +212,55 @@ load_table(TABLE &t)
 | DATE | DATE (zero dates refused) |
 | DATETIME(n) | TIMESTAMP (microseconds) |
 | TIMESTAMP(n) | TIMESTAMP, value in UTC (time zone semantics: Phase 2) |
-| other types (ENUM, SET, JSON, BIT, TIME, YEAR, spatial) | refused in the POC |
+| YEAR | USMALLINT: 0 (0000) or the year (2026-11-16) |
+| BIT(n) | UBIGINT: the value (2026-11-16) |
+| TIME(n) | BIGINT: signed microseconds (2026-11-16) |
+| ENUM, SET | VARCHAR value (UTF-8, weight column if needed) + hidden `__n_<col>`: ENUM index USMALLINT, SET bitmask UBIGINT (2026-11-16) |
+| other types (JSON, spatial, VECTOR) | refused in the POC |
+
+#### YEAR, BIT, TIME, ENUM, SET (done 2026-11-16)
+
+Nothing structural prevented them: each layer (load type mapping in
+`duckdb_types.cc`, binlog decoder in `duckdb_row_decoder.cc`, offload result
+types and expressions in `duckdb_offload.cc`) lacked the cases. The binlog
+values are documented and `binlog_row_metadata=FULL` (already required)
+carries the ENUM/SET value lists (`Optional_metadata_fields::m_enum_str_value`
+/ `m_set_str_value`). JSON, spatial and VECTOR stay refused.
+
+| MySQL | DuckDB | Notes |
+|---|---|---|
+| YEAR | USMALLINT | 0 = 0000, else 1900 + byte; result holder displays as YEAR (`0000`) |
+| BIT(n) | UBIGINT | binlog: big-endian bytes; result sent as the ceil(n/8)-byte binary string |
+| TIME(n) | BIGINT, signed microseconds | DuckDB TIME covers 00:00-24:00 only, MySQL -838:59:59..838:59:59; constants converted at SQL generation; SUM/AVG of TIME refused (MySQL sums HHMMSS numbers) |
+| ENUM | VARCHAR value + hidden `__n_<col>` USMALLINT index | string contexts (=, <, LIKE, MIN/MAX: MySQL compares the string with the column collation, weights for _ci) use the value; ORDER BY, `e = 2`, `e + 0` use the index (chosen from MySQL's own comparator type); index 0 = invalid value `''` |
+| SET | VARCHAR value + hidden `__n_<col>` UBIGINT bitmask | as ENUM |
+
+DuckDB's own ENUM type was considered for space and rejected: DuckLake
+refuses it ("Failed to convert DuckDB type to DuckLake - unsupported type
+ENUM"), and on disk it would not save anything: Parquet dictionary-encodes
+low-cardinality strings (measured, 1M rows, 3 values: VARCHAR 256,675 bytes,
+UTINYINT 256,219 bytes). The hidden index column costs about the same again
+for such a column. The structure check of history copies ignores `__n_`
+columns as it does `__w_`.
+
+Implemented in that order (lowest risk first) on 2026-11-16; offload rules
+in DWL-06 ("YEAR and BIT", "TIME", "ENUM and SET").
+
+- Load (`duckdb_types.cc`): YEAR `Field_year::val_int`, BIT `Field_bit::val_int`,
+  TIME `Field_time::val_time` → `Time_val::to_microseconds`, ENUM / SET the
+  string (`val_str`, converted to UTF-8, weighted like VARCHAR) and
+  `val_int` into `__n_<col>` (after the weight columns).
+- Binlog decoder: YEAR one byte; BIT big-endian bytes (metadata: bits % 8,
+  bytes); TIME2 `Time_val::load_time` (as `log_event.cc`); ENUM / SET the
+  index or bitmask little-endian (1-2 / 1-8 bytes), the value rebuilt from
+  the Table_map element list in the column charset (`m_enum_and_set_*`
+  charsets), then converted and weighted like a string; the applier writes
+  the number into `__n_<col>`.
+- History copies rebuilt after DDL (or reattached, resynced, adopted):
+  archived ENUM / SET rows get their index recomputed from their value with
+  the current definition (a value no longer in it: index 0, the text is
+  kept); archived SET text is written again in the current element order
+  ('x,z' becomes 'z,x' after SET('z','y','x')), so text and bitmask agree.
 
 ### Table registry
 

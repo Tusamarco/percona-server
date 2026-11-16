@@ -1,0 +1,72 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# INFORMATION_SCHEMA.DUCKDB_TABLES (manual-test-plan.md section 35): one
+# row per table in the lake, with its state, history flag, primary key,
+# weight columns and load position.
+--source ../include/have_duckdb.inc
+SELECT PLUGIN_NAME, PLUGIN_STATUS, PLUGIN_TYPE FROM information_schema.PLUGINS
+  WHERE PLUGIN_NAME = 'DUCKDB_TABLES';
+
+CREATE TABLE t1 (id INT PRIMARY KEY, a INT, s VARCHAR(10) COLLATE utf8mb4_0900_ai_ci,
+  l VARCHAR(10) CHARACTER SET latin1, b VARCHAR(10) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, 1, 'x', 'y', 'z');
+ALTER TABLE t1 SECONDARY_LOAD;
+CREATE TABLE h1 (id1 INT, id2 INT, v INT, PRIMARY KEY (id1, id2)) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO h1 VALUES (1, 1, 1);
+ALTER TABLE h1 SECONDARY_LOAD;
+--echo # t2 has the secondary engine but is not loaded: no row
+CREATE TABLE t2 (id INT PRIMARY KEY) SECONDARY_ENGINE = duckdb;
+--let $cols= TABLE_SCHEMA, TABLE_NAME, STATE, RETAIN_HISTORY, PRIMARY_KEY, WEIGHT_COLUMNS, LOAD_BINLOG_FILE LIKE 'binlog.%' AS has_file, LOAD_BINLOG_POSITION > 0 AS has_pos, LOAD_GTID_SET LIKE '%:%' AS has_gtids
+--eval SELECT $cols FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test' ORDER BY TABLE_NAME
+
+--echo # RENAME TABLE is followed by the applier
+RENAME TABLE t1 TO t3;
+--source ../include/wait_applier.inc
+SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test' ORDER BY TABLE_NAME;
+
+--echo # Dropping a history table keeps its copy: STALE
+DROP TABLE h1;
+--source ../include/wait_applier.inc
+SELECT TABLE_NAME, STATE, RETAIN_HISTORY FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test' ORDER BY TABLE_NAME;
+
+--echo # Unload: the row disappears
+ALTER TABLE t3 SECONDARY_UNLOAD;
+SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test' ORDER BY TABLE_NAME;
+
+--echo # The PROCESS privilege is required (as for InnoDB's tables)
+CREATE USER duckdb_is_user@localhost;
+GRANT SELECT ON test.* TO duckdb_is_user@localhost;
+--connect (con_u, localhost, duckdb_is_user,,test)
+SELECT COUNT(*) FROM information_schema.DUCKDB_TABLES;
+--disconnect con_u
+--connection default
+GRANT PROCESS ON *.* TO duckdb_is_user@localhost;
+--connect (con_u, localhost, duckdb_is_user,,test)
+SELECT COUNT(*) FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test';
+--disconnect con_u
+--connection default
+DROP USER duckdb_is_user@localhost;
+
+--echo # Lake closed (duckdb_enable=OFF): empty
+SET GLOBAL duckdb_enable = OFF;
+SELECT COUNT(*) FROM information_schema.DUCKDB_TABLES;
+SET GLOBAL duckdb_enable = ON;
+--source ../include/wait_applier.inc
+SELECT COUNT(*) FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test';
+
+DROP TABLE t3;
+--source ../include/cleanup.inc

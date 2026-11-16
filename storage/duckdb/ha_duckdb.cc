@@ -43,6 +43,7 @@
 #include "storage/duckdb/duckdb_binlog_reader.h"
 #include "storage/duckdb/duckdb_executor.h"
 #include "storage/duckdb/duckdb_guard.h"
+#include "storage/duckdb/duckdb_i_s.h"
 #include "storage/duckdb/duckdb_lake.h"
 #include "storage/duckdb/duckdb_load.h"
 #include "storage/duckdb/duckdb_log.h"
@@ -1202,6 +1203,22 @@ mysql_declare_plugin(duckdb){
         duckdb_se::guard_init,
         nullptr,
         duckdb_se::guard_deinit,
+        0x0001,
+        nullptr,
+        nullptr,
+        nullptr,
+        0,
+    },
+    {
+        MYSQL_INFORMATION_SCHEMA_PLUGIN,
+        &duckdb_se::i_s_tables_descriptor,
+        "DUCKDB_TABLES",
+        "Marco Tusa",
+        "INFORMATION_SCHEMA.DUCKDB_TABLES: the tables in the DuckDB lake",
+        PLUGIN_LICENSE_GPL,
+        duckdb_se::i_s_tables_init,
+        nullptr,
+        nullptr,
         0x0001,
         nullptr,
         nullptr,

@@ -1,0 +1,58 @@
+SELECT PLUGIN_NAME, PLUGIN_STATUS, PLUGIN_TYPE FROM information_schema.PLUGINS
+WHERE PLUGIN_NAME = 'DUCKDB_TABLES';
+PLUGIN_NAME	PLUGIN_STATUS	PLUGIN_TYPE
+DUCKDB_TABLES	ACTIVE	INFORMATION SCHEMA
+CREATE TABLE t1 (id INT PRIMARY KEY, a INT, s VARCHAR(10) COLLATE utf8mb4_0900_ai_ci,
+l VARCHAR(10) CHARACTER SET latin1, b VARCHAR(10) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 VALUES (1, 1, 'x', 'y', 'z');
+ALTER TABLE t1 SECONDARY_LOAD;
+CREATE TABLE h1 (id1 INT, id2 INT, v INT, PRIMARY KEY (id1, id2)) SECONDARY_ENGINE = duckdb
+SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO h1 VALUES (1, 1, 1);
+ALTER TABLE h1 SECONDARY_LOAD;
+# t2 has the secondary engine but is not loaded: no row
+CREATE TABLE t2 (id INT PRIMARY KEY) SECONDARY_ENGINE = duckdb;
+SELECT TABLE_SCHEMA, TABLE_NAME, STATE, RETAIN_HISTORY, PRIMARY_KEY, WEIGHT_COLUMNS, LOAD_BINLOG_FILE LIKE 'binlog.%' AS has_file, LOAD_BINLOG_POSITION > 0 AS has_pos, LOAD_GTID_SET LIKE '%:%' AS has_gtids FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test' ORDER BY TABLE_NAME;
+TABLE_SCHEMA	TABLE_NAME	STATE	RETAIN_HISTORY	PRIMARY_KEY	WEIGHT_COLUMNS	has_file	has_pos	has_gtids
+test	h1	LOADED	YES	id1, id2	NULL	1	1	1
+test	t1	LOADED	NO	id	s, l	1	1	1
+# RENAME TABLE is followed by the applier
+RENAME TABLE t1 TO t3;
+SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test' ORDER BY TABLE_NAME;
+TABLE_NAME	STATE
+h1	LOADED
+t3	LOADED
+# Dropping a history table keeps its copy: STALE
+DROP TABLE h1;
+Warnings:
+Warning	3877	DuckDB copy of test.h1 kept and marked stale: it holds archived rows
+SELECT TABLE_NAME, STATE, RETAIN_HISTORY FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test' ORDER BY TABLE_NAME;
+TABLE_NAME	STATE	RETAIN_HISTORY
+h1	STALE	YES
+t3	LOADED	NO
+# Unload: the row disappears
+ALTER TABLE t3 SECONDARY_UNLOAD;
+SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test' ORDER BY TABLE_NAME;
+TABLE_NAME	STATE
+h1	STALE
+# The PROCESS privilege is required (as for InnoDB's tables)
+CREATE USER duckdb_is_user@localhost;
+GRANT SELECT ON test.* TO duckdb_is_user@localhost;
+SELECT COUNT(*) FROM information_schema.DUCKDB_TABLES;
+COUNT(*)
+0
+GRANT PROCESS ON *.* TO duckdb_is_user@localhost;
+SELECT COUNT(*) FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test';
+COUNT(*)
+1
+DROP USER duckdb_is_user@localhost;
+# Lake closed (duckdb_enable=OFF): empty
+SET GLOBAL duckdb_enable = OFF;
+SELECT COUNT(*) FROM information_schema.DUCKDB_TABLES;
+COUNT(*)
+0
+SET GLOBAL duckdb_enable = ON;
+SELECT COUNT(*) FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'test';
+COUNT(*)
+1
+DROP TABLE t3;

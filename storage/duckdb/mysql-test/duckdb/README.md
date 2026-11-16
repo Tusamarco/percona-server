@@ -43,10 +43,14 @@ default 15-minute limit: add `--testcase-timeout=45`.
 | `applier` | DML of every type, large transaction in pieces, DDL refresh, RENAME, TRUNCATE (12-17) |
 | `history` | purge with the tag, LIVE / FULL, unload confirmation, stale copy, structure check, check only, reattach (19, 20) |
 | `guard` | FULL scope guard, UPDATE / DELETE / TRUNCATE under FULL stopped (34) |
+| `i_s_tables` | INFORMATION_SCHEMA.DUCKDB_TABLES: states, RENAME, stale history copy, unload, PROCESS privilege, lake closed (35) |
 | `super_read_only` | refresh after DDL with `super_read_only=ON` (a replica), user statements refused (18) |
 | `cached_tables` | cached secondary tables across unload / reload, duckdb_enable, DROP (27) |
 | `offload_rules` | cost threshold, duckdb_offload_min_rows, read your own writes, transaction that wrote, EXPLAIN notes, max_execution_time (21, 27, 28, 30) |
 | `offload_6a`, `offload_6b`, `offload_6c1`, `offload_6c2`, `offload_6c3`, `offload_division`, `offload_weights` | the query lists `project_duckdb/duckdb_offload_*_queries.sql`, InnoDB vs DuckDB |
+| `offload_time` | TIME: constants in every form, negative and > 24 h values, fractions, refusals (37) |
+| `offload_enum` | ENUM and SET: value and index contexts, invalid value, history copy across a definition change, refusals (38) |
+| `offload_yb` | YEAR and BIT: load, applier, results (YEAR columns zero-filled, BIT as bytes), unsigned arithmetic, refusals (36) |
 | `offload_refusals` | the refusal lists `duckdb_offload_*_refusals.sql` |
 
 Not in MTR (manual-test-plan.md): restarts with special options and long

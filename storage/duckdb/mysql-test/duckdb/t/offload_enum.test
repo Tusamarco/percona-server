@@ -1,0 +1,117 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# ENUM and SET columns (section 38): value and hidden index; string contexts, index order and numbers, history copies across a definition change, refusals.
+--source ../include/have_duckdb.inc
+--source ../include/tables_n.inc
+--source ../include/tables_et.inc
+
+--let $query= SELECT id, e, es, s, l FROM et ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, e FROM et ORDER BY e, id LIMIT 12
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, es FROM et ORDER BY es DESC, id LIMIT 12
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, s FROM et ORDER BY s, id LIMIT 12
+--source ../include/duckdb_compare.inc
+--let $query= SELECT e, COUNT(*) FROM et GROUP BY e ORDER BY e
+--source ../include/duckdb_compare.inc
+--let $query= SELECT es, COUNT(*) FROM et GROUP BY es ORDER BY es DESC
+--source ../include/duckdb_compare.inc
+--let $query= SELECT s, COUNT(*) FROM et GROUP BY s ORDER BY s
+--source ../include/duckdb_compare.inc
+--let $query= SELECT l, COUNT(*) FROM et GROUP BY l ORDER BY l
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(e), MAX(e), MIN(es), MAX(es), MIN(s), MAX(s), MIN(l), MAX(l) FROM et
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE e = 'medium' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE e = 'MEDIUM' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE e = 2 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE e > 'm' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE e < 3 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE es IN ('a', 'c') ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE es BETWEEN 'a' AND 'b' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE e = '' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, e + 0, es + 0, s + 0, e - 1, s * 2 FROM et ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE e + 0 = 0 OR s = 0 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE s = 'red,blue' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE s = 'blue,red' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE es LIKE 'a%' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(DISTINCT e), COUNT(DISTINCT s), COUNT(e), COUNT(*) FROM et
+--source ../include/duckdb_compare.inc
+--let $query= SELECT g, MIN(e), MAX(s) FROM et GROUP BY g ORDER BY g
+--source ../include/duckdb_compare.inc
+--let $query= SELECT a.id, b.id FROM et a JOIN et b ON a.es = b.es AND a.id < b.id WHERE a.id < 15 ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM et WHERE l = 'ETE' OR l = 'zed' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, e FROM et WHERE id IN (2, 3, 4, 90, 100, 101) ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT x.e FROM (SELECT e FROM et WHERE id < 10) x ORDER BY x.e, x.e IS NULL
+--source ../include/duckdb_compare.inc
+
+--echo # Refused
+--let $query= SELECT SUM(e) FROM et
+--source ../include/duckdb_refused.inc
+--let $query= SELECT id, FIND_IN_SET('red', s) FROM et ORDER BY id
+--source ../include/duckdb_refused.inc
+--let $query= SELECT id, CONCAT(e, '!') FROM et ORDER BY id
+--source ../include/duckdb_refused.inc
+--let $query= SELECT x.e FROM (SELECT e FROM et WHERE id < 10 LIMIT 100) x ORDER BY x.e
+--source ../include/duckdb_refused.inc
+--let $query= SELECT id FROM et WHERE s LIKE '%green%' ORDER BY id
+--source ../include/duckdb_refused.inc
+--let $query= SELECT DISTINCT es FROM et ORDER BY es
+--source ../include/duckdb_refused.inc
+
+--echo # History table: archived ENUM / SET rows across a definition change
+GRANT DUCKDB_HISTORY_READER ON *.* TO root@localhost;
+--connect (con_e, localhost, root,,test)
+CREATE TABLE eh (id INT PRIMARY KEY, e ENUM('a','b','c'), s SET('x','y','z')) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO eh VALUES (1,'a','x'), (2,'b','x,z'), (3,'c','y'), (4,'a','z'), (5,'b',''), (6,NULL,NULL);
+ALTER TABLE eh SECONDARY_LOAD;
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
+DELETE FROM eh WHERE id IN (1, 2);
+SET gtid_next = 'AUTOMATIC';
+--source ../include/wait_applier.inc
+--echo # archived rows keep their value; the index follows the new definition,
+--echo # SET values are written in the new element order
+ALTER TABLE eh MODIFY e ENUM('c','b','a','d'), MODIFY s SET('z','y','x');
+--source ../include/wait_applier.inc
+SET SESSION use_secondary_engine = ON, duckdb_history_scope = FULL;
+SELECT id, e, e + 0, s, s + 0 FROM eh ORDER BY id;
+SELECT id FROM eh ORDER BY e, id;
+SET SESSION duckdb_history_scope = LIVE;
+--let $query= SELECT id, e, e + 0, s, s + 0 FROM eh ORDER BY id
+--source ../include/duckdb_compare.inc
+--disconnect con_e
+--connection default
+REVOKE DUCKDB_HISTORY_READER ON *.* FROM root@localhost;
+
+--source ../include/cleanup.inc

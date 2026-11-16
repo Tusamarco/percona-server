@@ -166,6 +166,28 @@ bool Registry::snapshot(const std::string &db, const std::string &table,
   return true;
 }
 
+std::vector<Registry::Listed> Registry::list() {
+  std::vector<Listed> out;
+  std::lock_guard<std::mutex> guard(m_mutex);
+  for (const auto &entry : m_tables) {  // std::map: sorted by (db, table)
+    const LoadedTable &t = entry.second;
+    if (!t.present) continue;
+    Listed l;
+    l.db = entry.first.first;
+    l.table = entry.first.second;
+    l.state.retain_history = t.retain_history;
+    l.state.stale = t.stale;
+    l.state.refresh_pending = t.refresh_pending;
+    l.state.pending_renames = t.pending_renames;
+    l.state.pk_columns = t.pk_columns;
+    l.state.weight_columns = t.weight_columns;
+    l.state.load_position = t.load_position;
+    l.load_gtid_set = t.load_gtid_set;
+    out.push_back(std::move(l));
+  }
+  return out;
+}
+
 bool Registry::earliest_load_position(BinlogPos *pos) {
   std::lock_guard<std::mutex> guard(m_mutex);
   bool found = false;

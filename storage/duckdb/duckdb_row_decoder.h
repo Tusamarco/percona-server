@@ -38,6 +38,9 @@ struct Value {
       (DWL#6 step A1), computed from the bytes in the column's charset. */
   std::string w;
   bool weighted{false};
+  /** ENUM / SET (TEXT): u holds the index or bitmask, for the hidden
+      "__n_<column>" column. */
+  bool indexed{false};
   bool operator==(const Value &o) const;
   /** Readable form, for the debug log and the collapse key. */
   std::string to_string() const;
@@ -50,7 +53,16 @@ struct ColumnInfo {
   unsigned int metadata{0};  // type metadata from the Table_map
   bool is_unsigned{false};
   unsigned int charset{0};  // collation id of string columns, 0 otherwise
+  /** ENUM / SET: MYSQL_TYPE_ENUM or MYSQL_TYPE_SET, and the elements in
+      definition order (binlog_row_metadata=FULL), in the column charset. */
+  unsigned int enum_set{0};
+  std::vector<std::string> elements;
 };
+
+/** The real type of a MYSQL_TYPE_STRING column (CHAR, ENUM or SET) and its
+    length from the Table_map metadata. */
+void decode_string_metadata(unsigned int metadata, unsigned int *real_type,
+                            unsigned int *max_length);
 
 struct TableInfo {
   std::string db;

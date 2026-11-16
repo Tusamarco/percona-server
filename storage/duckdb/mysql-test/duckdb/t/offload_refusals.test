@@ -30,7 +30,7 @@
 --source ../include/duckdb_refused.inc
 --let $query= SELECT id, ROUND(price) FROM p6 WHERE id <= 5 ORDER BY id
 --source ../include/duckdb_refused.inc
---let $query= SELECT id, u + 1 FROM p6 WHERE id <= 5 ORDER BY id
+--let $query= SELECT id, u - 1 FROM p6 WHERE id <= 5 ORDER BY id
 --source ../include/duckdb_refused.inc
 --let $query= SELECT DISTINCT b4 FROM p6 ORDER BY b4
 --source ../include/duckdb_refused.inc

@@ -33,10 +33,26 @@
 #include "my_byteorder.h"
 #include "my_sys.h"  // get_charset, get_charset_by_csname
 #include "storage/duckdb/duckdb_collation.h"
+#include "my_temporal.h"  // Time_val (TIME2 values)
 #include "my_time.h"
 #include "mysql/strings/m_ctype.h"
 
 namespace duckdb_se {
+
+// CHAR metadata keeps the real type in the high byte and the maximum length in
+// the low byte; lengths above 255 borrow two bits of the type byte.
+void decode_string_metadata(unsigned int metadata, unsigned int *real_type,
+                            unsigned int *max_length) {
+  const unsigned int byte0 = metadata >> 8;
+  const unsigned int byte1 = metadata & 0xFF;
+  if ((byte0 & 0x30) != 0x30) {
+    *max_length = byte1 | (((byte0 & 0x30) ^ 0x30) << 4);
+    *real_type = byte0 | 0x30;
+  } else {
+    *max_length = byte1;
+    *real_type = byte0;
+  }
+}
 
 namespace {
 
@@ -70,21 +86,6 @@ uint32_t read_length(const unsigned char *p, unsigned int bytes) {
       return uint3korr(p);
     default:
       return uint4korr(p);
-  }
-}
-
-// CHAR metadata keeps the real type in the high byte and the maximum length in
-// the low byte; lengths above 255 borrow two bits of the type byte.
-void decode_string_metadata(unsigned int metadata, unsigned int *real_type,
-                            unsigned int *max_length) {
-  const unsigned int byte0 = metadata >> 8;
-  const unsigned int byte1 = metadata & 0xFF;
-  if ((byte0 & 0x30) != 0x30) {
-    *max_length = byte1 | (((byte0 & 0x30) ^ 0x30) << 4);
-    *real_type = byte0 | 0x30;
-  } else {
-    *max_length = byte1;
-    *real_type = byte0;
   }
 }
 
@@ -181,6 +182,25 @@ bool decode_value(const ColumnInfo &c, const unsigned char **pos,
         v->i = sint8korr(p);
       }
       break;
+    case MYSQL_TYPE_YEAR:
+      // One byte: 0 is 0000, otherwise the year minus 1900.
+      if (need(p, end, size = 1, err)) return true;
+      v->kind = Value::Kind::UINT;
+      v->u = p[0] == 0 ? 0 : 1900 + p[0];
+      break;
+    case MYSQL_TYPE_BIT: {
+      // Metadata: bits % 8 in the low byte, whole bytes in the high byte;
+      // the value is big-endian over ceil(bits / 8) bytes.
+      size = (c.metadata >> 8) + ((c.metadata & 0xFF) != 0 ? 1 : 0);
+      if (size < 1 || size > 8)
+        return fail(err, "column " + c.name + ": invalid BIT metadata");
+      if (need(p, end, size, err)) return true;
+      uint64_t bits = 0;
+      for (size_t k = 0; k < size; k++) bits = (bits << 8) | p[k];
+      v->kind = Value::Kind::UINT;
+      v->u = bits;
+      break;
+    }
     case MYSQL_TYPE_FLOAT: {
       if (need(p, end, size = 4, err)) return true;
       float f;
@@ -224,8 +244,33 @@ bool decode_value(const ColumnInfo &c, const unsigned char **pos,
     case MYSQL_TYPE_STRING: {
       unsigned int real_type, max_length;
       decode_string_metadata(c.metadata, &real_type, &max_length);
+      if (real_type == MYSQL_TYPE_ENUM || real_type == MYSQL_TYPE_SET) {
+        // The index (ENUM, 1-2 bytes) or bitmask (SET, 1-8 bytes), little
+        // endian; the value is rebuilt from the element list.
+        size = max_length;
+        if (size < 1 || size > 8 || c.enum_set != real_type)
+          return fail(err, "column " + c.name + ": invalid ENUM/SET metadata");
+        if (need(p, end, size, err)) return true;
+        uint64_t n = 0;
+        for (size_t k = size; k-- > 0;) n = (n << 8) | p[k];
+        std::string text;
+        if (real_type == MYSQL_TYPE_ENUM) {
+          if (n > c.elements.size())
+            return fail(err, "column " + c.name + ": ENUM index out of range");
+          if (n > 0) text = c.elements[n - 1];
+        } else {
+          for (size_t k = 0; k < c.elements.size() && k < 64; k++)
+            if ((n >> k) & 1) text += (text.empty() ? "" : ",") + c.elements[k];
+        }
+        if (string_value(c, reinterpret_cast<const unsigned char *>(text.data()),
+                         text.size(), v, err))
+          return true;
+        v->u = n;
+        v->indexed = true;
+        break;
+      }
       if (real_type != MYSQL_TYPE_STRING)
-        return fail(err, "column " + c.name + ": ENUM/SET not supported");
+        return fail(err, "column " + c.name + ": unsupported string type");
       const unsigned int prefix = max_length > 255 ? 2 : 1;
       if (need(p, end, prefix, err)) return true;
       const uint32_t len = read_length(p, prefix);
@@ -272,6 +317,18 @@ bool decode_value(const ColumnInfo &c, const unsigned char **pos,
       v->i = days_from_civil(t.year, t.month, t.day) * 86400000000LL +
              ((t.hour * 60LL + t.minute) * 60 + t.second) * 1000000LL +
              static_cast<int64_t>(t.second_part);
+      break;
+    }
+    case MYSQL_TYPE_TIME2: {
+      // Stored in the lake as signed microseconds (DWL-03).
+      const unsigned int fsp = c.metadata;
+      if (fsp > 6) return fail(err, "column " + c.name + ": invalid TIME fsp");
+      if (need(p, end, size = 3 + (fsp + 1) / 2, err)) return true;
+      // As log_event.cc prints it: the field's own binary format.
+      Time_val t;
+      Time_val::load_time(p, fsp, &t);
+      v->kind = Value::Kind::INT;
+      v->i = t.to_microseconds();
       break;
     }
     case MYSQL_TYPE_TIMESTAMP2: {
@@ -353,13 +410,20 @@ bool read_column_metadata(unsigned int type, const unsigned char **pos,
     case MYSQL_TYPE_LONGLONG:
     case MYSQL_TYPE_DATE:
     case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_YEAR:
       *metadata = 0;
+      break;
+    case MYSQL_TYPE_BIT:
+      // bits % 8, then whole bytes (Field_bit::save_field_metadata).
+      if (need(p, end, size = 2, err)) return true;
+      *metadata = uint2korr(p);
       break;
     case MYSQL_TYPE_FLOAT:
     case MYSQL_TYPE_DOUBLE:
     case MYSQL_TYPE_BLOB:
     case MYSQL_TYPE_DATETIME2:
     case MYSQL_TYPE_TIMESTAMP2:
+    case MYSQL_TYPE_TIME2:
       if (need(p, end, size = 1, err)) return true;
       *metadata = p[0];
       break;
