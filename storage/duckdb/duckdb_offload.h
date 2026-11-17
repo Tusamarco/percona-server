@@ -49,6 +49,11 @@ bool offload_wait_applied(THD *thd);
 /** duckdb_offload_min_rows of the session (ha_duckdb.cc). */
 unsigned long long offload_min_rows(THD *thd);
 
+/** duckdb_decimal_overflow (ha_duckdb.cc): a DECIMAL value above DuckDB's
+    38 digits in a statement MySQL declares wider. */
+enum class DecimalOverflow : unsigned long { FALLBACK = 0, ROUND = 1, ERROR = 2 };
+DecimalOverflow decimal_overflow(THD *thd);
+
 }  // namespace duckdb_se
 
 #endif  // STORAGE_DUCKDB_DUCKDB_OFFLOAD_H_

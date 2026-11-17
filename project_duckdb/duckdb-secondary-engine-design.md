@@ -2,7 +2,21 @@
 
 **Design and Implementation Plan**
 
-Status: draft v0.3 for review. Owner: Marco. Target: Percona Server for MySQL; the POC is built on the Percona-Server-9.7.2-2 branch (final target release still open, see Open questions).
+Status: v0.4, 2026-11-17: the POC is implemented and the design below describes what was built (decisions taken during development are marked with their date). Owner: Marco. Target: Percona Server for MySQL; the POC is built on the Percona-Server-9.7.2-2 branch (final target release still open, see Open questions). Step by step status: `worklog-index.md`; user guides: `HOWTO.md`, `TUTORIAL.md`.
+
+Changes from v0.3 (what the implementation added or changed, 2026-11-07 to 2026-11-17):
+
+- All five POC features work end to end (DWL#1 to DWL#7), with an MTR suite of 25 tests, unit tests and a release-build performance run (offloaded queries 54x to 584x faster than InnoDB).
+- DDL no longer unloads a copy: the applier refreshes it (archived rows kept), follows RENAME TABLE, and marks it stale only when it cannot follow (DWL#4 step 4d).
+- History copies survive DROP TABLE and can be reattached, resynced or adopted by another table (DWL#3 step 3b).
+- The applier is one reader thread that decodes, collapses and commits batches; the parallel prepare workers of v0.3 were not needed and are deferred.
+- Collations: hidden weight columns (`__w_<col>`) give MySQL's exact semantics for every collation in comparisons, grouping, ordering and joins (DWL#6 step A).
+- Types added: YEAR, BIT, TIME, ENUM, SET (hidden `__n_<col>` index column); exact DECIMAL division as MySQL computes it.
+- Offload also when a large table is scanned (`duckdb_offload_min_rows`), with read-your-own-writes and error mapping (1242, 1317, 3024).
+- The guard also stops UPDATE / DELETE of history tables under FULL and lets the plugin's own refresh pass `super_read_only`.
+- `INFORMATION_SCHEMA.DUCKDB_TABLES`, lake relocation (`duckdb_lake_relocate`), tables with foreign keys (2026-11-17), replicas tested.
+- DECIMAL results beyond 38 digits (`duckdb_decimal_overflow`), LIKE on binary collations, grouped CHAR in joins, the reviewed date / number / string functions (DWL#6); TPC-H 19 of 22 offloaded.
+- New sections: production readiness checklist and SQL gaps by priority (plan steps 5-10), SQL coverage tracker (what queries can contain, kept current) and an updated phased plan with the TPC-H / HammerDB proof.
 
 Changes from v0.2:
 
@@ -84,10 +98,11 @@ The secondary engine is the approach that best matches how DuckDB works and the 
 
 One DuckDB instance lives inside mysqld, in memory, with one DuckLake attached as `lake`. Each MySQL session that touches DuckDB gets its own DuckDB connection. No DuckDB call runs on a MySQL thread: DuckDB plans statements recursively and overflows the small stack of connection threads, so every DuckDB call runs on a plugin-owned executor pool (`duckdb_executor_threads`, `duckdb_executor_stack_size`) while MySQL work stays on the session thread (DWL#2, DuckDB executor threads). DuckDB, its extensions, DuckLake and CRoaring are linked statically into the plugin library; DuckDB and DuckLake are MIT licensed, compatible with GPL-2.0 (third-party licenses to be confirmed for the SBOM).
 
-The library `ha_duckdb.so` contains two plugins:
+The library `ha_duckdb.so` contains three plugins:
 
 - `duckdb`: the secondary engine (load, unload, offload, applier, variables).
-- `duckdb_guard`: an audit (event tracking) plugin that enforces the FULL scope rules (see Query offload).
+- `duckdb_guard`: an audit (event tracking) plugin that enforces the FULL scope rules (see Query offload) and lets the plugin's internal refresh pass `read_only` / `super_read_only`.
+- `DUCKDB_TABLES`: an INFORMATION_SCHEMA plugin, `INFORMATION_SCHEMA.DUCKDB_TABLES`, one row per copy in the lake (state, history flag, primary key, weight columns, load position).
 
 ## User interface
 
@@ -149,10 +164,20 @@ All variables are plugin variables of the `duckdb` plugin, so the server adds th
 | `duckdb_executor_threads` | int | 4 | global | yes | Threads that run DuckDB calls; 1 to the number of cores; above the cores at startup it is lowered with a warning |
 | `duckdb_executor_stack_size` | size | 8 MiB | global | no | Stack of the executor threads; 2 to 64 MiB |
 | `duckdb_history_scope` | enum LIVE, FULL | LIVE | global, session, SET_VAR hint | yes | Affects only tables with retain_history |
-| `duckdb_apply_workers` | int | 1 | global | proposal: no in the POC | Prepare workers of the applier |
-| `duckdb_apply_batch_max_trx` | int | to be decided | global | yes | Batch closes at this many source transactions |
-| `duckdb_apply_batch_max_rows` | int | to be decided | global | yes | Batch closes at this many row changes |
-| `duckdb_apply_batch_max_delay_ms` | int | to be decided | global | yes | Maximum wait before a batch closes; bounds lag under light load |
+| `duckdb_lake_relocate` | BOOL | ON | global | yes | A lake moved to another path: ON accepts it after checking every file, OFF refuses to open it |
+| `duckdb_apply_batch_max_trx` | int | 1000 | global | yes | Batch closes at this many source transactions |
+| `duckdb_apply_batch_max_rows` | int | 100000 | global | yes | Batch closes at this many row changes; larger transactions are applied in pieces inside one DuckDB transaction |
+| `duckdb_apply_batch_max_delay_ms` | int | 1000 | global | yes | Maximum wait before a batch closes; bounds lag under light load |
+| `duckdb_apply_gap_action` | enum STOP, FIRST_AVAILABLE | STOP | global | yes | Binary logs purged before the applier read them |
+| `duckdb_apply_start_position` | string (command) | empty | global | yes | Restart the applier at a binary log (repair after a gap) |
+| `duckdb_apply_debug_log` | BOOL | OFF | global | yes | One error log line per applied change (testing) |
+| `duckdb_offload_min_rows` | int | 1000000 | global, session, SET_VAR hint | yes | Also offload when the plan scans a loaded table of at least this many rows |
+| `duckdb_offload_wait_applied` | BOOL | ON | session, SET_VAR hint | yes | Read your own writes: wait (at most 5 s) until the session's last commit is applied |
+| `duckdb_history_check_only` | BOOL | OFF | session | yes | SECONDARY_LOAD of a history table only checks the structure |
+| `duckdb_unload_history_confirm` | BOOL | OFF | session | yes | Required to unload or discard a history copy |
+| `duckdb_discard_stale_copy` | string (command) | empty | global | yes | Drop the stale copy of a table that no longer exists |
+
+`duckdb_apply_workers` (parallel prepare workers) was not implemented: one reader thread decodes, collapses and commits fast enough so far; it stays an option if the apply lag requires it.
 
 ### Mandatory variables
 
@@ -180,15 +205,18 @@ The update callback of a plugin variable runs under `LOCK_global_system_variable
 ```
 DuckDB instance (in memory, one per mysqld)
   └─ ATTACH 'ducklake:<path>/catalog.ducklake' AS lake (DATA_PATH '<path>/data/')
-       ├─ lake.<mysql_schema>.<table>       one per SECONDARY_ENGINE table
+       ├─ lake.<mysql_schema>.<table>       one per loaded table
+       ├─ lake.__mysql.tables               registry: state, history flag, load position,
+       │                                    primary key, weight columns
        └─ lake.__mysql.applied_position     applied GTID, same transaction as data
   temp_directory = <path>/tmp/              spills from large queries
 ```
 
 - Catalog backend: a local DuckDB file. mysqld is the only writer, so the single-writer limit does not matter, and it adds no external dependency.
-- Each MySQL database maps to a DuckLake schema with the same name, each table to a table with the same name, plus the hidden `__archived_at TIMESTAMP` column on retain_history tables.
+- Each MySQL database maps to a DuckLake schema with the same name, each table to a table with the same name, plus hidden columns: `__archived_at TIMESTAMP` on retain_history tables, `__w_<col>` (BLOB, MySQL's sort weight) for string columns of collations DuckDB cannot compare, `__n_<col>` (ENUM index / SET bitmask).
+- The lake can be read by DuckDB itself while mysqld is stopped (`duckq`, HOWTO "Reading the lake while MySQL is down"); a moved lake is accepted with `duckdb_lake_relocate=ON`.
 - Default location `<datadir>/duckdb_data`. The name `duckdb_data` is reserved in the datadir when the default is used; a MySQL database with that name would fail with "database directory exists".
-- Hardening after attach: `autoload_known_extensions=false`, `autoinstall_known_extensions=false` (runtime settings in DuckDB 2.0), `enable_external_access=false` so DuckDB SQL cannot read arbitrary files or reach the network (to verify that it does not block DuckLake access to DATA_PATH when set after the attach). `lock_configuration` is not used, because we change `memory_limit` and `threads` at runtime; users never send SQL to DuckDB directly and our translator never emits SET.
+- Hardening after attach: `autoload_known_extensions=false`, `autoinstall_known_extensions=false` (runtime settings in DuckDB 2.0), `enable_external_access=false` so DuckDB SQL cannot read arbitrary files or reach the network (implemented: set at open, before the attach the extension settings, after it `enable_external_access`; DuckLake keeps reading and writing DATA_PATH, as every test since DWL#2 shows). `lock_configuration` is not used, because we change `memory_limit` and `threads` at runtime; users never send SQL to DuckDB directly and our translator never emits SET.
 - Unload: `DROP TABLE` in DuckLake, then a cleanup call so the Parquet files are removed from disk.
 - Updates in DuckLake are written as a delete file plus a new Parquet file (seen in the smoke test), so the applier collapses changes per key before writing.
 - Snapshot expiry and file compaction (merge adjacent files, expire snapshots, clean up old files) are needed under continuous propagation; scheduling and variables are Phase 3 work. History is never tied to DuckLake time travel, so snapshot expiry cannot delete history.
@@ -232,11 +260,12 @@ We start from a copy of storage/secondary_engine_mock into `storage/duckdb/`. We
 
 `load_table()` scans the InnoDB table through the primary handler and writes it into DuckLake through the DuckDB Appender, which works directly on a DuckLake table (verified in the smoke test; no staging table needed). One SECONDARY_LOAD is one DuckLake transaction and one snapshot. The server holds `MDL_SHARED_NO_WRITE` during the load (sql/sql_table.cc), so writes on the table are blocked and the scan is consistent.
 
-- Preconditions, checked at load; the load is refused otherwise: a primary key, no foreign keys, supported column types, `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `gtid_mode=ON`, `binlog_row_metadata=FULL`.
-- POC types: signed and unsigned integers, DECIMAL, FLOAT and DOUBLE, CHAR, VARCHAR and TEXT, DATE, DATETIME, TIMESTAMP. Any other type fails the load with an error naming the column.
+- Preconditions, checked at load; the load is refused otherwise: a primary key, supported column types, `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `gtid_mode=ON`, `binlog_row_metadata=FULL`, `binlog_order_commits=ON`, `sync_binlog=1` for history tables. Foreign keys (2026-11-17): allowed, cascading ones too, with `innodb_native_foreign_keys=OFF` (the 9.7 default: MySQL runs cascades in the SQL layer and writes the cascaded rows to the binary log, verified); with ON a child of a cascading key is refused, because InnoDB's own cascades are not logged.
+- Types: signed and unsigned integers, DECIMAL up to 38 digits, FLOAT and DOUBLE, CHAR, VARCHAR, TEXT, BINARY, VARBINARY, BLOB in any character set (text stored as UTF-8), DATE, DATETIME, TIMESTAMP (UTC), YEAR, BIT, TIME (signed microseconds), ENUM and SET (value plus `__n_<col>`). JSON, spatial and VECTOR fail the load with an error naming the column.
+- The load runs in two DuckLake transactions: the data under a build name, then the rename and the registry row under the apply mutex (a long transaction writing the registry would conflict with the applier). DuckDB work runs on the executor pool.
 - `NOT SECONDARY` columns are honored through the table read set.
 - The load records the binlog position and GTID set it represents; the applier skips events for that table up to that point.
-- For a retain_history table, SECONDARY_LOAD is allowed only when the DuckDB copy is empty; afterwards InnoDB no longer holds the archived rows, so a reload would destroy history.
+- For a retain_history table that already has a copy, SECONDARY_LOAD never discards it: it reattaches a stale copy, resyncs a current one (live rows replaced from InnoDB, archived rows kept) or adopts another table's stale copy (`adopt_history_from`), after a strict structure check (DWL#3 step 3b).
 
 ### Change propagation: binlog reader in the plugin
 
@@ -252,13 +281,14 @@ binlog files ──► [reader] ──► [prepare worker 1..N] ──► [commi
                  detect tag    per primary key           + applied GTID
 ```
 
-- Reader thread: reads and decodes the binlog, filters loaded tables, detects the purge tag.
-- Prepare workers (`duckdb_apply_workers`): convert values and collapse changes per primary key inside the batch. Work is split by table or by hash of the primary key, so changes to the same key stay in order without dependency tracking.
-- Committer: merges the prepared parts and commits once per batch, in GTID order. Cross-table source transactions stay atomic in DuckDB, there is a single applied position, and DuckDB parallelizes the commit work with its own `duckdb_threads`.
+- As implemented: one reader thread reads and decodes the binlog, filters loaded tables, detects the purge tag, converts values, collapses changes per primary key and commits once per batch, in GTID order. Cross-table source transactions stay atomic in DuckDB, there is a single applied position, and DuckDB parallelizes the commit work with its own `duckdb_threads`. The prepare workers below were designed but not needed so far:
+- Prepare workers (`duckdb_apply_workers`, deferred): would convert values and collapse changes per primary key inside the batch, split by table or by hash of the primary key.
 - Collapse rules within a batch: insert then updates becomes one insert of the final row; insert then a real delete becomes nothing; insert then a purge-tagged delete becomes an insert with `__archived_at` set; several updates become one update with the final image.
 - Batch boundaries are always at transaction boundaries; a batch closes at the first of `duckdb_apply_batch_max_trx`, `duckdb_apply_batch_max_rows`, `duckdb_apply_batch_max_delay_ms`.
 - Crash safety: each batch stores its last GTID in `lake.__mysql.applied_position` in the same DuckLake transaction as the data; on restart the reader resumes from there.
-- DDL on a loaded table invalidates the copy: the table is unloaded with a warning (retain_history tables: see Durability of the history).
+- DDL on a loaded table never blocks replication (DWL#4 step 4d, `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`): after a column change, TRUNCATE or partition DDL the applier refreshes the copy from InnoDB (an internal `SECONDARY_LOAD`, archived rows kept and converted); it follows RENAME TABLE; a refresh waiting for a later rename is deferred; a copy that cannot follow is marked stale. The internal session passes `super_read_only` through the guard (replicas).
+- Replicas (tested 2026-11-15): the reader reads the replica's own binary log (`log_replica_updates=ON`); the source does not need the plugin. Loads and the history privilege on a replica need `sql_log_bin=0` (HOWTO, Replicas).
+- Transactions larger than `duckdb_apply_batch_max_rows` are applied in pieces inside one DuckDB transaction. Binary logs purged before the applier read them: `duckdb_apply_gap_action` (STOP or FIRST_AVAILABLE, the tables that miss changes are named).
 
 Why not the replica model (`replica_parallel_workers`): its gain comes from many small commits in parallel, which suits InnoDB, where a commit is cheap and row operations dominate. In DuckLake each commit writes new files and a catalog snapshot, commits serialize on the catalog, and concurrency control is optimistic, so parallel small commits would multiply the most expensive step and create many small files. We keep its principle (independent work in parallel, order where it matters) in the prepare workers. The dependency information (`last_committed`, `sequence_number`) in the Gtid events stays available if a future per-table commit mode is ever needed.
 
@@ -268,22 +298,23 @@ Lag is visible through status variables; queries see data up to the last applied
 
 For tables with history retention, the applier distinguishes two kinds of delete:
 
-- Purge delete: a delete in a transaction whose GTID carries the fixed tag `duckdb_avoid_purge`. The tag belongs to that transaction only: `gtid_next` is a session variable. The row is kept in DuckDB and `__archived_at` is set to the commit time. The tag is written in the same transaction, it replicates to replicas, and setting it requires the server's existing `TRANSACTION_GTID_TAG` privilege, because a mistaken purge keeps data that was meant to disappear. `ALTER TABLE ... DROP PARTITION`, visible in the binlog as a DDL event, is a later addition.
+- Purge delete: a delete in a transaction whose GTID carries the fixed tag `duckdb_avoid_purge`. The tag belongs to that transaction only: `gtid_next` is a session variable. The row is kept in DuckDB and `__archived_at` is set to the commit time. The tag is written in the same transaction, it replicates to replicas, and setting it requires the server's existing `TRANSACTION_GTID_TAG` privilege, because a mistaken purge keeps data that was meant to disappear. `ALTER TABLE ... DROP PARTITION` / `TRUNCATE PARTITION` are not archive operations: the copy is refreshed and the partition's rows are gone; to archive a partition, purge it first (`DELETE ... PARTITION (p)` in a tagged transaction), then drop it (TUTORIAL section 8). A tagged DROP PARTITION as archiving is designed (record partition bounds at load, archive the partition's rows at the DDL position, then refresh; about 3-4 days) and planned (Phased plan, phase 4).
 - Business delete: any other delete, including cancellations and legal erasure requests. The live row is removed from DuckDB (`WHERE pk = ? AND __archived_at IS NULL`).
 
 A primary key purged and inserted again gives one archived row and one live row with the same key; the key is unique only among live rows.
 
 ### Query offload and plan translation
 
-The server decides whether to try offload: `use_secondary_engine` is ON or FORCED, every table in the query has `SECONDARY_ENGINE=duckdb` and is loaded, and our pre-prepare hook finds the estimated cost above `secondary_engine_cost_threshold`. Then:
+The server decides whether to try offload: `use_secondary_engine` is ON or FORCED, the statement is not part of a multi-statement transaction (MySQL never uses a secondary engine there: `BEGIN`, `autocommit=0`), every table in the query has `SECONDARY_ENGINE=duckdb` and is loaded, and our pre-prepare hook finds the estimated cost above `secondary_engine_cost_threshold` or a scan of a loaded table of at least `duckdb_offload_min_rows` rows (InnoDB's estimates can be far too low). Then:
 
 1. Prepare hook: creates our per-statement context.
-2. Optimize hook: we walk the query block (select list, FROM and joins, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT). Every item must be on the allow list (columns, literals, comparison and boolean operators, arithmetic, SUM, COUNT, AVG, MIN, MAX, a first set of date functions). If all is supported, we generate DuckDB SQL text and set `join->override_executor_func`, with the `USE_EXTERNAL_EXECUTOR` flag so the server builds no iterators. Otherwise we reject with a reason (optimizer trace, status counter), and in LIVE scope the query runs on InnoDB.
+2. Optimize hook: we walk the query block (select list, FROM and joins, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, subqueries, set operations). Every item must be on the allow list (the SQL coverage tracker lists what is covered). If all is supported, we generate DuckDB SQL text, prepare it in DuckDB (a bind error is a refusal, before anything is sent), and set `join->override_executor_func`, with the `USE_EXTERNAL_EXECUTOR` flag so the server builds no iterators. Otherwise we reject with a reason (optimizer trace, status counter, the error with FORCED), and in LIVE scope the query runs on InnoDB.
 3. Executor function: runs the SQL on the session's DuckDB connection, reads results chunk by chunk, converts each value to the MySQL type of its select-list item, and sends rows to the client.
 
 - Joins are offloaded when all tables in the query are DuckDB tables and loaded; generating SQL from the query block lets DuckDB apply its own optimizer, including join order.
 - LIVE scope adds `__archived_at IS NULL` for each history table; FULL omits it.
-- POC limits: only top-level SELECT results sent to the client are offloaded; INSERT ... SELECT, CREATE ... SELECT, SELECT ... INTO and subqueries inside DML run on InnoDB. No offload inside a transaction that has already written, because DuckDB does not have those writes yet.
+- Limits: only top-level SELECT results sent to the client are offloaded; INSERT ... SELECT, CREATE ... SELECT, SELECT ... INTO and subqueries inside DML run on InnoDB. No offload inside a transaction that has already written (and MySQL itself does not offload in multi-statement transactions).
+- EXPLAIN shows the generated DuckDB SQL and DuckDB's plan as notes; DuckDB errors with a MySQL equivalent return MySQL's code with both messages (1242, 1317 for KILL, 3024 for max_execution_time).
 - The framework provides the hooks; the translation is entirely our work.
 
 ### FULL scope guard (duckdb_guard)
@@ -293,7 +324,7 @@ Under FULL scope a query that ends up on InnoDB would return only live rows, sil
 - The server raises table access READ events in `open_tables()` (sql/sql_base.cc), before `open_secondary_engine_tables()` decides between primary and secondary, and before any row is read.
 - The server already supports statements that can execute only in the secondary engine (`lex->set_execute_only_in_secondary_engine()`, used for CUBE, TABLESAMPLE, GROUPING SETS). With `use_secondary_engine=OFF` such a statement fails; otherwise it is treated as FORCED, so failing to offload is an error and never a fallback.
 
-On each READ event the guard:
+On each table access event (READ, and since 2026-11-16 UPDATE and DELETE, so UPDATE / DELETE / TRUNCATE of a history table under FULL are stopped: they read only live rows) the guard:
 
 1. Ignores tables that are not history tables (registry of loaded retain_history tables kept by the plugin).
 2. Ignores the statement if the effective `duckdb_history_scope` (including SET_VAR) is not FULL.
@@ -311,13 +342,14 @@ On each READ event the guard:
 The same query must return the same result on both engines. Areas to cover:
 
 - Type mapping: DECIMAL precision and scale, unsigned integers, DATETIME and TIMESTAMP with time zones, BIT, ENUM, SET, JSON.
-- Collations. GROUP BY, DISTINCT, ORDER BY and comparisons on strings must follow the column collation. Under utf8mb4_0900_ai_ci, "José" and "jose" are equal; under the DuckDB default comparison they are not. This is the largest source of silent wrong results. POC rule: every character set and collation is loaded (text stored as UTF-8, binary strings as BLOB), and the offload rejects comparisons, GROUP BY, ORDER BY, DISTINCT and joins on string columns with a non-binary collation (reason `collation`); string operations on `_bin` collations are offloaded. Phase 2 design: for each string column with a non-binary collation we also store a hidden weight-string column computed with the server's own `strnxfrm` at load and apply time; the translator uses the weights for equality, ordering, grouping and DISTINCT, which gives exactly the MySQL semantics of any collation. LIKE and regular expressions cannot use weights and stay rejected under non-binary collations.
+- Collations. GROUP BY, DISTINCT, ORDER BY and comparisons on strings must follow the column collation. Under utf8mb4_0900_ai_ci, "José" and "jose" are equal; under the DuckDB default comparison they are not. This is the largest source of silent wrong results. Implemented (DWL#6 step A, 2026-11-14): for each string column whose collation DuckDB cannot compare, a hidden weight column computed with the server's own `strnxfrm` at load and apply time; comparisons, joins, GROUP BY, ORDER BY, MIN/MAX and COUNT(DISTINCT) use it, which gives exactly MySQL's semantics; PAD SPACE binary collations use rtrim keys. Still refused under non-binary collations: LIKE, SELECT DISTINCT, IN subqueries, DISTINCT set operations. A grouped string value shown in a join needs the table's primary key in GROUP BY (otherwise the value InnoDB shows depends on its join order).
+- Numbers: exact DECIMAL division and AVG as MySQL computes them (9-digit words, truncation, `div_precision_increment`); unsigned arithmetic only when it cannot leave 0..2^64-1 (MySQL raises error 1690). Columns with a special lake value (TIME, ENUM, SET, YEAR, BIT) are translated only by the functions that know them.
 - NULL handling and MySQL implicit type conversions.
 - Function mapping, one function at a time, with an allow list. Anything not on the list causes rejection.
 
 ### Freshness and consistency
 
-Propagation is asynchronous, so a query on DuckDB sees data up to the last applied transaction. In the POC we expose the lag through status variables. Later we need a policy, configurable per session: accept a bounded lag, wait until DuckDB has applied the GTID the session needs (similar to WAIT_FOR_EXECUTED_GTID_SET), or, in LIVE scope only, fall back to InnoDB when the lag is above a threshold. Implemented in the POC (DWL#6): read your own writes, `duckdb_offload_wait_applied` (session, default ON) waits until the applier has applied the connection's last commit, at most 5 s, then the query runs on InnoDB.
+Propagation is asynchronous, so a query on DuckDB sees data up to the last applied transaction. In the POC we expose the lag through status variables. Later we need a policy, configurable per session: accept a bounded lag, wait until DuckDB has applied the GTID the session needs (similar to WAIT_FOR_EXECUTED_GTID_SET), or, in LIVE scope only, fall back to InnoDB when the lag is above a threshold. Implemented in the POC (DWL#6): read your own writes, `duckdb_offload_wait_applied` (session, default ON) waits until the applier has applied the connection's last commit, at most 5 s, then the query runs on InnoDB (with FULL scope: `applier_behind` error). Snapshot isolation across statements is not an issue: MySQL never offloads inside a multi-statement transaction.
 
 ## History retention and query scope
 
@@ -350,16 +382,16 @@ With history retention, DuckDB is no longer a disposable copy: it holds the only
 
 - Backup: Percona XtraBackup must capture `catalog.ducklake`, the Parquet files it references and the applied position consistently with InnoDB. Parquet files are immutable, which simplifies copying.
 - Replicas: a new replica built from a backup needs the DuckDB history too; it cannot be rebuilt from binlogs that have been purged. The avoid-purge tag replicates, so a replica's applier archives the same rows.
-- DDL: the server refuses RENAME TABLE and ALTER TABLE on tables with a secondary engine (we do not set `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`). DROP TABLE and `SECONDARY_ENGINE = NULL` keep the history in the lake and mark it stale. SECONDARY_LOAD reattaches a stale copy automatically: archived rows kept, live rows replaced with the current InnoDB rows, new columns added in place (archived rows get NULL); incompatible changes are refused. A rename goes through `SECONDARY_ENGINE = NULL`, RENAME TABLE, and the attribute key `adopt_history_from` (DWL#3).
+- DDL (since DWL#4 step 4d, `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`): ALTER, TRUNCATE, partition DDL and RENAME TABLE are allowed; the applier refreshes the copy keeping the archived rows (converted to new column types; ENUM / SET indexes recomputed with the new definition) and follows renames. DROP TABLE and `SECONDARY_ENGINE = NULL` keep the history in the lake and mark it stale. SECONDARY_LOAD reattaches a stale copy (strict structure check, every difference reported); `adopt_history_from` gives it to a table with another name (DWL#3).
 - Unload: discarding history (SECONDARY_UNLOAD of a history table, or removing a stale copy) requires `SET SESSION duckdb_unload_history_confirm = ON`, because it destroys data that exists nowhere else. Lake data is never deleted implicitly.
-- Binlog retention: if binlog files are purged before the applier has read them, the copy has a gap. The plugin cannot block binlog purge without core changes, so it detects the gap, marks the affected tables stale and logs an error.
+- Binlog retention: if binlog files are purged before the applier has read them, the copy has a gap. The plugin cannot block binlog purge without core changes, so it detects the gap, names the affected tables and stops (`duckdb_apply_gap_action=STOP`) or continues at the first available binary log; the tables are reloaded and `duckdb_apply_start_position` restarts the applier.
 
 ## Operations
 
 - Resource limits: `duckdb_memory_limit` and `duckdb_threads` are mandatory and dynamic.
 - DDL on a base table without history invalidates the secondary copy and requires a reload; with history, see Durability of the history.
-- Observability: status variables and Performance Schema tables for apply lag (`duckdb_apply_lag_seconds`, `duckdb_apply_lag_transactions`, `duckdb_applied_gtid`), batches and collapsed rows (`duckdb_apply_batches`, `duckdb_apply_rows_collapsed`), time split between decode, prepare and commit, offloaded and rejected query counts, rejection reasons, archived row counts and DuckDB memory use.
-- Testing: MTR suite `duckdb`; every query runs with use_secondary_engine OFF and FORCED and results are compared in LIVE scope; FULL scope tests check archived rows and rejections.
+- Observability (implemented): 31 status variables (applier state and position, applied position and GTID, batches, changes, pieces, purges and archived rows, DDL refreshes / renames / failures, offloaded and refused queries with the last reason, guard counters, executor pool) and `INFORMATION_SCHEMA.DUCKDB_TABLES`; the optimizer trace and EXPLAIN notes for offload. Still to do: apply lag in seconds, time split between decode and commit, DuckDB memory use (Phased plan, phase 3).
+- Testing (implemented): MTR suite `duckdb` (25 tests: plugin, applier, history, guard, super_read_only, foreign keys, transactions, DECIMAL overflow, LIKE, grouped CHAR, functions, INFORMATION_SCHEMA, cached tables, offload rules, the offload query and refusal lists, types); every query runs with use_secondary_engine OFF and FORCED and results are compared; unit tests (41); manual tests for restarts, replicas, semi-sync, relocation and performance (`manual-test-plan.md`).
 
 ## Build and source integration
 
@@ -419,7 +451,9 @@ Features:
 
 Also in the POC: build integration (Build and source integration), all variables except encryption, startup sequence and location checks, `duckdb_enable`, status variables for lag and offload.
 
-Out of the POC: encryption, `binlog_encryption`, DROP PARTITION as purge, the separate `orders_history` name, XtraBackup integration, compaction scheduling, write-and-read statements under FULL (rejected). Added to the POC during development: the freshness wait (`duckdb_offload_wait_applied`) and DDL on history tables (refresh with archived rows kept).
+Out of the POC: encryption, `binlog_encryption`, DROP PARTITION as purge, the separate `orders_history` name, XtraBackup integration, compaction scheduling, write-and-read statements under FULL (rejected). Added to the POC during development: the freshness wait (`duckdb_offload_wait_applied`), DDL on loaded and history tables (refresh with archived rows kept), weight columns for every collation, the types YEAR / BIT / TIME / ENUM / SET, exact decimal division, `duckdb_offload_min_rows`, lake relocation, `INFORMATION_SCHEMA.DUCKDB_TABLES`, foreign keys.
+
+**Status (2026-11-17): the five features work end to end** in MTR and on Marco's reference instance; the exit criterion is met: on the release build with 10.5 million rows, offloaded queries ran 54x to 584x faster than InnoDB (`perf/results-2026-11-1*-release*.txt`), with identical results.
 
 No core code changes: everything lives in `storage/duckdb/`, `extra/duckdb/` and `cmake/duckdb.cmake`.
 
@@ -434,22 +468,227 @@ POC tests (MTR suite `duckdb`):
 
 Exit criterion: the five features work end to end in MTR, and a reference analytical workload shows a measured speedup versus InnoDB.
 
+## SQL coverage tracker
+
+What an offloaded query can contain, against the SQL standard (SQL:2016
+core and the common optional features) and the MySQL dialect that
+applications use. Only reads are offloaded: writes, DDL and transactions
+stay on InnoDB by design. Anything not covered is not an error: with
+`use_secondary_engine = ON` the query runs on InnoDB (with FORCED it fails
+with the reason). The rule for every item is the same: offload only when
+the result is exactly InnoDB's.
+
+**Keep this table current**: every step that adds or removes coverage
+updates it, with the step and its test list. Status: **done**, **partial**
+(what is missing in the notes), **missing**, **n/a** (not part of MySQL, or
+not a read). Last update: 2026-11-17 (function review, TPC-H 19/22,
+`tpch/README.md`).
+
+### Query structure
+
+| Feature | Status | Notes / tests |
+|---|---|---|
+| SELECT, FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT / OFFSET | done | 6a, 6b |
+| DISTINCT, COUNT(DISTINCT) | partial | not SELECT DISTINCT on non-binary or PAD binary strings |
+| Inner, CROSS, LEFT, RIGHT joins | done | 6c-1 |
+| FULL OUTER JOIN | n/a | not in MySQL |
+| NATURAL / USING joins | done | resolved by MySQL into equalities |
+| LATERAL derived tables | missing | |
+| Derived tables, views, non-recursive CTEs | done | 6c-1 |
+| Recursive CTEs | missing | |
+| UNION / INTERSECT / EXCEPT, DISTINCT and ALL, nested | partial | DISTINCT forms need binary or `_0900_bin` strings; a YEAR column refused |
+| Subqueries: scalar, IN, NOT IN, EXISTS, NOT EXISTS, ANY / ALL, correlated | partial | 6c-3; IN on `_bin` / `_ci` strings; a correlated scalar subquery without aggregate; equalities propagated between EXISTS and NOT EXISTS nests (TPC-H Q21) |
+| Row value constructors `(a, b) IN (...)`, `(a, b) = (...)` | missing | |
+| GROUP BY ROLLUP, CUBE, GROUPING SETS, GROUPING() | missing | refused `rollup` |
+| Window functions (ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, aggregates OVER, frames) | missing | refused `window` |
+| TABLESAMPLE | missing | |
+| VALUES / TABLE statements, JSON_TABLE | missing | |
+| A grouped string shown in a join | partial | exact cases: the table's primary key in GROUP BY, CHAR under a binary collation (2026-11-17); VARCHAR / non-binary: data check planned (next step 2) |
+
+### Predicates
+
+| Feature | Status | Notes / tests |
+|---|---|---|
+| =, <>, <, <=, >, >= ; BETWEEN ; IN (list) ; IS [NOT] NULL ; AND, OR, NOT | done | every collation through weight columns (step A) |
+| IS [NOT] TRUE / FALSE / UNKNOWN | done | |
+| NULL-safe equality `<=>` (IS NOT DISTINCT FROM) | missing | |
+| LIKE, ESCAPE | partial | every binary collation, PAD or not (2026-11-17), MySQL's default escape `\`; `_ci` and other non-binary missing |
+| REGEXP / RLIKE (SIMILAR TO is not in MySQL) | missing | |
+| String compared with a number | missing | MySQL converts to DOUBLE |
+
+### Expressions and functions
+
+| Feature | Status | Notes / tests |
+|---|---|---|
+| + - * on signed numbers, exact DECIMAL division, DIV, MOD, unary minus | done | 6b, B (exact division) |
+| Unsigned arithmetic | partial | + and * that cannot overflow; subtraction refused (MySQL error 1690) |
+| DECIMAL results declared above 38 digits | done | 2026-11-17: computed as DECIMAL(38, scale), run first; `duckdb_decimal_overflow` FALLBACK / ROUND / ERROR (TPC-H Q11) |
+| CASE, IF, IFNULL, COALESCE, NULLIF | done | |
+| CAST / CONVERT | missing | not reviewed yet |
+| Numeric functions | partial | ABS, ROUND (not of DOUBLE), FLOOR, CEIL, SIGN, TRUNCATE (exact), SQRT, LN, LOG, LOG2, LOG10, GREATEST / LEAST of numbers (2026-11-17 review, DWL-06); refused: EXP, POW (overflow errors), RAND |
+| String functions | partial | CHAR_LENGTH, LENGTH (UTF-8 charsets), SUBSTRING, LEFT, RIGHT, CONCAT, CONCAT_WS, TRIM (spaces / one character), REPLACE, REVERSE, LPAD, RPAD, INSTR, LOCATE (binary collations) (2026-11-17); refused: UPPER, LOWER (case mapping differs), ASCII; not reviewed: REGEXP, SOUNDEX, FORMAT, ... |
+| Date parts: YEAR, MONTH, DAYOFMONTH, DAYOFYEAR, QUARTER, DAYOFWEEK, WEEKDAY, HOUR, MINUTE, SECOND, DATE of DATE / DATETIME | done | 6b |
+| EXTRACT(unit FROM ...) | done | 2026-11-17, every unit but WEEK (default_week_format) |
+| Date arithmetic on columns | partial | `d +/- INTERVAL n unit`, DATE_ADD / SUB, ADDDATE / SUBDATE, DATEDIFF, TO_DAYS, LAST_DAY, DAYNAME / MONTHNAME (en_US) (2026-11-17); missing: TIMESTAMPDIFF, multi-part units |
+| DATE_FORMAT, STR_TO_DATE, CURRENT_DATE / NOW() in expressions | missing | |
+| Functions on TIMESTAMP columns (session time zone) | missing | |
+| Bit operators (& | ^ ~ << >>) | missing | |
+| JSON functions | missing | |
+
+### Aggregates
+
+| Feature | Status | Notes / tests |
+|---|---|---|
+| COUNT, SUM, AVG, MIN, MAX, with DISTINCT | done | exact SUM and AVG (6a, B) |
+| STDDEV, VARIANCE (POP / SAMP) | missing | |
+| BIT_AND, BIT_OR, BIT_XOR | missing | |
+| GROUP_CONCAT (LISTAGG), JSON_ARRAYAGG / JSON_OBJECTAGG | missing | |
+| FILTER (WHERE ...) on aggregates, ordered-set aggregates | n/a | not in MySQL |
+
+### Data types
+
+| Feature | Status | Notes / tests |
+|---|---|---|
+| Integers (signed / unsigned), DECIMAL up to 38 digits, FLOAT, DOUBLE | done | |
+| CHAR, VARCHAR, TEXT, BINARY, VARBINARY, BLOB, every character set and collation | done | weights for non-binary collations |
+| DATE, DATETIME, TIMESTAMP, YEAR, TIME | done | YEAR, TIME 2026-11-16 |
+| BIT, ENUM, SET | done | 2026-11-16 |
+| DECIMAL above 38 digits | missing | table not loadable |
+| JSON, spatial, VECTOR | missing | table not loadable |
+
+### Tables and consistency
+
+| Feature | Status | Notes / tests |
+|---|---|---|
+| Tables with a primary key | done | |
+| Tables without a primary key | missing | |
+| Tables with foreign keys | done | 2026-11-17, also cascading keys (binlogged with `innodb_native_foreign_keys = OFF`, the default); with ON a cascading child is refused |
+| Partitioned tables | done | DROP PARTITION as archiving: missing (purge first) |
+| Read your own writes | done | `duckdb_offload_wait_applied` |
+| Queries in multi-statement transactions (BEGIN, autocommit = 0) | n/a | MySQL never uses a secondary engine there (InnoDB answers) |
+| Isolation | done | each offloaded statement reads the last applied state, which includes every commit of the session |
+
 ## Phased plan
 
-| Phase | Scope | Exit criterion |
+Status on 2026-11-17. Done items keep their phase for the record; the
+open items are in the proposed working order (each step: design note for
+Marco's review, implementation, MTR test, throwaway instance, then Marco's
+reference instance; the SQL coverage tracker is updated).
+
+| Phase | Scope | Status | Exit criterion |
+|---|---|---|---|
+| 1. POC | See POC scope | **done** (2026-11-15) | Features work end to end in MTR; measured speedup versus InnoDB: met (54x-584x) |
+| 2. Correctness | Type mapping, collation weight columns, function allow list, rejection and fallback, MTR result comparison, Clang build | **mostly done**: weights, every type but JSON / spatial / VECTOR, exact decimal division, rejection rules, MTR suite. Open: the translation items of phase 2b | Identical results with use_secondary_engine OFF and FORCED across the test suite: met for everything that is offloaded |
+| 2b. Translation coverage and the TPC-H proof | See "Next steps" 1-3 | **in progress** (TPC-H check: 19 of 22) | HammerDB TPROC-H runs with all 22 queries giving InnoDB's results, offloaded where translated; measured speedup at scale factor 1 and 10 |
+| 3. Propagation hardening | Crash tests, binlog gap detection (done), catch-up after duckdb_enable=FALSE (done: the applier resumes from the applied position), compaction and snapshot expiry, incremental refresh after DDL, batch tuning, freshness policy (read your own writes done), apply lag metrics | partly done | Copy stays consistent through crash tests; measured apply lag under write load; disk space stable under continuous changes |
+| 4. History retention complete | DROP PARTITION as archiving (tagged), DUCKDB_HISTORY_READER privilege (done), DDL on history tables (done), confirmed SECONDARY_UNLOAD (done), backup integration, encryption | partly done | Purged rows remain queryable in FULL scope; LIVE results identical to InnoDB; backup and restore preserve history |
+| 5. Production readiness | Target release (9.7 or 8.4), consistency check, resource governance, backup, observability, packaging, CI, upgrade policy, wider translation by real usage (see "Production readiness" and "SQL gaps by priority" below) | not started | Agreed workload runs on a staging environment within lag and memory targets; crash and consistency tests pass; lake size stable under continuous changes |
+
+### Next steps (proposed order, 2026-11-17, for Marco's review)
+
+1. **TPC-H enablers, small** (`tpch/README.md`): done 2026-11-17 (LIKE
+   on binary collations, grouped CHAR values in joins, EXTRACT and the
+   function review: DWL-06 "Function review against DuckDB"). TPC-H 19 of
+   22.
+2. **Grouped string values in joins, exact by a data check** (decided
+   2026-11-17): before offloading a query that shows a grouped string of a
+   PAD SPACE or non-binary collation in a join without the table's primary
+   key, ask DuckDB whether the column has two different values that compare
+   equal (`GROUP BY <weight or rtrim key> HAVING count(DISTINCT col) > 1
+   LIMIT 1`); if none, every group is unambiguous and the query is exact;
+   cache the answer per column until the applier next changes the table.
+   VARCHAR and `_ci` columns with consistent data (TPC-H Q16, names stored
+   in one case), and string expressions grouped under PAD SPACE (TPC-H
+   Q22, `GROUP BY substr(...)`). About 1-2 days. An opt-in "any value" mode
+   (`duckdb_grouped_value = EXACT | ANY`) stays a possible later option.
+3. **TPC-H Q21**: equalities propagated between EXISTS and NOT EXISTS
+   nests. SUBSTR is done (review). Expected with 1-3: 22 of 22.
+4. **HammerDB TPROC-H on the release build**, scale factor 1 then 10: build
+   with HammerDB (`autocommit = 1` in its MySQL OLAP script, otherwise MySQL
+   offloads nothing), load the copies, power run with InnoDB and with the
+   plugin, identical results, timings in `perf/`.
+5. **Target release decision: 9.7 or 8.4 LTS**, before more code depends
+   on 9.7 interfaces. For 8.4, confirm the external executor hook,
+   `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`, the SQL-layer foreign keys (and
+   that cascades are binlogged) and the secondary-only statement mechanism
+   used by the guard.
+6. **Production hardening, must-have** (phases 3 and 5; detail in
+   "Production readiness" below): crash tests and a built-in consistency
+   check, snapshot expiry and compaction, apply lag under write load,
+   resource governance, backup and restore, refresh after DDL that does not
+   block the other tables.
+7. **Translation by real usage** (phase 5; order in "SQL gaps by priority"
+   below): first counters of refusal reasons, so a workload shows which
+   gaps matter; then CAST / CONVERT, DATE_FORMAT and NOW() / CURRENT_DATE,
+   functions on TIMESTAMP columns, window functions, GROUP_CONCAT, ROLLUP.
+8. **Structural gaps**: tables without a primary key (needs a design: no
+   row identity in the binary log; match on the full before-image or a
+   hidden identity), JSON columns loaded as text (functions on them
+   refused, the other columns offloaded).
+9. **History**: tagged DROP PARTITION as archiving (designed: record
+   partition bounds at load, archive the partition's rows at the DDL
+   position; 3-4 days), backup integration (XtraBackup), encryption.
+10. **General availability**: observability, packaging, security and
+    compliance, upgrade policy, CI (detail below).
+
+### Production readiness
+
+What is needed besides SQL coverage before the feature can be used by
+customers. An untranslated query still gives InnoDB's result (slower); the
+items below are the ones that can lose data, disk or availability.
+
+Must-have before any customer use:
+
+| Item | What | Why | Status |
+|---|---|---|---|
+| Crash safety | Kill mysqld at every applier stage (mid batch, mid DuckLake commit, during a refresh after DDL, during SECONDARY_LOAD); compare the copy with InnoDB row by row after restart | The copy must never silently diverge | missing |
+| Consistency check | An operator command (checksum per table or per range, InnoDB vs DuckDB, at the applied position) | Proof for operators and support; detects divergence after incidents | missing |
+| Disk space | DuckLake snapshot expiry, compaction of small files, removal of dropped copies and old versions (scheduled, with variables) | Today the lake grows forever under updates: the risk most likely to hit a user within weeks | missing |
+| Apply lag under write load | Sustained OLTP load (sysbench or HammerDB TPROC-C) next to the analytics; batch tuning; decide on the deferred parallel prepare workers | Freshness target and capacity planning | missing |
+| Resource governance | Memory and thread limit per offloaded query, a cap on concurrent offloaded queries, DuckDB out-of-memory becomes an error or an InnoDB fallback, never a crash | DuckDB runs inside mysqld: a runaway query affects OLTP | partial (`duckdb_memory_limit`, `duckdb_threads`, KILL, `max_execution_time`) |
+| Backup and restore | XtraBackup integration, or a documented procedure that keeps the lake, its applied position and the InnoDB backup consistent | For history tables the lake is the only copy of purged rows | missing |
+| Refresh after DDL | Incremental refresh (ALTER ADD / DROP COLUMN applied in place) or a refresh that does not stop the applier for other tables | Today DDL on a large table means minutes of lag for every table | missing |
+| Performance proof | HammerDB TPROC-H at scale factor 1 and 10 on the release build (next step 4) | The business case | planned |
+
+Needed for general availability:
+
+| Item | What | Status |
 |---|---|---|
-| 1. POC | See POC scope | Features work end to end in MTR; measured speedup on a reference analytical workload versus InnoDB |
-| 2. Correctness | Type mapping, collation weight-string columns, function allow list, rejection and fallback, MTR result comparison, Clang build | Identical results with use_secondary_engine OFF and FORCED across the test suite |
-| 3. Propagation hardening | Crash tests, binlog gap detection, catch-up after duckdb_enable=FALSE, compaction and snapshot expiry, batch tuning, freshness policy | Copy stays consistent through crash tests; measured apply lag under write load |
-| 4. History retention complete | DROP PARTITION as purge, DUCKDB_HISTORY_READER privilege, in-place DDL, confirmed SECONDARY_UNLOAD, backup integration, encryption | Purged rows remain queryable in FULL scope; LIVE results still identical to InnoDB; backup and restore preserve history |
-| 5. Production readiness | Wider plan translation, resource governance, observability, packaging | Agreed workload runs on a staging environment within lag and memory targets |
+| Observability | Apply lag in seconds per table, offload ratio, refusal reasons aggregated (not only the last), lake size, Performance Schema instruments, PMM dashboards | partial (status variables, `INFORMATION_SCHEMA.DUCKDB_TABLES`) |
+| Packaging | One tarball; plugin size (about 1.5 GB with debug info, stripped release); ICU symbol clash between the server (ICU 77) and DuckDB's icu extension (hidden visibility, to test) | missing |
+| Security and compliance | Encryption (designed, keyring component), erasure requests against history copies (a purge keeps the personal data), privileges reviewed | designed |
+| Upgrade policy | DuckDB / DuckLake version upgrades and lake format migration (DuckLake has no release tags) | missing |
+| CI | MTR suite in CI, Clang build, ASAN / UBSAN runs of the applier and the offload | missing (MTR suite exists, 25 tests) |
+| Documentation | Operations guide (sizing, monitoring, failure scenarios), beyond HOWTO and TUTORIAL | partial |
+
+### SQL gaps by priority
+
+From the SQL coverage tracker; "common" means the gap appears in typical
+reporting and BI queries. Each one today sends the query to InnoDB.
+
+| Priority | Gap | Why | Effort |
+|---|---|---|---|
+| High | Grouped strings in joins, VARCHAR and non-binary collations | TPC-H Q16, Q22; `GROUP BY c.name` in joins is common | medium (next step 2) |
+| High | Window functions | In most modern analytic queries | large (ordering and peers must follow MySQL collations) |
+| High | CAST / CONVERT | Everywhere in ORMs and BI tools | medium (MySQL conversion rules, truncation) |
+| High | DATE_FORMAT, NOW() / CURRENT_DATE in expressions, TIMESTAMPDIFF | Reports format dates and filter relative to now | medium (locale-dependent formats) |
+| High | Functions on TIMESTAMP columns | Every TIMESTAMP column is cut off from date functions | medium (session time zone, as for constants) |
+| Medium | LIKE and string functions on `_ci` / non-binary collations | Most schemas use `utf8mb4_0900_ai_ci` | large, may stay partial |
+| Medium | ROLLUP / GROUPING SETS / GROUPING() | Report subtotals | medium |
+| Medium | STDDEV / VARIANCE, BIT_AND / OR / XOR, GROUP_CONCAT | Statistics; GROUP_CONCAT is very common in MySQL | small; medium for GROUP_CONCAT (separator, ORDER BY, `group_concat_max_len`) |
+| Medium | `<=>`, row constructors, string compared with a number | Generated SQL | small to medium |
+| Medium | TPC-H Q21 (equalities between EXISTS and NOT EXISTS) | Last TPC-H subquery gap | medium (next step 3) |
+| Low | UPPER / LOWER, REGEXP, WEEK, recursive CTEs, LATERAL, JSON_TABLE, JSON functions | Rarer in analytics or semantics hard to match | medium to large each |
+| Low | Unsigned subtraction, EXP / POW overflow errors | Edge cases | small |
 
 ## Risks
 
 - The secondary engine API, the external executor hook and the LEX methods used by the guard have no open-source production user in upstream MySQL and may change between releases without notice. Not changing core code means we depend on these internal interfaces from the plugin.
-- Silent wrong results from semantic gaps, mainly collations, are worse than slow results. Rejection must be the default.
+- Silent wrong results from semantic gaps, mainly collations, are worse than slow results. Rejection must be the default. Mitigated: weight columns, the exactness rule for every translated construct, OFF / FORCED comparison of every test query (no wrong result found in the TPC-H check, 2026-11-17).
 - A DuckDB fault or memory blowup inside mysqld affects the whole server, not only analytical sessions.
-- Change propagation under heavy update or delete load may not keep up, given the DuckDB cost for single-row changes; DuckLake writes a delete file and a new data file per update, and many small commits create many small files.
+- Change propagation under heavy update or delete load may not keep up, given the DuckDB cost for single-row changes; DuckLake writes a delete file and a new data file per update, and many small commits create many small files. Space of old versions and dropped copies is not reclaimed yet (phase 3).
+- A refresh after DDL reloads the whole table, and the applier waits for it: on large tables DDL means minutes of lag for all tables.
+- Benchmarks and tools that run with `autocommit=0` (HammerDB does for MySQL) get no offload: MySQL never uses a secondary engine inside a multi-statement transaction.
 - Binlog dependency: propagation needs binlog with ROW format, FULL image and GTIDs; binlog files purged before the applier reads them leave a gap.
 - History loss: a lake directory lost without backup, or an accidental SECONDARY_UNLOAD, destroys archived data permanently.
 - Compliance: an erasure request executed in a purge-tagged transaction keeps personal data in DuckDB.
@@ -458,13 +697,21 @@ Exit criterion: the five features work end to end in MTR, and a reference analyt
 
 ## Open questions
 
-- Under FULL scope, what statements that write and also read a history table do: read live data only, read the full history, or be rejected. The POC rejects them.
+Decided during development (kept for the record):
+
+- Write-and-read statements under FULL scope: rejected by the guard, including every UPDATE / DELETE / TRUNCATE of a history table (2026-11-16).
+- `__archived_at` is visible in the lake (readable offline); MySQL users see only the table's own columns.
+- After `duckdb_enable=FALSE` and back, the applier resumes from the applied position; after a binary log gap, `duckdb_apply_gap_action` decides.
+- Batch defaults: 1000 transactions, 100,000 rows, 1000 ms; `duckdb_apply_workers` deferred.
+- Tables with foreign keys: allowed when cascades are binlogged (`innodb_native_foreign_keys=OFF`, 2026-11-17).
+- A grouped string value shown in a join without the table's primary key (2026-11-17): CHAR under binary collations is exact (done); VARCHAR and non-binary collations: offload after a data check showing no ambiguous values (next step 2).
+- DECIMAL results declared above 38 digits (2026-11-17): computed as DECIMAL(38, scale); statements that could overflow run first; `duckdb_decimal_overflow` = FALLBACK (default, InnoDB answers), ROUND (fewer decimals with a warning), ERROR.
+
+Open:
+
 - How to expose the separate history name (orders_history) without core changes, if at all.
-- Which release we target in the end: 9.7 (current POC base) or 8.4 LTS, where the external executor hook and the secondary-only statement mechanism must be confirmed.
-- Whether the archive mark column (__archived_at) is visible to users in FULL scope.
+- Which release we target in the end: 9.7 (current POC base) or 8.4 LTS, where the external executor hook, `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`, the SQL-layer foreign keys and the secondary-only statement mechanism must be confirmed.
 - How to handle tables without a primary key (excluded for now).
-- After `duckdb_enable=FALSE` and back to TRUE, or after a binlog gap: catch up from the applied position or mark tables stale and require a reload.
-- Defaults for `duckdb_apply_batch_max_trx`, `_max_rows`, `_max_delay_ms`, and whether `duckdb_apply_workers` is dynamic.
 - DuckLake encryption support and the crypto library before implementing encryption.
 - Packaging: separate package or part of the server packages (everything in one tarball either way).
 

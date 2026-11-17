@@ -267,6 +267,34 @@ bool lake_columns(duckdb_connection c, const std::string &db,
   return false;
 }
 
+// Foreign keys. Since 9.x MySQL runs foreign key checks and cascades in the
+// SQL layer by default (innodb_native_foreign_keys=OFF,
+// sql/sql_foreign_key_constraint.cc): a cascaded DELETE, UPDATE or SET NULL
+// changes the child rows through the handler and writes them to the binary
+// log as row events (verified), so the applier sees every change and any
+// foreign key is fine. With innodb_native_foreign_keys=ON InnoDB applies
+// cascades itself and does not log them: a table whose rows a cascade can
+// change (the child of a CASCADE / SET NULL / SET DEFAULT key) would miss
+// changes. Parent tables and RESTRICT / NO ACTION children are fine either
+// way. Returns the reason to refuse, or "".
+std::string cascading_foreign_key(const TABLE_SHARE &share) {
+  if (!innodb_native_foreign_keys) return "";
+  auto cascades = [](dd::Foreign_key::enum_rule r) {
+    return r == dd::Foreign_key::RULE_CASCADE ||
+           r == dd::Foreign_key::RULE_SET_NULL ||
+           r == dd::Foreign_key::RULE_SET_DEFAULT;
+  };
+  for (uint i = 0; i < share.foreign_keys; i++) {
+    const TABLE_SHARE_FOREIGN_KEY_INFO &fk = share.foreign_key[i];
+    if (cascades(fk.delete_rule) || cascades(fk.update_rule))
+      return std::string("foreign key ") + fk.fk_name.str +
+             " has a cascading action (CASCADE / SET NULL / SET DEFAULT) and "
+             "innodb_native_foreign_keys=ON: InnoDB does not write cascaded "
+             "changes to the binary log, so the DuckDB copy would miss them";
+  }
+  return "";
+}
+
 // Archived rows of the old copy into the new one: columns by name (following
 // renames), converted with CAST to the new types; columns new to the table
 // are NULL in archived rows (they did not exist then). A value that cannot be
@@ -579,8 +607,8 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
   // Preconditions (DWL#3).
   if (table.s->primary_key == MAX_KEY)
     return report("SECONDARY_LOAD requires a primary key");
-  if (table.s->foreign_keys > 0 || table.s->foreign_key_parents > 0)
-    return report("tables with foreign keys are not supported");
+  if (const std::string fk = cascading_foreign_key(*table.s); !fk.empty())
+    return report(fk);
   bool retain_history;
   std::string adopt_spec;
   if (parse_attributes(*table.s, &retain_history, &adopt_spec, &err))

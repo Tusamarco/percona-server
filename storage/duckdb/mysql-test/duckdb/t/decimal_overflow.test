@@ -1,0 +1,60 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# DECIMAL results MySQL declares above DuckDB's 38 digits (2026-11-17):
+# computed as DECIMAL(38, scale), the statement runs in DuckDB first;
+# duckdb_decimal_overflow decides what an overflow does: FALLBACK (InnoDB;
+# FORCED: error), ROUND (fewer decimals, warning), ERROR (DuckDB's error).
+--source ../include/have_duckdb.inc
+SELECT @@duckdb_decimal_overflow;
+CREATE TABLE big (id INT PRIMARY KEY, a DECIMAL(38,0), b DECIMAL(30,2)) SECONDARY_ENGINE = duckdb;
+INSERT INTO big VALUES (1, 99999999999999999999999999999999999999, 1234567890123456789012345678.12),
+  (2, 99999999999999999999999999999999999999, 1.50), (3, 1000000000000000000000000000000, 7.25);
+ALTER TABLE big SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+--echo # Declared wide, values that fit: DuckDB, the same as InnoDB
+--let $query= SELECT id, b / 3, a * 0 + b FROM big WHERE id IN (2, 3) ORDER BY id
+--source ../include/duckdb_compare.inc
+
+--echo # FALLBACK (default): ON gives InnoDB's values, FORCED the reason
+SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
+SELECT SUM(a) FROM big WHERE id <= 2;
+SELECT id, a / 3 FROM big WHERE id = 3;
+SET SESSION use_secondary_engine = FORCED;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT SUM(a) FROM big WHERE id <= 2;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT id, a / 3 FROM big WHERE id = 3;
+
+--echo # ROUND: fewer decimals with a warning when that makes the value fit
+SET SESSION duckdb_decimal_overflow = ROUND;
+SELECT id, a / 3 FROM big WHERE id = 3;
+--echo # ... otherwise as FALLBACK (the overflow is in DuckDB's own sum)
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT SUM(a) FROM big WHERE id <= 2;
+--echo # per statement, with ON: InnoDB answers
+SET SESSION use_secondary_engine = ON;
+SELECT /*+ SET_VAR(duckdb_decimal_overflow = FALLBACK) */ id FROM big WHERE id = 3 AND a / 3 > 0;
+
+--echo # ERROR: no first run, DuckDB's error also with ON
+SET SESSION duckdb_decimal_overflow = ERROR, use_secondary_engine = ON;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT SUM(a) FROM big WHERE id <= 2;
+
+SET SESSION duckdb_decimal_overflow = DEFAULT, use_secondary_engine = DEFAULT,
+  secondary_engine_cost_threshold = DEFAULT;
+DROP TABLE big;
+--source ../include/cleanup.inc

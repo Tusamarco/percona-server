@@ -46,10 +46,16 @@ default 15-minute limit: add `--testcase-timeout=45`.
 | `i_s_tables` | INFORMATION_SCHEMA.DUCKDB_TABLES: states, RENAME, stale history copy, unload, PROCESS privilege, lake closed (35) |
 | `super_read_only` | refresh after DDL with `super_read_only=ON` (a replica), user statements refused (18) |
 | `cached_tables` | cached secondary tables across unload / reload, duckdb_enable, DROP (27) |
+| `decimal_overflow` | DECIMAL results declared above 38 digits: run first, FALLBACK / ROUND / ERROR, ON and FORCED |
+| `foreign_keys` | tables with foreign keys: ON DELETE / ON UPDATE CASCADE, SET NULL, RESTRICT; tagged purge archives cascaded history rows |
+| `transactions` | autocommit=0 and BEGIN: no secondary engine, FORCED gives the reason (was a debug assertion) |
 | `offload_rules` | cost threshold, duckdb_offload_min_rows, read your own writes, transaction that wrote, EXPLAIN notes, max_execution_time (21, 27, 28, 30) |
 | `offload_6a`, `offload_6b`, `offload_6c1`, `offload_6c2`, `offload_6c3`, `offload_division`, `offload_weights` | the query lists `project_duckdb/duckdb_offload_*_queries.sql`, InnoDB vs DuckDB |
 | `offload_time` | TIME: constants in every form, negative and > 24 h values, fractions, refusals (37) |
 | `offload_enum` | ENUM and SET: value and index contexts, invalid value, history copy across a definition change, refusals (38) |
+| `offload_like` | LIKE on binary collations (latin1_bin, utf8mb4_bin): trailing spaces, case, accents, escapes, NO_BACKSLASH_ESCAPES; LIKE on _ci refused (40) |
+| `offload_grouped_char` | grouped CHAR under binary collations shown in a join (exact); VARCHAR and _ci refused; PAD_CHAR_TO_FULL_LENGTH refused (41) |
+| `offload_functions` | functions reviewed against DuckDB: date, number and string functions with edge values; the refused ones (42) |
 | `offload_yb` | YEAR and BIT: load, applier, results (YEAR columns zero-filled, BIT as bytes), unsigned arithmetic, refusals (36) |
 | `offload_refusals` | the refusal lists `duckdb_offload_*_refusals.sql` |
 

@@ -10,9 +10,9 @@ Got one of the listed errors
 SET SESSION use_secondary_engine = FORCED;
 SELECT COUNT(*) FROM p6 WHERE raw LIKE 'k_';
 Got one of the listed errors
-# SELECT id, TRUNCATE(amount, 1) FROM p6 WHERE id <= 5 ORDER BY id
+# SELECT id, EXP(amount / 100) FROM p6 WHERE id <= 5 ORDER BY id
 SET SESSION use_secondary_engine = FORCED;
-SELECT id, TRUNCATE(amount, 1) FROM p6 WHERE id <= 5 ORDER BY id;
+SELECT id, EXP(amount / 100) FROM p6 WHERE id <= 5 ORDER BY id;
 Got one of the listed errors
 # SELECT id, ROUND(price) FROM p6 WHERE id <= 5 ORDER BY id
 SET SESSION use_secondary_engine = FORCED;

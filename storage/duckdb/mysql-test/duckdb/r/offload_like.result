@@ -1,0 +1,31 @@
+# SELECT id FROM lt WHERE v LIKE 'abc' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE 'abc%' ORDER BY id
+# SELECT id FROM lt WHERE c LIKE 'abc' ORDER BY id
+# SELECT id FROM lt WHERE c LIKE 'abc %' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE 'ABC' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE 'caf_' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE '_uro' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE '%é' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE 'a\_b\%c' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE 'a!_b%' ESCAPE '!' ORDER BY id
+# SELECT id FROM lt WHERE v NOT LIKE '%b%' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE '' ORDER BY id
+# SELECT id, v LIKE 'ab_' FROM lt ORDER BY id
+# SELECT id FROM lt WHERE u LIKE 'abc' ORDER BY id
+# SELECT COUNT(*) FROM lt WHERE c LIKE '%' AND v LIKE '%'
+# SELECT id FROM lt WHERE v LIKE 'a\\b' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE 'a\%' ORDER BY id
+# SELECT id FROM lt WHERE u LIKE 'a\_b%' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE 'a|_b%' ESCAPE '|' ORDER BY id
+# NO_BACKSLASH_ESCAPES: no escape character
+SET @old_mode = @@SESSION.sql_mode;
+SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES');
+# SELECT id FROM lt WHERE v LIKE 'a\b' ORDER BY id
+# SELECT id FROM lt WHERE v LIKE 'a\%' ORDER BY id
+SET SESSION sql_mode = @old_mode;
+# Refused
+# SELECT id FROM lt WHERE v LIKE _latin1'ABC' COLLATE latin1_general_ci ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id FROM lt WHERE v LIKE _latin1'ABC' COLLATE latin1_general_ci ORDER BY id;
+Got one of the listed errors
+DROP TABLE lt;

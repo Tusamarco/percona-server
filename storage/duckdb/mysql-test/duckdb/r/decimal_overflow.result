@@ -1,0 +1,44 @@
+SELECT @@duckdb_decimal_overflow;
+@@duckdb_decimal_overflow
+FALLBACK
+CREATE TABLE big (id INT PRIMARY KEY, a DECIMAL(38,0), b DECIMAL(30,2)) SECONDARY_ENGINE = duckdb;
+INSERT INTO big VALUES (1, 99999999999999999999999999999999999999, 1234567890123456789012345678.12),
+(2, 99999999999999999999999999999999999999, 1.50), (3, 1000000000000000000000000000000, 7.25);
+ALTER TABLE big SECONDARY_LOAD;
+# Declared wide, values that fit: DuckDB, the same as InnoDB
+# SELECT id, b / 3, a * 0 + b FROM big WHERE id IN (2, 3) ORDER BY id
+# FALLBACK (default): ON gives InnoDB's values, FORCED the reason
+SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
+SELECT SUM(a) FROM big WHERE id <= 2;
+SUM(a)
+199999999999999999999999999999999999998
+SELECT id, a / 3 FROM big WHERE id = 3;
+id	a / 3
+3	333333333333333333333333333333.3333
+SET SESSION use_secondary_engine = FORCED;
+SELECT SUM(a) FROM big WHERE id <= 2;
+ERROR HY000: the DuckDB secondary engine cannot run this query: decimal_overflow: a DECIMAL value exceeds DuckDB's 38 digits (duckdb_decimal_overflow=FALLBACK): Out of Range Error: Overflow in HUGEINT addition: 99999999999999999999999999999999999999 + 99999999999999999999999999999999999999
+SELECT id, a / 3 FROM big WHERE id = 3;
+ERROR HY000: the DuckDB secondary engine cannot run this query: decimal_overflow: a DECIMAL value exceeds DuckDB's 38 digits (duckdb_decimal_overflow=FALLBACK): Out of Range Error: Overflow in multiplication of INT128 (1000000000000000000000000000000 * 1000000000)!
+# ROUND: fewer decimals with a warning when that makes the value fit
+SET SESSION duckdb_decimal_overflow = ROUND;
+SELECT id, a / 3 FROM big WHERE id = 3;
+id	a / 3
+3	333333333333333333333333333333.3330
+Warnings:
+Warning	3877	DuckDB: DECIMAL results rounded to 3 decimals: a value exceeds DuckDB's 38 digits with 4 decimals (duckdb_decimal_overflow=ROUND)
+# ... otherwise as FALLBACK (the overflow is in DuckDB's own sum)
+SELECT SUM(a) FROM big WHERE id <= 2;
+ERROR HY000: the DuckDB secondary engine cannot run this query: decimal_overflow: a DECIMAL value exceeds DuckDB's 38 digits, also with fewer decimals (the overflow is in DuckDB's own arithmetic; duckdb_decimal_overflow=ROUND)
+# per statement, with ON: InnoDB answers
+SET SESSION use_secondary_engine = ON;
+SELECT /*+ SET_VAR(duckdb_decimal_overflow = FALLBACK) */ id FROM big WHERE id = 3 AND a / 3 > 0;
+id
+3
+# ERROR: no first run, DuckDB's error also with ON
+SET SESSION duckdb_decimal_overflow = ERROR, use_secondary_engine = ON;
+SELECT SUM(a) FROM big WHERE id <= 2;
+ERROR HY000: DuckDB error: Out of Range Error: Overflow in HUGEINT addition: 99999999999999999999999999999999999999 + 99999999999999999999999999999999999999
+SET SESSION duckdb_decimal_overflow = DEFAULT, use_secondary_engine = DEFAULT,
+secondary_engine_cost_threshold = DEFAULT;
+DROP TABLE big;

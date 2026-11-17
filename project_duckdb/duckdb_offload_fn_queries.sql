@@ -1,0 +1,49 @@
+-- Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+--
+-- This program is free software; you can redistribute it and/or modify
+-- it under the terms of the GNU General Public License as published by
+-- the Free Software Foundation; version 2 of the License.
+--
+-- This program is distributed in the hope that it will be useful,
+-- but WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-- GNU General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License
+-- along with this program; if not, write to the Free Software
+-- Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+--
+-- Functions reviewed against DuckDB (table fx of duckdb_offload_setup.sql):
+-- each must give the same result with OFF and FORCED, edge values included.
+-- dates
+SELECT id, EXTRACT(YEAR FROM dt), EXTRACT(QUARTER FROM dt), EXTRACT(MONTH FROM dt), EXTRACT(DAY FROM dt), EXTRACT(YEAR_MONTH FROM dt) FROM fx ORDER BY id
+SELECT id, EXTRACT(HOUR FROM t6), EXTRACT(MINUTE FROM t6), EXTRACT(SECOND FROM t6), EXTRACT(MICROSECOND FROM t6), EXTRACT(HOUR FROM dt) FROM fx ORDER BY id
+SELECT id, EXTRACT(DAY_HOUR FROM ts), EXTRACT(DAY_MINUTE FROM ts), EXTRACT(DAY_SECOND FROM ts), EXTRACT(HOUR_MINUTE FROM ts), EXTRACT(HOUR_SECOND FROM ts), EXTRACT(MINUTE_SECOND FROM ts) FROM fx ORDER BY id
+SELECT id, EXTRACT(DAY_MICROSECOND FROM t6), EXTRACT(HOUR_MICROSECOND FROM t6), EXTRACT(MINUTE_MICROSECOND FROM t6), EXTRACT(SECOND_MICROSECOND FROM t6) FROM fx ORDER BY id
+SELECT EXTRACT(YEAR FROM dt) AS y, COUNT(*) FROM fx GROUP BY y ORDER BY y
+SELECT id, dt + INTERVAL 1 MONTH, dt - INTERVAL 1 MONTH, DATE_ADD(dt, INTERVAL 1 YEAR), DATE_SUB(dt, INTERVAL 2 QUARTER), ADDDATE(dt, INTERVAL 3 WEEK) FROM fx ORDER BY id
+SELECT id, dt + INTERVAL 1 DAY, dt - INTERVAL 1 DAY, dt + INTERVAL 5 HOUR, ts + INTERVAL 90 MINUTE, ts - INTERVAL 3600 SECOND FROM fx ORDER BY id
+SELECT id, t6 + INTERVAL 1 MICROSECOND, SUBDATE(ts, INTERVAL 1 DAY), dt + INTERVAL n DAY FROM fx ORDER BY id
+SELECT id, dt - INTERVAL 999 YEAR, dt - INTERVAL 1000 YEAR, dt - INTERVAL 1001 YEAR, dt + INTERVAL 1 YEAR FROM fx WHERE id IN (4, 5) ORDER BY id
+SELECT id FROM fx WHERE dt + INTERVAL 30 DAY > '2024-03-01' ORDER BY id
+SELECT id, DATEDIFF(dt, '2024-01-01'), DATEDIFF(ts, dt), TO_DAYS(dt), LAST_DAY(dt), LAST_DAY(ts) FROM fx ORDER BY id
+SELECT id, DAYNAME(dt), MONTHNAME(ts) FROM fx ORDER BY id
+-- numbers
+SELECT id, FLOOR(d), CEILING(d), CEIL(f), FLOOR(f), FLOOR(n), SIGN(d), SIGN(f), SIGN(n) FROM fx ORDER BY id
+SELECT id, TRUNCATE(d, 1), TRUNCATE(d, 0), TRUNCATE(d, -1), TRUNCATE(n, -1), TRUNCATE(n, 2) FROM fx ORDER BY id
+SELECT id, SQRT(f), LN(f), LOG(f), LOG2(d), LOG10(n), SQRT(n) FROM fx ORDER BY id
+SELECT id, GREATEST(n, 3, id), LEAST(d, 1.5), GREATEST(f, 0), LEAST(n, NULL) FROM fx ORDER BY id
+-- strings
+SELECT id, CHAR_LENGTH(s), CHAR_LENGTH(sl), CHAR_LENGTH(ch), LENGTH(s), LENGTH(sc), OCTET_LENGTH(ch) FROM fx ORDER BY id
+SELECT id, SUBSTRING(s, 2), SUBSTRING(s, 2, 3), SUBSTRING(s, 0), SUBSTRING(s, -3), SUBSTRING(s, -20), SUBSTRING(s, 2, 0), SUBSTRING(s, 2, -1) FROM fx ORDER BY id
+SELECT id, SUBSTR(sl, 1, 2), MID(s, 3, 2), LEFT(s, 2), LEFT(s, 0), LEFT(s, -1), RIGHT(s, 3), RIGHT(s, 0), RIGHT(sl, 20) FROM fx ORDER BY id
+SELECT id, CONCAT(s, '-', sl), CONCAT(s, n), CONCAT(d, '/', dt), CONCAT(ts), CONCAT('x', NULL), CONCAT_WS(',', s, NULL, n), CONCAT_WS(NULL, s) FROM fx ORDER BY id
+SELECT id, TRIM(s), LTRIM(s), RTRIM(s), TRIM(BOTH 'x' FROM s), TRIM(LEADING 'x' FROM s), TRIM(TRAILING 'x' FROM s) FROM fx ORDER BY id
+SELECT id, REPLACE(s, 'l', 'LL'), REPLACE(sc, 'a', ''), REPLACE(s, '', 'z'), REVERSE(s), REVERSE(sl) FROM fx ORDER BY id
+SELECT id, LPAD(s, 8, '*'), RPAD(s, 8, 'ab'), LPAD(s, 2, '*'), LPAD(s, -1, '*'), LPAD(s, 8, ''), RPAD(sl, 3, '') FROM fx ORDER BY id
+SELECT id, INSTR(s, 'l'), INSTR(s, ''), LOCATE('b', s), LOCATE('ö', s), INSTR(ch, 'x') FROM fx ORDER BY id
+-- in conditions, grouping, ordering
+SELECT id FROM fx WHERE SUBSTR(sl, 1, 2) IN ('13', 'he', 'xx') ORDER BY id
+SELECT CHAR_LENGTH(s) AS l, COUNT(*) FROM fx GROUP BY l ORDER BY l
+SELECT id, s FROM fx ORDER BY SUBSTRING(s, 2), id
+SELECT id FROM fx WHERE CHAR_LENGTH(s) > 5 AND EXTRACT(MONTH FROM dt) IN (1, 2, 12) ORDER BY id

@@ -1,0 +1,48 @@
+SELECT @@innodb_native_foreign_keys;
+@@innodb_native_foreign_keys
+0
+GRANT DUCKDB_HISTORY_READER ON *.* TO root@localhost;
+CREATE TABLE fp (id INT PRIMARY KEY, name VARCHAR(10)) SECONDARY_ENGINE = duckdb;
+CREATE TABLE fd (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES fp(id) ON DELETE CASCADE) SECONDARY_ENGINE = duckdb;
+CREATE TABLE fu (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES fp(id) ON UPDATE CASCADE) SECONDARY_ENGINE = duckdb;
+CREATE TABLE fn (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES fp(id) ON DELETE SET NULL) SECONDARY_ENGINE = duckdb;
+CREATE TABLE fr (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES fp(id)) SECONDARY_ENGINE = duckdb;
+CREATE TABLE fh (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES fp(id) ON DELETE CASCADE) SECONDARY_ENGINE = duckdb
+SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO fp VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+INSERT INTO fd VALUES (10,1),(11,1),(12,5);
+INSERT INTO fu VALUES (20,2),(21,5);
+INSERT INTO fn VALUES (30,3),(31,5);
+INSERT INTO fr VALUES (50,5);
+INSERT INTO fh VALUES (40,4),(41,4),(42,5);
+ALTER TABLE fp SECONDARY_LOAD;
+ALTER TABLE fd SECONDARY_LOAD;
+ALTER TABLE fu SECONDARY_LOAD;
+ALTER TABLE fn SECONDARY_LOAD;
+ALTER TABLE fr SECONDARY_LOAD;
+ALTER TABLE fh SECONDARY_LOAD;
+DELETE FROM fp WHERE id = 1;
+UPDATE fp SET id = 7 WHERE id = 2;
+DELETE FROM fp WHERE id = 3;
+DELETE FROM fp WHERE id = 5;
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`fu`, CONSTRAINT `fu_ibfk_1` FOREIGN KEY (`pid`) REFERENCES `fp` (`id`) ON UPDATE CASCADE)
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
+DELETE FROM fp WHERE id = 4;
+SET gtid_next = 'AUTOMATIC';
+# SELECT * FROM fp ORDER BY id
+# SELECT * FROM fd ORDER BY id
+# SELECT * FROM fu ORDER BY id
+# SELECT * FROM fn ORDER BY id
+# SELECT * FROM fh ORDER BY id
+# the cascaded rows of the tagged purge are archived
+SET SESSION duckdb_history_scope = FULL;
+SELECT * FROM fh ORDER BY id;
+id	pid
+40	4
+41	4
+42	5
+SET SESSION duckdb_history_scope = LIVE, duckdb_unload_history_confirm = ON;
+ALTER TABLE fh SECONDARY_UNLOAD;
+SET SESSION duckdb_unload_history_confirm = OFF;
+DROP TABLE fh, fd, fu, fn, fr, fp;
+REVOKE DUCKDB_HISTORY_READER ON *.* FROM root@localhost;

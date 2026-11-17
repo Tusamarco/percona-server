@@ -3,6 +3,7 @@ FROM information_schema.PLUGINS WHERE PLUGIN_NAME LIKE 'duckdb%' ORDER BY 1;
 PLUGIN_NAME	PLUGIN_STATUS	PLUGIN_TYPE	PLUGIN_AUTHOR
 duckdb	ACTIVE	STORAGE ENGINE	Marco Tusa
 duckdb_guard	ACTIVE	AUDIT	Marco Tusa
+DUCKDB_TABLES	ACTIVE	INFORMATION SCHEMA	Marco Tusa
 SELECT ENGINE, SUPPORT FROM information_schema.ENGINES WHERE ENGINE = 'DUCKDB';
 ENGINE	SUPPORT
 duckdb	YES
@@ -20,6 +21,7 @@ duckdb_apply_debug_log
 duckdb_apply_gap_action
 duckdb_apply_start_position
 duckdb_data_path
+duckdb_decimal_overflow
 duckdb_discard_stale_copy
 duckdb_enable
 duckdb_encryption

@@ -59,6 +59,8 @@
 #include "sql/sql_lex.h"
 #include "sql/sql_optimizer.h"
 #include "sql/table.h"
+#include "sql/item_timefunc.h"  // Item_extract, Item_func_add_interval
+#include "sql/sql_locale.h"     // MY_LOCALE (lc_time_names)
 #include "sql/tztime.h"
 #include "storage/duckdb/duckdb_binlog_reader.h"
 #include "storage/duckdb/duckdb_collation.h"
@@ -170,6 +172,8 @@ class OffloadContext : public Secondary_engine_execution_context {
       con->execute_cleanup(
           [this](duckdb_connection, std::string *) {
             if (stmt != nullptr) duckdb_destroy_prepare(&stmt);
+            if (have_pre_result) duckdb_destroy_result(&pre_result);
+            have_pre_result = false;
             return false;
           },
           &ignored);
@@ -182,6 +186,11 @@ class OffloadContext : public Secondary_engine_execution_context {
   bool executed{false};
   std::unique_ptr<Lake::Connection> con;
   duckdb_prepared_statement stmt{nullptr};
+  // A statement with DECIMAL values declared above 38 digits ran during
+  // optimization (duckdb_decimal_overflow): its materialized result, sent by
+  // execute_offloaded().
+  duckdb_result pre_result;
+  bool have_pre_result{false};
 
   // Semi-join materialization is turned off while the server optimizes a
   // statement for us: that strategy rewrites WHERE to read its own
@@ -351,11 +360,31 @@ class Generator {
 
   bool generate(LEX *lex, std::string *sql, std::vector<Kind> *kinds);
 
+  // DECIMAL values MySQL declares with more than 38 digits: computed in
+  // DuckDB as DECIMAL(38, scale), exact while the values fit (OffloadContext
+  // runs such statements first, duckdb_decimal_overflow).
+  bool decimal_wide() const { return m_decimal_wide; }
+  // duckdb_decimal_overflow=ROUND, after an overflow: DECIMAL results keep
+  // at most this many decimals (-1: all).
+  void set_decimal_scale_cap(int cap) { m_scale_cap = cap; }
+  int decimal_max_scale() const { return m_max_scale; }
+
  private:
   bool refuse(const std::string &why) {
     *m_reason = why;
     return true;
   }
+  // DECIMAL(38, scale) for a DECIMAL result, with the ROUND cap.
+  std::string dec38(unsigned scale) {
+    m_max_scale = std::max(m_max_scale, static_cast<int>(scale));
+    const unsigned s = m_scale_cap >= 0
+                           ? std::min(scale, static_cast<unsigned>(m_scale_cap))
+                           : scale;
+    return "DECIMAL(38," + std::to_string(s) + ")";
+  }
+  bool m_decimal_wide{false};
+  int m_scale_cap{-1};
+  int m_max_scale{0};
   bool refuse_collation(const Item *item) {
     const char *name = item->type() == Item::FIELD_ITEM
                            ? down_cast<const Item_field *>(item)->field_name
@@ -375,7 +404,7 @@ class Generator {
   int division_frac(int f1, int f2) const;
   bool internal_frac(Item *item, int *frac);
   bool exact_division(const std::string &a, int f1, const std::string &b,
-                      int f2, int round_to, std::string *out);
+                      int f2, int round_to, int a_digits, std::string *out);
   bool temporal_arg(Item *item, std::string *out);
   bool order_key(Item *item, std::string *out);
   bool enum_index(Item *item, std::string *out);
@@ -666,6 +695,17 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
       const double v = a->val_real();
       snprintf(buf, sizeof(buf), "CAST(%.17g AS DOUBLE)", v);
       s = a->null_value ? "NULL" : buf;
+    } else if (strings && is_string(a) && !ordering &&
+               str_mode_cs(cs) == StrMode::WEIGHT &&
+               (cs->state & MY_CS_BINSORT) != 0) {
+      // =, <>, IN under a binary collation of another character set
+      // (latin1_bin): equal means the same characters (apart from trailing
+      // spaces under PAD SPACE), which the UTF-8 copy keeps one to one, so
+      // no weight is needed and expressions (SUBSTR) work; ordering keeps
+      // the weights (the character set's byte order is not UTF-8's).
+      std::string e;
+      failed = expr(a, &e);
+      s = cs->pad_attribute == NO_PAD ? e : pad_equal_key(e);
     } else if (strings && is_string(a)) {
       // The comparison key of the collation: bytes, rtrim / padded key, or
       // MySQL's weight.
@@ -718,11 +758,23 @@ bool Generator::internal_frac(Item *item, int *frac) {
 // too large for 128 bits is a DuckDB error, never a wrong value.
 bool Generator::exact_division(const std::string &a, int f1,
                                const std::string &b, int f2, int round_to,
-                               std::string *out) {
-  const int F = division_frac(f1, f2);
-  const int shift = F - f1 + f2;
-  if (F > 36 || shift < 0 || f1 > 18 || f2 > 18)
+                               int a_digits, std::string *out) {
+  const int F_mysql = division_frac(f1, f2);
+  if (F_mysql > 36 || F_mysql - f1 + f2 < 0 || f1 > 18 || f2 > 18)
     return refuse("exact_division_precision");
+  // duckdb_decimal_overflow=ROUND after an overflow: the quotient is
+  // computed with one digit more than the kept decimals (then rounded), so
+  // the scaled HUGEINT intermediate is smaller.
+  const int kept_mysql = round_to >= 0 && round_to < F_mysql ? round_to : F_mysql;
+  m_max_scale = std::max(m_max_scale, kept_mysql);
+  int F = F_mysql;
+  if (m_scale_cap >= 0 && m_scale_cap + 1 < F)
+    F = std::max(m_scale_cap + 1, f1 - f2);
+  const int shift = F - f1 + f2;
+  // The dividend (a_digits digits) times 10^shift is a 128-bit integer:
+  // above 38 digits a large value overflows, so the statement runs first
+  // (duckdb_decimal_overflow), whatever precision MySQL declares.
+  if (a_digits + F_mysql - f1 + f2 > 38) m_decimal_wide = true;
   auto pow10 = [](int n) {
     return "CAST('1" + std::string(static_cast<size_t>(n), '0') +
            "' AS HUGEINT)";
@@ -753,6 +805,11 @@ bool Generator::exact_division(const std::string &a, int f1,
   // DuckDB's DECIMAL cast rounds half away from zero, as MySQL's HALF_UP.
   if (round_to >= 0 && round_to < F)
     value = "CAST(" + value + " AS DECIMAL(38," + std::to_string(round_to) +
+            "))";
+  // duckdb_decimal_overflow=ROUND after an overflow: fewer decimals.
+  if (m_scale_cap >= 0 && m_scale_cap < kept_mysql &&
+      m_scale_cap < (round_to >= 0 && round_to < F ? round_to : F))
+    value = "CAST(" + value + " AS DECIMAL(38," + std::to_string(m_scale_cap) +
             "))";
   *out = "(CASE WHEN " + B + " = 0 THEN NULL ELSE " + value + " END)";
   return false;
@@ -982,9 +1039,19 @@ bool Generator::string_key(Item *item, const CHARSET_INFO *cs, bool ordering,
 // with the smallest primary key; when GROUP BY contains the column's
 // table's primary key every row of the group has the same value; otherwise
 // (a join) the first row depends on the join order: refused (decided
-// 2026-11-14: exactly as InnoDB).
+// 2026-11-14: exactly as InnoDB). Exception (2026-11-17): a CHAR column
+// under a binary collation: MySQL reads CHAR without trailing spaces (the
+// copy stores it so, from the load and from the binary log, where
+// Field_string::pack strips them), so values equal under the PAD SPACE
+// binary comparison are byte-identical: every row of a group shows the
+// same value, whichever InnoDB meets first.
 bool Generator::grouped_value(const Field *field, const TableInfo &ti,
                               const std::string &col, std::string *out) {
+  if (field != nullptr && field->real_type() == MYSQL_TYPE_STRING &&
+      (field->charset()->state & MY_CS_BINSORT) != 0) {
+    *out = "any_value(" + col + ")";
+    return false;
+  }
   bool pk_grouped = !ti.pk_fields.empty();
   for (const Field *k : ti.pk_fields)
     pk_grouped = pk_grouped && m_block->grouped.count(k) > 0;
@@ -996,7 +1063,6 @@ bool Generator::grouped_value(const Field *field, const TableInfo &ti,
     *out = "arg_min(" + col + ", " + ti.pk + ")";
     return false;
   }
-  (void)field;
   return refuse("grouped_string_value_in_join");
 }
 
@@ -1058,9 +1124,12 @@ bool Generator::aggregate(Item_sum *s, std::string *out) {
       // (Item_sum_avg): the same exact division as `/`.
       // AVG keeps the truncated digits (Item_sum_avg::val_decimal does not
       // round; the output does).
+      // The sum has at most the argument's digits plus 19 (row count).
       return exact_division("sum(" + d + a + ")",
                             static_cast<int>(arg->decimals),
-                            "count(" + d + a + ")", 0, -1, out);
+                            "count(" + d + a + ")", 0, -1,
+                            static_cast<int>(arg->decimal_precision()) + 19,
+                            out);
     }
     case Item_sum::MIN_FUNC:
     case Item_sum::MAX_FUNC: {
@@ -1155,7 +1224,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
   };
   auto arith = [&](const char *op) {
     if (fn->result_type() == DECIMAL_RESULT && fn->decimal_precision() > 38)
-      return refuse("decimal_precision_above_38");
+      m_decimal_wide = true;
     if (fn->result_type() == INT_RESULT && fn->unsigned_flag &&
         (op[0] == '+' || op[0] == '*'))
       return unsigned_arith(args[0], args[1], op[0], out);
@@ -1166,8 +1235,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
     // (Item_func_numhybrid::val_decimal): it matters when an operand has
     // more digits (AVG).
     if (fn->result_type() == DECIMAL_RESULT)
-      *out = "CAST(" + *out + " AS DECIMAL(38," +
-             std::to_string(fn->decimals) + "))";
+      *out = "CAST(" + *out + " AS " + dec38(fn->decimals) + ")";
     return false;
   };
   switch (fn->functype()) {
@@ -1239,25 +1307,37 @@ bool Generator::function(Item_func *fn, std::string *out) {
       if (!is_string(a) || a->const_item()) return refuse("like_argument");
       if (a->collation.collation == &my_charset_bin)
         return refuse("like_on_binary_string");
-      // LIKE compares characters: not with weights.
-      if (str_mode(a) != StrMode::RAW && str_mode(a) != StrMode::PAD)
+      // LIKE compares characters, not weights, and never pads ('a ' LIKE
+      // 'a' is false also under PAD SPACE). Under a binary collation of any
+      // character set (latin1_bin, utf8mb4_bin, gbk_bin ...) a character
+      // matches only itself, and the copy holds each value converted to
+      // UTF-8 character by character: DuckDB's LIKE on it is MySQL's. The
+      // collation is the LIKE's own (a COLLATE clause can change it).
+      const CHARSET_INFO *like_cs = fn->compare_collation();
+      if (like_cs == nullptr) like_cs = a->collation.collation;
+      const bool binary_like = (like_cs->state & MY_CS_BINSORT) != 0;
+      if (!binary_like && str_mode(a) != StrMode::RAW &&
+          str_mode(a) != StrMode::PAD)
         return refuse_collation(a);
       if (!args[1]->const_item() || !is_string(args[1]->real_item()))
         return refuse("like_pattern_not_constant");
       // Trailing spaces are significant in LIKE, PAD SPACE or not.
       std::string s, p;
       if (expr(a, &s) || literal(args[1]->real_item(), &p)) return true;
+      // The escape character MySQL uses: the ESCAPE clause, else '\\'
+      // (none under NO_BACKSLASH_ESCAPES), Item_func_like::eval_escape_clause.
+      // DuckDB's LIKE has no default escape: we always name it.
+      auto *like = down_cast<Item_func_like *>(fn);
+      if (n > 2 && !args[2]->const_item())
+        return refuse("like_escape_not_constant");
+      if (!like->escape_is_evaluated()) return refuse("like_escape");
+      const int esc = like->escape();
       std::string escape;
-      if (n > 2) {
-        if (!args[2]->const_item()) return refuse("like_escape_not_constant");
-        String buf;
-        String *e = args[2]->val_str(&buf);
-        if (e != nullptr && e->length() > 0) {
-          if (e->length() != 1) return refuse("like_escape");
-          const char c = e->ptr()[0];
-          escape = c == '\'' ? " ESCAPE ''''" : std::string(" ESCAPE '") + c +
-                                                    "'";
-        }
+      if (esc != 0) {
+        if (esc < 0 || esc > 127) return refuse("like_escape");
+        const char c = static_cast<char>(esc);
+        escape = c == '\'' ? " ESCAPE ''''" : std::string(" ESCAPE '") + c +
+                                                  "'";
       }
       *out = "(" + s + " LIKE " + p + escape + ")";
       return false;
@@ -1278,7 +1358,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
         // The value is rounded to the item's scale (as every arithmetic
         // function's, Item_func_numhybrid::val_decimal).
         return exact_division(a, f1, b, f2, static_cast<int>(fn->decimals),
-                              out);
+                              static_cast<int>(l->decimal_precision()), out);
       }
       if (fn->result_type() != REAL_RESULT) return refuse("exact_division");
       std::string l, r;
@@ -1289,7 +1369,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
     }
     case Item_func::MOD_FUNC: {
       if (fn->result_type() == DECIMAL_RESULT && fn->decimal_precision() > 38)
-        return refuse("decimal_precision_above_38");
+        m_decimal_wide = true;
       std::string l, r;
       if (numeric(args[0], &l) || numeric(args[1], &r)) return true;
       // Sign of the dividend in both; MySQL gives NULL for a zero divisor.
@@ -1441,6 +1521,375 @@ bool Generator::function(Item_func *fn, std::string *out) {
     std::string l, r;
     if (numeric(args[0], &l) || numeric(args[1], &r)) return true;
     *out = "(" + l + " // NULLIF(" + r + ", 0))";
+    return false;
+  }
+  // ---- Functions reviewed against DuckDB (2026-11-17) -------------------
+  // Each is translated only where DuckDB gives MySQL's result; the guards
+  // below cover the differences found (tests: duckdb_offload_fn_*.sql).
+  // A string argument: character data (not binary strings); its value is
+  // stored as UTF-8 character by character, so character positions match.
+  // The arguments of these functions are not the comparison's operands: a
+  // constant among them is not a date of the enclosing comparison
+  // (m_temporal applies to the comparison's own constants only).
+  struct OwnArgs {
+    enum_field_types &t;
+    enum_field_types saved;
+    explicit OwnArgs(enum_field_types &x) : t(x), saved(x) {
+      t = MYSQL_TYPE_NULL;
+    }
+    ~OwnArgs() { t = saved; }
+  };
+  auto text_arg = [&](unsigned i, std::string *o) {
+    Item *a = args[i]->real_item();
+    if (!is_string(a) || a->collation.collation == &my_charset_bin)
+      return refuse("string_function_argument:" + name);
+    OwnArgs own(m_temporal);
+    return expr(a, o);
+  };
+  auto int_arg = [&](unsigned i, std::string *o) {
+    Item *a = args[i]->real_item();
+    if (a->result_type() != INT_RESULT) return refuse("integer_argument:" + name);
+    OwnArgs own(m_temporal);
+    return numeric(a, o);
+  };
+  if (fn->functype() == Item_func::EXTRACT_FUNC) {
+    // MySQL's EXTRACT of a DATE / DATETIME (Item_extract::val_int); WEEK
+    // follows default_week_format (DuckDB: ISO weeks): not translated.
+    const interval_type unit = down_cast<Item_extract *>(fn)->int_type;
+    std::string a;
+    if (temporal_arg(args[0], &a)) return true;
+    const std::string t = "CAST(" + a + " AS TIMESTAMP)";
+    auto part = [&](const char *p) {
+      return "CAST(date_part('" + std::string(p) + "', " + t + ") AS BIGINT)";
+    };
+    const std::string us = "(" + part("microseconds") + " % 1000000)";
+    const std::string hms = "(" + part("hour") + " * 10000 + " +
+                            part("minute") + " * 100 + " + part("second") + ")";
+    switch (unit) {
+      case INTERVAL_YEAR: *out = part("year"); return false;  // 0: year 0
+      case INTERVAL_QUARTER: *out = part("quarter"); return false;
+      case INTERVAL_MONTH: *out = part("month"); return false;
+      case INTERVAL_DAY: *out = part("day"); return false;
+      case INTERVAL_HOUR: *out = part("hour"); return false;
+      case INTERVAL_MINUTE: *out = part("minute"); return false;
+      case INTERVAL_SECOND: *out = part("second"); return false;
+      case INTERVAL_MICROSECOND: *out = us; return false;
+      case INTERVAL_YEAR_MONTH:
+        *out = "(" + part("year") + " * 100 + " + part("month") + ")";
+        return false;
+      case INTERVAL_DAY_HOUR:
+        *out = "(" + part("day") + " * 100 + " + part("hour") + ")";
+        return false;
+      case INTERVAL_DAY_MINUTE:
+        *out = "(" + part("day") + " * 10000 + " + part("hour") + " * 100 + " +
+               part("minute") + ")";
+        return false;
+      case INTERVAL_DAY_SECOND:
+        *out = "(" + part("day") + " * 1000000 + " + hms + ")";
+        return false;
+      case INTERVAL_HOUR_MINUTE:
+        *out = "(" + part("hour") + " * 100 + " + part("minute") + ")";
+        return false;
+      case INTERVAL_HOUR_SECOND: *out = hms; return false;
+      case INTERVAL_MINUTE_SECOND:
+        *out = "(" + part("minute") + " * 100 + " + part("second") + ")";
+        return false;
+      case INTERVAL_DAY_MICROSECOND:
+        *out = "((" + part("day") + " * 1000000 + " + hms + ") * 1000000 + " +
+               us + ")";
+        return false;
+      case INTERVAL_HOUR_MICROSECOND:
+        *out = "(" + hms + " * 1000000 + " + us + ")";
+        return false;
+      case INTERVAL_MINUTE_MICROSECOND:
+        *out = "((" + part("minute") + " * 100 + " + part("second") +
+               ") * 1000000 + " + us + ")";
+        return false;
+      case INTERVAL_SECOND_MICROSECOND:
+        *out = "(" + part("second") + " * 1000000 + " + us + ")";
+        return false;
+      default:
+        return refuse("extract_unit");
+    }
+  }
+  if (fn->functype() == Item_func::DATEADD_FUNC) {
+    // DATE_ADD / DATE_SUB / ADDDATE / SUBDATE of a DATE or DATETIME with an
+    // integer count of one unit. Months clamp to the month's end in both;
+    // a result outside 1000-01-01 .. 9999-12-31 is NULL in MySQL.
+    auto *ai = down_cast<Item_func_add_interval *>(fn);
+    static const char *units[] = {"YEAR",   "QUARTER", "MONTH",  "WEEK",
+                                  "DAY",    "HOUR",    "MINUTE", "SECOND",
+                                  "MICROSECOND"};
+    const interval_type unit = ai->get_interval_type();
+    if (unit > INTERVAL_MICROSECOND) return refuse("date_add_unit");
+    if (fn->data_type() != MYSQL_TYPE_DATE &&
+        fn->data_type() != MYSQL_TYPE_DATETIME)
+      return refuse("date_add_result_type");
+    std::string a, n;
+    if (temporal_arg(args[0], &a) || int_arg(1, &n)) return true;
+    const std::string v = "(CAST(" + a + " AS TIMESTAMP) " +
+                          (ai->is_subtract() ? "-" : "+") + " to_" +
+                          [&] {
+                            std::string u = units[unit];
+                            for (char &c : u) c = static_cast<char>(tolower(c));
+                            if (u == "quarter") return std::string("months");
+                            return u + "s";
+                          }() +
+                          "(" + (unit == INTERVAL_QUARTER ? "3 * " : "") +
+                          "CAST(" + n + " AS INTEGER)))";
+    const std::string typed =
+        fn->data_type() == MYSQL_TYPE_DATE ? "CAST(" + v + " AS DATE)" : v;
+    // MySQL computes down to year 0 (0000-01-01) and gives NULL before it
+    // or from year 10000 (DuckDB's year 0 is 1 BC).
+    *out = "(CASE WHEN date_part('year', " + v + ") < 0 OR date_part('year', " +
+           v + ") > 9999 THEN NULL ELSE " + typed + " END)";
+    return false;
+  }
+  if (name == "to_days") {
+    // Day number from year 0 (DATEDIFF is TO_DAYS(a) - TO_DAYS(b)); of a
+    // constant: MySQL's own value.
+    if (args[0]->const_item()) {
+      const longlong v = fn->val_int();
+      *out = fn->null_value ? "NULL" : "CAST(" + std::to_string(v) + " AS BIGINT)";
+      return false;
+    }
+    std::string a;
+    if (temporal_arg(args[0], &a)) return true;
+    *out = "(date_diff('day', DATE '0001-01-01', CAST(" + a +
+           " AS DATE)) + 366)";
+    return false;
+  }
+  if (name == "last_day") {
+    std::string a;
+    if (temporal_arg(args[0], &a)) return true;
+    *out = "last_day(CAST(" + a + " AS DATE))";
+    return false;
+  }
+  if (name == "dayname" || name == "monthname") {
+    // English names only (lc_time_names = en_US).
+    if (strcmp(m_thd->variables.lc_time_names->name, "en_US") != 0)
+      return refuse("lc_time_names");
+    std::string a;
+    if (temporal_arg(args[0], &a)) return true;
+    *out = name + "(" + a + ")";
+    return false;
+  }
+  // Numbers.
+  if (name == "floor" || name == "ceiling" || name == "sign") {
+    std::string a;
+    if (numeric(args[0], &a)) return true;
+    *out = std::string(name == "ceiling" ? "ceil" : name.c_str()) + "(" + a +
+           ")";
+    return false;
+  }
+  if (fn->functype() == Item_func::TRUNCATE_FUNC) {
+    // Exact numbers only, constant digits.
+    if (args[0]->result_type() == REAL_RESULT)
+      return refuse("truncate_of_double");
+    if (!args[1]->const_item() || args[1]->result_type() != INT_RESULT)
+      return refuse("truncate_digits_not_constant");
+    std::string a;
+    if (numeric(args[0], &a)) return true;
+    *out = "trunc(" + a + ", " + std::to_string(args[1]->val_int()) + ")";
+    if (fn->result_type() == DECIMAL_RESULT)
+      *out = "CAST(" + *out + " AS DECIMAL(38," +
+             std::to_string(fn->decimals) + "))";
+    return false;
+  }
+  if (name == "sqrt" || name == "ln" || name == "log2" || name == "log10" ||
+      (name == "log" && n == 1)) {
+    // MySQL gives NULL outside the domain; DuckDB NaN or -inf.
+    std::string a;
+    if (numeric(args[0], &a)) return true;
+    const std::string x = "CAST(" + a + " AS DOUBLE)";
+    const std::string f = name == "sqrt"    ? "sqrt"
+                          : name == "log2"  ? "log2"
+                          : name == "log10" ? "log10"
+                                            : "ln";
+    *out = "(CASE WHEN " + x + (name == "sqrt" ? " < 0" : " <= 0") +
+           " THEN NULL ELSE " + f + "(" + x + ") END)";
+    return false;
+  }
+  if (name == "greatest" || name == "least") {
+    // Numbers, compared in the function's type (MySQL's aggregated type);
+    // NULL if any argument is NULL (DuckDB skips NULLs).
+    std::string type;
+    switch (fn->result_type()) {
+      case INT_RESULT:
+        if (fn->unsigned_flag) return refuse("greatest_least_unsigned");
+        type = "BIGINT";
+        break;
+      case DECIMAL_RESULT:
+        type = "DECIMAL(38," + std::to_string(fn->decimals) + ")";
+        break;
+      case REAL_RESULT:
+        type = "DOUBLE";
+        break;
+      default:
+        return refuse("greatest_least_arguments");
+    }
+    std::string all, nulls;
+    for (unsigned i = 0; i < n; i++) {
+      Item *a = args[i]->real_item();
+      std::string e;
+      OwnArgs own(m_temporal);
+      if (a->type() == Item::NULL_ITEM) {
+        e = "NULL";
+      } else if (a->result_type() != INT_RESULT &&
+                 a->result_type() != DECIMAL_RESULT &&
+                 a->result_type() != REAL_RESULT) {
+        return refuse("greatest_least_arguments");
+      } else if (numeric(a, &e)) {
+        return true;
+      }
+      e = "CAST(" + e + " AS " + type + ")";
+      all += (i ? ", " : "") + e;
+      nulls += std::string(i ? " OR " : "") + e + " IS NULL";
+    }
+    *out = "(CASE WHEN " + nulls + " THEN NULL ELSE " + name + "(" + all +
+           ") END)";
+    return false;
+  }
+  // Strings (character data; positions and lengths in characters).
+  if (name == "char_length") {
+    std::string a;
+    if (text_arg(0, &a)) return true;
+    *out = "CAST(length(" + a + ") AS BIGINT)";
+    return false;
+  }
+  if (name == "length") {
+    // Bytes in the column's character set: the UTF-8 copy has MySQL's
+    // bytes only for utf8mb4 / utf8mb3 / ascii.
+    Item *a0 = args[0]->real_item();
+    if (!is_string(a0) || a0->collation.collation == &my_charset_bin)
+      return refuse("string_function_argument:length");
+    const char *csname = a0->collation.collation->csname;
+    if (strncmp(csname, "utf8mb", 6) != 0 && strcmp(csname, "ascii") != 0)
+      return refuse("length_of_charset:" + std::string(csname));
+    std::string a;
+    if (expr(a0, &a)) return true;
+    *out = "CAST(strlen(" + a + ") AS BIGINT)";
+    return false;
+  }
+  if (name == "substr" || name == "left" || name == "right") {
+    // MySQL: position 0 or a length below 1 give ''; a negative position
+    // counts from the end, beyond the start gives ''. DuckDB returns
+    // characters in those cases.
+    std::string s0, p, l;
+    if (text_arg(0, &s0) || int_arg(1, &p)) return true;
+    if (name == "substr" && n == 3 && int_arg(2, &l)) return true;
+    const std::string len = "length(" + s0 + ")";
+    if (name == "left" || name == "right") {
+      *out = "(CASE WHEN " + p + " IS NULL OR " + s0 +
+             " IS NULL THEN NULL WHEN " + p + " < 1 THEN '' ELSE " + name +
+             "(" + s0 + ", " + p + ") END)";
+      return false;
+    }
+    std::string guard = p + " = 0 OR (" + p + " < 0 AND -" + p + " > " + len +
+                        ")";
+    if (n == 3) guard += " OR " + l + " < 1";
+    *out = "(CASE WHEN " + s0 + " IS NULL OR " + p + " IS NULL" +
+           (n == 3 ? " OR " + l + " IS NULL" : std::string()) +
+           " THEN NULL WHEN " + guard + " THEN '' ELSE substring(" + s0 +
+           ", " + p + (n == 3 ? ", " + l : std::string()) + ") END)";
+    return false;
+  }
+  if (name == "concat" || name == "concat_ws") {
+    // Strings, integers, DECIMAL, DATE and DATETIME(0) print as in MySQL.
+    // CONCAT is NULL with any NULL argument ('||' too); CONCAT_WS skips
+    // NULL values (DuckDB's concat_ws too).
+    std::vector<std::string> parts;
+    for (unsigned i = 0; i < n; i++) {
+      Item *a = args[i]->real_item();
+      std::string e;
+      OwnArgs own(m_temporal);
+      if (a->type() == Item::NULL_ITEM) {
+        e = "NULL";
+      } else if (is_string(a)) {
+        if (a->collation.collation == &my_charset_bin)
+          return refuse("concat_of_binary");
+        if (expr(a, &e)) return true;
+      } else if (a->result_type() == INT_RESULT ||
+                 a->result_type() == DECIMAL_RESULT) {
+        if (a->data_type() == MYSQL_TYPE_YEAR || a->data_type() == MYSQL_TYPE_BIT)
+          return refuse("concat_argument");
+        if (expr(a, &e)) return true;
+        e = "CAST(" + e + " AS VARCHAR)";
+      } else if (a->data_type() == MYSQL_TYPE_DATE ||
+                 (a->data_type() == MYSQL_TYPE_DATETIME && a->decimals == 0)) {
+        if (a->const_item()) return refuse("concat_argument");
+        if (expr(a, &e)) return true;
+        e = "CAST(" + e + " AS VARCHAR)";
+      } else {
+        return refuse("concat_argument");
+      }
+      parts.push_back(e);
+    }
+    if (name == "concat") {
+      std::string all;
+      for (const std::string &e : parts) all += (all.empty() ? "" : " || ") + e;
+      *out = "(" + all + ")";
+    } else {
+      std::string all;
+      for (const std::string &e : parts) all += (all.empty() ? "" : ", ") + e;
+      *out = "concat_ws(" + all + ")";
+    }
+    return false;
+  }
+  if (name == "trim" || name == "ltrim" || name == "rtrim") {
+    // Spaces, or one character removed repeatedly (MySQL removes a string,
+    // DuckDB any of a set of characters: equal for one character).
+    std::string a, r;
+    if (text_arg(0, &a)) return true;
+    if (n == 2) {
+      if (!args[1]->const_item() || args[1]->is_null())
+        return refuse("trim_string");
+      String buf;
+      String *rs = args[1]->val_str(&buf);
+      if (rs == nullptr || rs->numchars() != 1) return refuse("trim_string");
+      if (literal(args[1]->real_item(), &r)) return true;
+      *out = name + "(" + a + ", " + r + ")";
+    } else {
+      *out = name + "(" + a + ", ' ')";
+    }
+    return false;
+  }
+  if (name == "replace" || name == "reverse") {
+    // REPLACE matches bytes in MySQL (case-sensitive under any collation).
+    std::string a, b, c;
+    if (text_arg(0, &a)) return true;
+    if (name == "reverse") {
+      *out = "reverse(" + a + ")";
+      return false;
+    }
+    if (text_arg(1, &b) || text_arg(2, &c)) return true;
+    *out = "replace(" + a + ", " + b + ", " + c + ")";
+    return false;
+  }
+  if (name == "lpad" || name == "rpad") {
+    // MySQL: NULL for a negative length, or an empty pad that must grow
+    // the value (DuckDB: an error); shorter lengths truncate in both.
+    std::string a, l, pad;
+    if (text_arg(0, &a) || int_arg(1, &l) || text_arg(2, &pad)) return true;
+    // MySQL: an empty pad cannot grow the value, which is returned as is
+    // (truncated when longer); DuckDB raises an error.
+    *out = "(CASE WHEN " + l + " < 0 THEN NULL WHEN " + pad +
+           " = '' THEN left(" + a + ", CAST(" + l + " AS INTEGER)) ELSE " +
+           name + "(" + a + ", CAST(" + l + " AS INTEGER), " + pad + ") END)";
+    return false;
+  }
+  if (name == "instr" || (name == "locate" && n == 2)) {
+    // A search under the arguments' collation: every non-constant string
+    // argument binary (a constant takes the column's collation).
+    for (unsigned i = 0; i < 2; i++) {
+      Item *a = args[i]->real_item();
+      if (!a->const_item() && (a->collation.collation->state & MY_CS_BINSORT) == 0)
+        return refuse_collation(a);
+    }
+    // The parser builds LOCATE(substr, str) with str first, as INSTR.
+    std::string hay, needle;
+    if (text_arg(0, &hay) || text_arg(1, &needle)) return true;
+    *out = "CAST(instr(" + hay + ", " + needle + ") AS BIGINT)";
     return false;
   }
   struct DateFn {
@@ -1625,8 +2074,12 @@ bool Generator::output_kind(Item *item, Kind *kind, std::string *cast) {
       // MySQL widens SUM and arithmetic results up to 65 digits; DuckDB
       // computes up to 38 and raises an error on overflow (never a wrong
       // value): the result is read as at most DECIMAL(38,s).
-      const unsigned scale = item->decimals;
+      unsigned scale = item->decimals;
       if (scale > 37) return refuse("decimal_scale_above_37");
+      if (item->decimal_precision() > 38) m_decimal_wide = true;
+      m_max_scale = std::max(m_max_scale, static_cast<int>(scale));
+      if (m_scale_cap >= 0)
+        scale = std::min(scale, static_cast<unsigned>(m_scale_cap));
       unsigned precision = std::min(item->decimal_precision(), 38U);
       if (precision < scale) precision = scale;
       if (precision == 0) precision = 1;
@@ -2295,6 +2748,10 @@ bool Generator::generate(LEX *lex, std::string *sql,
                          std::vector<Kind> *kinds) {
   if (lex->sql_command != SQLCOM_SELECT)
     return refuse("unsupported_statement");
+  // PAD_CHAR_TO_FULL_LENGTH (deprecated): MySQL returns CHAR values padded
+  // to their length; the copy holds them without trailing spaces.
+  if (m_thd->variables.sql_mode & MODE_PAD_CHAR_TO_FULL_LENGTH)
+    return refuse("sql_mode:PAD_CHAR_TO_FULL_LENGTH");
   Query_expression *unit = lex->unit;
 
   // History scope (DWL#5): LIVE hides archived rows; FULL shows them and
@@ -2694,7 +3151,12 @@ bool execute_offloaded(JOIN *join, Query_result *result) {
     return true;
   };
 
-  if (con->execute(
+  if (ctx->have_pre_result) {
+    // Already run during optimization: the result is ours now.
+    res = ctx->pre_result;
+    ctx->have_pre_result = false;
+    have_result = true;
+  } else if (con->execute(
           [&](duckdb_connection, std::string *e) {
             if (duckdb_execute_prepared_streaming(ctx->stmt, &res) ==
                 DuckDBError) {
@@ -2851,17 +3313,34 @@ bool wrote_in_transaction(THD *thd) {
   return false;
 }
 
+// DuckDB errors that mean a DECIMAL value did not fit in 38 digits.
+bool is_decimal_overflow(const std::string &msg) {
+  return msg.find("Overflow") != std::string::npos ||
+         msg.find("out of range") != std::string::npos ||
+         msg.find("Out of Range") != std::string::npos ||
+         msg.find("Could not cast") != std::string::npos;
+}
+
 bool optimize(THD *thd, LEX *lex) {
   OffloadContext *ctx = context(thd);
   if (ctx == nullptr) return true;
   ctx->restore_optimizer_switch();  // the server's optimization is done
   std::string reason;
+  bool wide = false;  // DECIMAL values declared above 38 digits
+  int max_scale = 0;
+  auto build = [&](int scale_cap) {
+    Generator gen(thd, &reason);
+    gen.set_decimal_scale_cap(scale_cap);
+    ctx->kinds.clear();
+    ctx->sql.clear();
+    gen.generate(lex, &ctx->sql, &ctx->kinds);
+    wide = gen.decimal_wide();
+    max_scale = gen.decimal_max_scale();
+  };
   if (wrote_in_transaction(thd)) {
     reason = "written_in_transaction";
   } else {
-    Generator gen(thd, &reason);
-    ctx->kinds.clear();
-    gen.generate(lex, &ctx->sql, &ctx->kinds);
+    build(-1);
   }
   // Freshness (duckdb_offload_wait_applied): the session's last commit must
   // be in DuckDB before we read it there.
@@ -2881,25 +3360,92 @@ bool optimize(THD *thd, LEX *lex) {
   }
   // Prepared now: a DuckDB bind error (types MySQL accepts but DuckDB does
   // not) is a refusal, and the query runs on InnoDB.
+  auto prepare_sql = [&](std::string *err) {
+    return ctx->con->execute(
+        [ctx](duckdb_connection c, std::string *e) {
+          if (ctx->stmt != nullptr) duckdb_destroy_prepare(&ctx->stmt);
+          ctx->stmt = nullptr;
+          if (duckdb_prepare(c, ctx->sql.c_str(), &ctx->stmt) == DuckDBError) {
+            const char *m = duckdb_prepare_error(ctx->stmt);
+            *e = m != nullptr ? m : "prepare failed";
+            duckdb_destroy_prepare(&ctx->stmt);
+            ctx->stmt = nullptr;
+            return true;
+          }
+          return false;
+        },
+        err);
+  };
+  // Run now, materialized (a DECIMAL overflow is then a refusal, not an
+  // error in the middle of sending rows).
+  auto run_first = [&](std::string *err) {
+    return ctx->con->execute(
+        [ctx](duckdb_connection, std::string *e) {
+          if (duckdb_execute_prepared(ctx->stmt, &ctx->pre_result) ==
+              DuckDBError) {
+            const char *m = duckdb_result_error(&ctx->pre_result);
+            *e = m != nullptr ? m : "execution failed";
+            duckdb_destroy_result(&ctx->pre_result);
+            return true;
+          }
+          ctx->have_pre_result = true;
+          return false;
+        },
+        err);
+  };
   if (reason.empty()) {
     std::string err;
     ctx->con = Lake::instance().connect(thd, &err);
-    if (!ctx->con) {
+    if (!ctx->con)
       reason = "duckdb_connection: " + err;
-    } else if (ctx->con->execute(
-                   [ctx](duckdb_connection c, std::string *e) {
-                     if (duckdb_prepare(c, ctx->sql.c_str(), &ctx->stmt) ==
-                         DuckDBError) {
-                       const char *m = duckdb_prepare_error(ctx->stmt);
-                       *e = m != nullptr ? m : "prepare failed";
-                       duckdb_destroy_prepare(&ctx->stmt);
-                       ctx->stmt = nullptr;
-                       return true;
-                     }
-                     return false;
-                   },
-                   &err)) {
+    else if (prepare_sql(&err))
       reason = "duckdb_prepare: " + err.substr(0, 200);
+  }
+  // DECIMAL values MySQL declares above 38 digits (duckdb_decimal_overflow):
+  // DuckDB computes them as DECIMAL(38, scale), exact while they fit. With
+  // FALLBACK and ROUND the statement runs here first; ERROR streams as
+  // usual and an overflow is the statement's error.
+  const DecimalOverflow mode = decimal_overflow(thd);
+  if (reason.empty() && wide && mode != DecimalOverflow::ERROR &&
+      !lex->is_explain()) {
+    std::string err;
+    if (run_first(&err)) {
+      if (!is_decimal_overflow(err)) {
+        reason = "duckdb_execution: " + err.substr(0, 200);
+      } else if (mode == DecimalOverflow::FALLBACK) {
+        reason = "decimal_overflow: a DECIMAL value exceeds DuckDB's 38 "
+                 "digits (duckdb_decimal_overflow=FALLBACK): " +
+                 err.substr(0, 160);
+      } else {
+        // ROUND: fewer decimals until the values fit, with a warning.
+        // Fewer decimals each time: 1, 2, 4, 8 ... fewer, then none.
+        bool done = false;
+        int cap = max_scale;
+        int step = 1;
+        while (!done && reason.empty() && cap > 0) {
+          cap = cap > step ? cap - step : 0;
+          step *= 2;
+          build(cap);
+          if (!reason.empty()) break;
+          if (prepare_sql(&err)) {
+            reason = "duckdb_prepare: " + err.substr(0, 200);
+          } else if (!run_first(&err)) {
+            done = true;
+            push_warning_printf(
+                thd, Sql_condition::SL_WARNING, ER_SECONDARY_ENGINE_PLUGIN,
+                "DuckDB: DECIMAL results rounded to %d decimals: a value "
+                "exceeds DuckDB's 38 digits with %d decimals "
+                "(duckdb_decimal_overflow=ROUND)",
+                cap, max_scale);
+          } else if (!is_decimal_overflow(err)) {
+            reason = "duckdb_execution: " + err.substr(0, 200);
+          }
+        }
+        if (!done && reason.empty())
+          reason = "decimal_overflow: a DECIMAL value exceeds DuckDB's 38 "
+                   "digits, also with fewer decimals (the overflow is in "
+                   "DuckDB's own arithmetic; duckdb_decimal_overflow=ROUND)";
+      }
     }
   }
   if (!reason.empty()) {
@@ -2935,10 +3481,19 @@ bool compare_cost(THD *, const JOIN &, double optimizer_cost,
   return false;
 }
 
+// The server asks for a reason whenever a FORCED query did not run in the
+// secondary engine, also when it never asked us (sql_select.cc,
+// find_and_set_offload_fail_reason, asserts a non-empty reason): with
+// autocommit=0 the statement is part of a multi-statement transaction and
+// the server does not offload it, before any of our hooks runs.
 std::string_view fail_reason(THD *thd) {
   OffloadContext *ctx = context(thd);
-  if (ctx == nullptr || ctx->reason.empty()) return {};
-  return ctx->reason;
+  if (ctx != nullptr && !ctx->reason.empty()) return ctx->reason;
+  if (thd != nullptr && thd->in_multi_stmt_transaction_mode())
+    return "autocommit=0 or an open transaction: MySQL does not run queries "
+           "of multi-statement transactions in a secondary engine (use "
+           "autocommit=1)";
+  return "the query was not sent to the DuckDB secondary engine";
 }
 
 }  // namespace

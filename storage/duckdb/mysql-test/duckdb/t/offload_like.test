@@ -1,0 +1,74 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# LIKE on binary collations (section 40): latin1_bin (PAD SPACE, stored as
+# UTF-8) and utf8mb4_bin; MySQL's escape character passed to DuckDB.
+--source ../include/have_duckdb.inc
+--source ../include/tables_lt.inc
+
+--let $query= SELECT id FROM lt WHERE v LIKE 'abc' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE 'abc%' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE c LIKE 'abc' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE c LIKE 'abc %' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE 'ABC' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE 'caf_' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE '_uro' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE '%é' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE 'a\_b\%c' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE 'a!_b%' ESCAPE '!' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v NOT LIKE '%b%' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE '' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, v LIKE 'ab_' FROM lt ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE u LIKE 'abc' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM lt WHERE c LIKE '%' AND v LIKE '%'
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE 'a\\\\b' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE 'a\\%' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE u LIKE 'a\_b%' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE 'a|_b%' ESCAPE '|' ORDER BY id
+--source ../include/duckdb_compare.inc
+
+--echo # NO_BACKSLASH_ESCAPES: no escape character
+SET @old_mode = @@SESSION.sql_mode;
+SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES');
+--let $query= SELECT id FROM lt WHERE v LIKE 'a\b' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM lt WHERE v LIKE 'a\%' ORDER BY id
+--source ../include/duckdb_compare.inc
+SET SESSION sql_mode = @old_mode;
+
+--echo # Refused
+--let $query= SELECT id FROM lt WHERE v LIKE _latin1'ABC' COLLATE latin1_general_ci ORDER BY id
+--source ../include/duckdb_refused.inc
+
+DROP TABLE lt;
+--source ../include/cleanup.inc

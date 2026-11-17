@@ -1,0 +1,56 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# A grouped CHAR value under a binary collation shown in a join (2026-11-17):
+# CHAR is read without trailing spaces, so values equal under PAD SPACE are
+# byte-identical and the value is exact whichever row InnoDB meets first.
+# VARCHAR and non-binary collations stay refused; PAD_CHAR_TO_FULL_LENGTH
+# refuses offload.
+--source ../include/have_duckdb.inc
+CREATE TABLE d (id INT PRIMARY KEY, cb CHAR(10) CHARACTER SET latin1 COLLATE latin1_bin, cu CHAR(10) COLLATE utf8mb4_bin,
+  vb VARCHAR(10) COLLATE utf8mb4_bin, cc CHAR(10) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb;
+CREATE TABLE f (id INT PRIMARY KEY, did INT, amt INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO d VALUES (1, 'abc', 'abc', 'abc', 'abc'), (2, 'abc  ', 'abc  ', 'abc ', 'ABC'), (3, 'xyz', 'xyz', 'xyz', 'xyz'), (4, 'Abc', 'Abc', 'Abc', 'Abc');
+INSERT INTO f VALUES (1, 2, 1), (2, 3, 2), (3, 4, 3), (4, 1, 4), (5, 2, 5), (6, 3, 6), (7, 4, 7), (8, 1, 8);
+ALTER TABLE d SECONDARY_LOAD;
+ALTER TABLE f SECONDARY_LOAD;
+--echo # changed after the load: through the binary log
+INSERT INTO d VALUES (5, 'xyz   ', 'xyz   ', 'xyz', 'XYZ');
+INSERT INTO f VALUES (9, 5, 100);
+--source ../include/wait_applier.inc
+
+--let $query= SELECT d.cb, SUM(f.amt), COUNT(*) FROM f JOIN d ON d.id = f.did GROUP BY d.cb ORDER BY d.cb
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.cu, SUM(f.amt) FROM f JOIN d ON d.id = f.did GROUP BY d.cu ORDER BY d.cu
+--source ../include/duckdb_compare.inc
+--let $query= SELECT d.cb, d.cu, MAX(f.amt) FROM f JOIN d ON d.id = f.did GROUP BY d.cb, d.cu ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+
+--echo # Refused: VARCHAR keeps trailing spaces, _ci merges cases
+--let $query= SELECT d.vb, SUM(f.amt) FROM f JOIN d ON d.id = f.did GROUP BY d.vb ORDER BY d.vb
+--source ../include/duckdb_refused.inc
+--let $query= SELECT d.cc, SUM(f.amt) FROM f JOIN d ON d.id = f.did GROUP BY d.cc ORDER BY d.cc
+--source ../include/duckdb_refused.inc
+
+--echo # PAD_CHAR_TO_FULL_LENGTH: MySQL pads CHAR values, the copy does not
+SET @old_mode = @@SESSION.sql_mode;
+SET SESSION sql_mode = CONCAT(@@sql_mode, ',PAD_CHAR_TO_FULL_LENGTH');
+SET SESSION use_secondary_engine = FORCED;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT cb FROM d WHERE id = 1;
+SET SESSION use_secondary_engine = DEFAULT;
+SET SESSION sql_mode = @old_mode;
+DROP TABLE d, f;
+--source ../include/cleanup.inc

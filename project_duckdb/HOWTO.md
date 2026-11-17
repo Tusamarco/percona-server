@@ -1,12 +1,14 @@
 # DuckDB secondary engine: how-to
 
 How to build, configure and use the DuckDB secondary engine of Percona Server
-9.7 (POC, branch `9.7-duckdb`). It describes the code as it is on 2026-11-13:
-DWL#1 to DWL#5 (with DWL#3 step 3b) are implemented, and **query offload
-(DWL#6) steps 6a, 6b and 6c**: queries with expressions, joins,
-subqueries, derived tables, views, CTEs and UNION / INTERSECT / EXCEPT run
-in DuckDB (section 6). Design and details: `duckdb-secondary-engine-design.md`
-and the worklogs `DWL-0*.md`; manual tests: `manual-test-plan.md`.
+9.7 (POC, branch `9.7-duckdb`). It describes the code as it is on 2026-11-16:
+DWL#1 to DWL#5 (with DWL#3 step 3b), **query offload (DWL#6)**: queries with
+expressions, joins, subqueries, derived tables, views, CTEs and UNION /
+INTERSECT / EXCEPT run in DuckDB, with every collation (section 6), the FULL
+scope guard (DWL#7) and `INFORMATION_SCHEMA.DUCKDB_TABLES`. A step by step
+guide for new users: `TUTORIAL.md`. Design and details:
+`duckdb-secondary-engine-design.md` and the worklogs `DWL-0*.md`; manual
+tests: `manual-test-plan.md`.
 
 Contents:
 
@@ -66,7 +68,7 @@ cd ../percona-server-9.7-build/mysql-test
 MTR_SHUTDOWN_TIMEOUT=120 ./mtr --suite=/opt/mysql_source/percona-server/storage/duckdb/mysql-test/duckdb --parallel=2
 ```
 
-20 tests (about 1.5 hours with a debug build); see
+25 tests (about 1.5 hours with a debug build); see
 `storage/duckdb/mysql-test/duckdb/README.md`.
 
 ### Results and checks
@@ -285,7 +287,15 @@ SET GLOBAL duckdb_enable = ON;   -- reopens it; the applier resumes where it sto
 Requirements for a table:
 
 - a primary key;
-- no foreign keys (in either direction);
+- foreign keys are allowed, cascading ones too, with the default
+  `innodb_native_foreign_keys = OFF`: MySQL 9.7 runs cascades in the SQL
+  layer and writes the cascaded rows to the binary log, so the copies follow
+  them (a tagged purge on a parent archives the cascaded rows of a history
+  child). With `innodb_native_foreign_keys = ON` InnoDB applies cascades
+  without logging them: a table that is the child of an `ON DELETE / ON
+  UPDATE CASCADE`, `SET NULL` or `SET DEFAULT` key is refused (do not switch
+  that variable to ON with such copies loaded: it is read-only and needs a
+  restart, and the copies would miss cascades);
 - supported column types: integer types (signed and unsigned), DECIMAL up to
   precision 38, FLOAT, DOUBLE, CHAR, VARCHAR, TEXT types, BINARY, VARBINARY,
   BLOB types, DATE, DATETIME, TIMESTAMP, YEAR, BIT, TIME, ENUM, SET. Other
@@ -533,12 +543,20 @@ otherwise it runs on InnoDB:
   aggregate; A table without a copy anywhere in the query:
   InnoDB (with FORCED the server's error 3889);
 - it uses only: columns, literals, `= <> < <= > >=`, BETWEEN, IN (list),
-  LIKE (with ESCAPE), IS [NOT] NULL, AND, OR, NOT; `+ - *`, `/` on DOUBLE
+  LIKE (with ESCAPE; on binary collations of any character set, `\` as
+  default escape as in MySQL), IS [NOT] NULL, AND, OR, NOT; `+ - *`, `/` on DOUBLE
   values and exact division of integers and decimals (as MySQL, with
   div_precision_increment), DIV, MOD, ABS, ROUND (not of DOUBLE); CASE, IF,
   IFNULL, COALESCE,
   NULLIF; YEAR, MONTH, DAYOFMONTH, DAYOFYEAR, QUARTER, DAYOFWEEK, WEEKDAY,
-  HOUR, MINUTE, SECOND, DATE of DATE and DATETIME columns; COUNT, COUNT
+  HOUR, MINUTE, SECOND, DATE of DATE and DATETIME columns; and the
+  functions of the review against DuckDB (DWL-06): EXTRACT (not WEEK),
+  date +/- INTERVAL, DATE_ADD / DATE_SUB, DATEDIFF, TO_DAYS, LAST_DAY,
+  DAYNAME / MONTHNAME, FLOOR, CEILING, SIGN, TRUNCATE, SQRT, LN, LOG,
+  GREATEST / LEAST of numbers, CHAR_LENGTH, LENGTH, SUBSTRING, LEFT, RIGHT,
+  CONCAT, CONCAT_WS, TRIM, REPLACE, REVERSE, LPAD, RPAD, INSTR, LOCATE
+  (refused because DuckDB differs: UPPER, LOWER, ASCII, EXP, POW,
+  EXTRACT(WEEK)); COUNT, COUNT
   (DISTINCT), SUM, AVG (also DISTINCT), MIN, MAX; DISTINCT, GROUP BY, HAVING,
   ORDER BY, LIMIT, OFFSET;
 - string comparisons, joins, GROUP BY, ORDER BY, COUNT(DISTINCT) and
@@ -549,11 +567,13 @@ otherwise it runs on InnoDB:
   over them in comparisons or GROUP BY (UPPER(c) = ...). A grouped string
   column shown in a join needs the table's primary key in GROUP BY (as
   `GROUP BY s.id, s.name`): otherwise the value InnoDB shows depends on its
-  join order and the query runs on InnoDB; MIN/MAX of such strings in a
+  join order and the query runs on InnoDB (a CHAR column under a binary
+  collation is exact and offloaded: its equal values are identical); MIN/MAX of such strings in a
   join likewise. SELECT DISTINCT of `utf8mb4_bin`/`utf8mb3_bin` columns is
   refused;
-- not translated, so answered by InnoDB: arithmetic on UNSIGNED columns,
-  TRUNCATE, other functions,
+- not translated, so answered by InnoDB: unsigned arithmetic that could
+  leave 0..2^64-1 (subtraction, possible overflow), functions outside
+  the reviewed list above (UPPER / LOWER, DATE_FORMAT, CAST ...),
   date functions on TIMESTAMP columns, comparing a string column with a
   number;
 - it is not inside a transaction that has written.
@@ -593,6 +613,83 @@ Read your own writes: with `duckdb_offload_wait_applied = ON` (default), a
 query waits until the applier has applied this connection's last commit (at
 most 5 s, otherwise it runs on InnoDB). With OFF it may not see a commit made
 less than about a second earlier.
+
+### When MySQL uses DuckDB: changing the thresholds
+
+With `use_secondary_engine = ON` MySQL plans every query for InnoDB first.
+It then tries DuckDB when one of these holds:
+
+1. **The estimated cost** of the InnoDB plan is above
+   `secondary_engine_cost_threshold` (server variable, default 100000).
+2. **The plan reads a loaded table of at least `duckdb_offload_min_rows`
+   rows** (plugin variable, default 1,000,000) by a full table scan, a full
+   index scan or a non-unique index lookup, whatever the estimated cost.
+   InnoDB's estimates for those plans can be far too low.
+
+If one holds and the plugin can translate the query exactly, it runs in
+DuckDB. Otherwise it runs on InnoDB.
+
+See the cost MySQL estimated, and why a query stayed on InnoDB:
+
+```sql
+SET SESSION use_secondary_engine = OFF;
+SELECT grp, COUNT(*) FROM g GROUP BY grp;
+SHOW SESSION STATUS LIKE 'Last_query_cost';        -- e.g. 18775.549000
+
+SET SESSION use_secondary_engine = ON, optimizer_trace = 'enabled=on';
+SELECT grp, COUNT(*) FROM g GROUP BY grp;
+SELECT JSON_EXTRACT(TRACE, '$**.secondary_engine_not_used') FROM information_schema.OPTIMIZER_TRACE;
+-- [{"cost": 18775.5, "reason": "The estimated query cost does not exceed
+--   secondary_engine_cost_threshold.", "threshold": 100000.0}]
+SET SESSION optimizer_trace = 'enabled=off';
+```
+
+Change them where they should apply:
+
+```sql
+-- this session
+SET SESSION secondary_engine_cost_threshold = 10000;
+SET SESSION duckdb_offload_min_rows = 100000;
+-- new sessions from now on / also after a restart
+SET GLOBAL secondary_engine_cost_threshold = 10000;
+SET PERSIST secondary_engine_cost_threshold = 10000;
+SET PERSIST duckdb_offload_min_rows = 100000;
+-- one query (optimizer hints)
+SELECT /*+ SET_VAR(secondary_engine_cost_threshold = 0) */ grp, COUNT(*) FROM g GROUP BY grp;
+SELECT /*+ SET_VAR(duckdb_offload_min_rows = 1000) */ grp, COUNT(*) FROM g GROUP BY grp;
+SELECT /*+ SET_VAR(use_secondary_engine = FORCED) */ grp, COUNT(*) FROM g GROUP BY grp;
+```
+
+- `secondary_engine_cost_threshold = 0`: every query the plugin can
+  translate goes to DuckDB, also small ones (each pays about a millisecond
+  of DuckDB setup).
+- `duckdb_offload_min_rows = 0` disables rule 2.
+- A primary key lookup or a short index range is cheap on InnoDB and
+  stays there with the defaults.
+- `use_secondary_engine = FORCED` skips both rules: DuckDB, or an error
+  with the reason.
+
+### DECIMAL results above 38 digits
+
+MySQL declares DECIMAL results up to 65 digits (an aggregate adds about 22
+digits, a division more), DuckDB computes up to 38. The plugin computes such
+results as `DECIMAL(38, scale)`: exact while the values fit, which is every
+realistic case (the integer part can have 38 - scale digits). Statements
+where a value could exceed 38 digits (declared above 38, or an exact
+division whose scaled dividend could) run in DuckDB first, during
+optimization; the result is kept and sent. `duckdb_decimal_overflow`
+decides what an overflow does:
+
+| Value | When a value does not fit |
+|---|---|
+| `FALLBACK` (default) | The query runs on InnoDB: results always identical (with FORCED: an error with the reason). |
+| `ROUND` | The query runs again in DuckDB with fewer decimals, and a warning says how many were kept (`DECIMAL results rounded to 3 decimals ...`). Helps when the overflow comes from the scale (exact division); when DuckDB's own arithmetic overflows (a SUM above 38 digits) it is as FALLBACK. |
+| `ERROR` | No first run: the statement streams as usual and fails with DuckDB's error, also with ON. |
+
+```sql
+SET SESSION duckdb_decimal_overflow = ROUND;
+SELECT /*+ SET_VAR(duckdb_decimal_overflow = FALLBACK) */ SUM(amount) / 3 FROM orders;
+```
 
 ### YEAR, BIT, TIME, ENUM and SET in queries
 
@@ -809,6 +906,67 @@ the lake is closed (`duckdb_enable=OFF`) and for accounts without the
 `INFORMATION_SCHEMA.TABLES` shows the same for one table in `CREATE_OPTIONS`
 (`SECONDARY_LOAD="1"`), without the state.
 
+### Reading the lake while MySQL is down
+
+The copies are a DuckLake lake in `duckdb_data_path` (default
+`<datadir>/duckdb_data`): a catalog `catalog.ducklake` and Parquet files under
+`data/`. With MySQL stopped, DuckDB itself can read it. Use `duckq`
+(`project_duckdb/tools/duckq.c`), built from the same DuckDB and DuckLake
+libraries as the plugin, so the versions match (DuckDB v2.0.0, DuckLake
+`55cc50c`):
+
+```bash
+B=/opt/mysql_source/percona-server-9.7-build          # the build directory
+L=$B/extra/duckdb/install/lib
+clang++-21 -x c /opt/mysql_source/percona-server/project_duckdb/tools/duckq.c -x none \
+  -I$B/extra/duckdb/install/include -o ~/duckq \
+  -Wl,--start-group $(ls $L/lib*.a) -Wl,--end-group -lpthread -ldl
+```
+
+Each argument after the database is one SQL statement; results are
+tab-separated:
+
+```bash
+LAKE=/path/to/datadir/duckdb_data
+A="ATTACH 'ducklake:$LAKE/catalog.ducklake' AS lake (DATA_PATH '$LAKE/data/', READ_ONLY)"
+~/duckq :memory: "$A" \
+  "SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'lake' ORDER BY 1, 2" \
+  "SELECT db, tbl, state, retain_history FROM lake.__mysql.tables"
+~/duckq :memory: "$A" \
+  "SELECT region, COUNT(*) FROM lake.shop.orders WHERE \"__archived_at\" IS NULL GROUP BY region"
+~/duckq :memory: "$A" \
+  "COPY (SELECT * FROM lake.shop.orders) TO '/backup/orders.parquet' (FORMAT parquet)"
+```
+
+What to know when reading the tables:
+
+- **Names:** MySQL schema `db`, table `t` is `lake.db.t`. The registry of
+  copies is `lake.__mysql.tables`.
+- **History tables:** the column `__archived_at` is NULL for live rows and
+  holds the purge time for archived rows. `WHERE "__archived_at" IS NULL`
+  gives what InnoDB has.
+- **Hidden columns:** `__w_<col>` holds MySQL's sort weight (BLOB) for
+  collations DuckDB cannot compare. `__n_<col>` holds the ENUM index or SET
+  bitmask.
+- **Values as stored:**
+  - Strings: UTF-8, CHAR without trailing spaces.
+  - TIMESTAMP: in UTC.
+  - TIME: signed microseconds (`t / 1000000` gives seconds).
+  - YEAR and BIT: numbers.
+  - ENUM and SET: their string value.
+- **Read only:** always attach with `READ_ONLY`. A change made outside MySQL
+  is not in InnoDB and is not known to the applier, so the copy would no
+  longer match.
+- **MySQL must be stopped:** while it runs, mysqld holds a lock on the
+  catalog and the attach fails with `Could not set lock on file ...
+  Conflicting lock is held in .../mysqld`. To read while MySQL runs, query
+  through MySQL (`use_secondary_engine = FORCED`), or copy the whole
+  `duckdb_data` directory while MySQL is stopped and read the copy.
+- **Other DuckDB clients:** a DuckDB CLI or Python package also works if
+  its DuckDB and DuckLake versions match the plugin's (see the
+  `extra/duckdb` submodules). A different version may refuse the catalog
+  or, worse, upgrade it.
+
 ### Status variables
 
 ```sql
@@ -867,8 +1025,9 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | `duckdb_discard_stale_copy` | global | yes (command) | `""` | `'db.table'` | Setting it drops the stale copy of a table that no longer exists. History copies need `duckdb_unload_history_confirm=ON`. A command: the variable stays empty afterwards. Not persisted. |
 | `duckdb_history_scope` | session, global, `SET_VAR` | yes | LIVE | LIVE, FULL | What queries see in history tables: live rows only, or also archived rows. FULL requires `DUCKDB_HISTORY_READER` and the `duckdb_guard` plugin, and always runs in DuckDB (or fails with the reason). |
 | `duckdb_apply_debug_log` | global | yes | OFF | ON, OFF | Testing aid: one error log line per change and per table of each batch, with DuckDB row counts (needs `log_error_verbosity=3`). |
-| `duckdb_offload_min_rows` | session, global | yes | 1000000 | 0 .. 2^64-1 | Also try a query in DuckDB when MySQL's plan reads a loaded table of at least this many rows by a full scan, full index scan or non-unique index lookup, whatever its estimated cost. 0: only `secondary_engine_cost_threshold` decides. |
-| `duckdb_offload_wait_applied` | session | yes | ON | ON, OFF | Before a query runs in DuckDB, wait until the applier has applied this connection's last commit (at most 5 s, otherwise InnoDB). |
+| `duckdb_offload_min_rows` | session, global, `SET_VAR` | yes | 1000000 | 0 .. 2^64-1 | Also try a query in DuckDB when MySQL's plan reads a loaded table of at least this many rows by a full scan, full index scan or non-unique index lookup, whatever its estimated cost. 0: only `secondary_engine_cost_threshold` decides. |
+| `duckdb_decimal_overflow` | session, global, `SET_VAR` | yes | FALLBACK | FALLBACK, ROUND, ERROR | DECIMAL results MySQL declares above 38 digits are computed as DECIMAL(38, scale) and the statement runs in DuckDB first; if a value does not fit: FALLBACK runs it on InnoDB (FORCED: error), ROUND runs it again with fewer decimals and a warning (when that helps; otherwise as FALLBACK), ERROR fails with DuckDB's error (no first run). |
+| `duckdb_offload_wait_applied` | session, `SET_VAR` | yes | ON | ON, OFF | Before a query runs in DuckDB, wait until the applier has applied this connection's last commit (at most 5 s, otherwise InnoDB). |
 | `duckdb_history_check_only` | session | yes | OFF | ON, OFF | SECONDARY_LOAD of a history table only checks that it can take over a history copy (adopt, reattach, resync) and always ends with an error giving the result. |
 | `duckdb_unload_history_confirm` | session | yes | OFF | ON, OFF | Allows SECONDARY_UNLOAD of a history table and `duckdb_discard_stale_copy` of a history copy (archived rows are deleted). |
 
@@ -910,19 +1069,23 @@ Counters restart at 0 when the server starts.
 
 ## 12. Limitations of this version
 
-- Offload covers the queries and constructs in section 6 (DWL#6 steps 6a,
-  6b, 6c); everything else runs on InnoDB. String operations on `_ci` and other
-  non-binary collations: after 6c (weight strings).
-- KILL QUERY of a long query running in DuckDB is implemented but not yet
-  tested.
+- Offload covers the queries and constructs in section 6 (DWL#6 steps 6a
+  to 6d, weight strings, the types of section 6, the reviewed date, number
+  and string functions); everything else runs on InnoDB: window functions,
+  UPPER / LOWER, DATE_FORMAT, CAST, GROUP_CONCAT, LIKE and string functions
+  on non-binary collations, a grouped VARCHAR in a join (TPC-H Q16, Q22).
 - Not supported: `binlog_encryption=ON`, `duckdb_encryption`, XA transactions
   on loaded tables (the applier stops), partial JSON updates, the types listed
   in section 3.
+- `DROP PARTITION` / `TRUNCATE PARTITION` of a history table do not archive:
+  the copy is refreshed and the partition's rows are gone. Purge the
+  partition first (`DELETE ... PARTITION (p)` in a tagged transaction), then
+  drop it (TUTORIAL.md section 8).
 - Space of dropped copies and old versions is not reclaimed yet (snapshot
   expiry, Phase 3).
 - A refresh after DDL reloads the whole table and pauses the applier for all
   tables while it runs.
-- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 20 tests) covers the
+- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 25 tests) covers the
   features; restarts with special options, replica, semi-sync, relocation
   and performance stay in `manual-test-plan.md`.
 - Replicas: tested with a source without the plugin (section 2, Replicas).

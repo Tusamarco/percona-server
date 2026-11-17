@@ -1,0 +1,21 @@
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 SELECT n, n % 7 FROM n;
+ALTER TABLE t1 SECONDARY_LOAD;
+SET SESSION autocommit = 0;
+SET SESSION use_secondary_engine = FORCED;
+SELECT COUNT(*), SUM(v) FROM t1;
+ERROR HY000: Secondary engine operation failed. Reason: "autocommit=0 or an open transaction: MySQL does not run queries of multi-statement transactions in a secondary engine (use autocommit=1)".
+# ON: the query runs on InnoDB
+SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
+SELECT COUNT(*), SUM(v) FROM t1;
+COUNT(*)	SUM(v)
+1000	2997
+SET SESSION autocommit = 1;
+SET SESSION use_secondary_engine = FORCED;
+BEGIN;
+SELECT COUNT(*), SUM(v) FROM t1;
+ERROR HY000: Secondary engine operation failed. Reason: "Query is part of a multi-statement transaction, which is not supported in secondary engines.".
+COMMIT;
+# autocommit=1, no transaction: DuckDB
+# SELECT COUNT(*), SUM(v) FROM t1
+SET SESSION use_secondary_engine = DEFAULT, secondary_engine_cost_threshold = DEFAULT;

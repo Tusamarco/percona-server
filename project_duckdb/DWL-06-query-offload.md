@@ -1,6 +1,6 @@
 # DWL#6: Query offload through the external executor
 
-Affects: Percona Server 9.7 — Status: steps 6a and 6b implemented, verified on the reference instance (6a 2026-11-12, 6b 2026-11-13); 6c-1, 6c-2 verified on the reference instance, 6c-3, 6d-1 and 6d-2 implemented, verified on a throwaway instance (2026-11-13); 6d-3 in progress
+Affects: Percona Server 9.7 — Status: steps 6a and 6b implemented, verified on the reference instance (6a 2026-11-12, 6b 2026-11-13); 6c-1, 6c-2 verified on the reference instance, 6c-3, 6d-1 and 6d-2 implemented, verified on a throwaway instance (2026-11-13); 6d-3 first release run done; types, DECIMAL overflow, LIKE, grouped CHAR and the function review implemented with MTR tests (2026-11-16/17)
 
 Steps (one at a time, tested by Marco before the next):
 
@@ -762,6 +762,114 @@ Tests: `duckdb_offload_tt_*` (24 / 7), `duckdb_offload_et_*` (28 / 6),
 `duckdb_offload_yb_*` (33 / 7); MTR `offload_time`, `offload_enum` (with a
 history table across an ENUM / SET definition change), `offload_yb`; unit
 tests for the decoder (41 in all).
+
+### DECIMAL results above 38 digits (2026-11-17, decided with Marco)
+
+MySQL declares DECIMAL results up to 65 digits; DuckDB's DECIMAL holds 38
+(a 128-bit integer) and raises an error on overflow, never a wrong value.
+DuckDB's arbitrary-size `BIGNUM` was tested and is not usable: its `*`, `/`
+return DOUBLE and `sum` returns NULL.
+
+- Results declared above 38 digits are computed as `DECIMAL(38, scale)`
+  (MySQL's scale, at most 30): exact while the integer part has at most
+  38 - scale digits. The refusal `decimal_precision_above_38` is gone.
+- A statement is "wide" when a DECIMAL result is declared above 38 digits,
+  or an exact division's dividend scaled by its shift could exceed 38
+  digits (the dividend's precision + shift > 38: the HUGEINT intermediate
+  can overflow although the result fits; AVG of integers counts 19 digits
+  for the row count). Wide statements run in DuckDB during optimization
+  (`duckdb_execute_prepared`, materialized); `execute_offloaded()` sends the
+  kept result.
+- `duckdb_decimal_overflow` (session, global, SET_VAR): FALLBACK (default)
+  turns an overflow into a refusal (ON: InnoDB, FORCED: error with the
+  reason); ROUND rebuilds the SQL with a scale cap (1, 2, 4, 8 ... decimals
+  fewer, exact division computed with one digit more than kept, then
+  rounded) and pushes a warning; when the overflow is in DuckDB's own
+  arithmetic (SUM accumulator, multiplication) fewer decimals do not help
+  and it ends as FALLBACK; ERROR does not run first: an overflow is the
+  statement's error, also with ON. EXPLAIN never runs the statement.
+- Tests: MTR `decimal_overflow`; TPC-H Q11 now offloaded (8 of 22).
+
+### LIKE on binary collations (2026-11-17)
+
+- LIKE compares characters and never pads (`'a ' LIKE 'a'` is false also
+  under PAD SPACE). Under a binary collation of any character set
+  (`MY_CS_BINSORT`: `latin1_bin`, `utf8mb4_bin`, `gbk_bin` ...) a character
+  matches only itself, and the copy holds each value converted to UTF-8
+  character by character, so DuckDB's LIKE on the stored value is MySQL's.
+  Before, only RAW / PAD string modes were accepted, and `latin1_bin` (a
+  weight collation for ordering: latin1 is cp1252, its byte order is not
+  the UTF-8 order) was refused. The collation is the LIKE's own
+  (`compare_collation()`: a COLLATE clause can make it `_ci`, refused).
+- Fixed: the escape character. MySQL uses `\` when there is no ESCAPE
+  clause (none under NO_BACKSLASH_ESCAPES); DuckDB's LIKE has no default
+  escape, so `LIKE 'a\_b'` matched differently for every collation. We pass
+  `Item_func_like::escape()` (MySQL's evaluated escape) as ESCAPE always.
+- Tests: `duckdb_offload_like_queries.sql` (19), `_refusals.sql`, MTR
+  `offload_like`; TPC-H 12 of 22 (Q2, Q13, Q14, Q20).
+
+### Grouped CHAR values in joins (2026-11-17)
+
+- MySQL shows a grouped PAD / `_ci` string from the first row it meets in
+  the group; in a join that depends on the join order, so such values were
+  refused unless GROUP BY has the table's primary key (decided 2026-11-14).
+- Exact exception: a CHAR column under a binary collation (latin1_bin,
+  utf8mb4_bin ...). MySQL reads CHAR without trailing spaces, the load and
+  the binary log carry it so (`Field_string::pack` strips them), so values
+  equal under the PAD SPACE binary comparison are byte-identical:
+  `any_value(col)` shows InnoDB's value whatever the join order.
+- `PAD_CHAR_TO_FULL_LENGTH` (deprecated sql_mode): MySQL returns CHAR padded
+  to its length; the copy has no padding: such statements are refused
+  (`sql_mode:PAD_CHAR_TO_FULL_LENGTH`; an older gap for every CHAR result).
+- Next (decided): VARCHAR and non-binary collations after a data check
+  (design document, Next steps 2).
+- Tests: MTR `offload_grouped_char`; TPC-H 16 of 22 (Q4, Q5, Q10, Q12).
+
+### Function review against DuckDB (2026-11-17)
+
+Each MySQL function was compared with DuckDB's on edge values (empty and
+NULL strings, multibyte characters, spaces, latin1; negative, zero and NULL
+numbers; month ends, Feb 29, year 0 and 9999, microseconds) and translated
+only where the results match, with the guards listed. Tests:
+`duckdb_offload_fn_queries.sql` (28, identical and offloaded),
+`duckdb_offload_fn_refusals.sql` (11), MTR `offload_functions`.
+
+| MySQL | Status | DuckDB / guard |
+|---|---|---|
+| `EXTRACT(unit FROM d)`, all units but WEEK | translated | `date_part`; composite units built as MySQL does (`YEAR_MONTH` = year * 100 + month, ...); MICROSECOND = microseconds % 1000000 (DuckDB includes the seconds) |
+| `EXTRACT(WEEK ...)` | refused | MySQL follows `default_week_format`, DuckDB ISO weeks |
+| `DATE_ADD`, `DATE_SUB`, `ADDDATE`, `SUBDATE`, `d +/- INTERVAL n unit` | translated | units YEAR .. MICROSECOND with an integer count; months clamp to the month end in both; DATE result cast to DATE; NULL outside year 0 .. 9999 as MySQL; units with several parts (`'1:30' HOUR_MINUTE`) refused |
+| `TO_DAYS`, `DATEDIFF` (MySQL builds it from TO_DAYS) | translated | `date_diff('day', DATE '0001-01-01', d) + 366`; of a constant: MySQL's value |
+| `LAST_DAY` | translated | `last_day` |
+| `DAYNAME`, `MONTHNAME` | translated | English names, only with `lc_time_names = en_US` |
+| `FLOOR`, `CEILING` / `CEIL`, `SIGN` | translated | same |
+| `TRUNCATE(x, d)` | translated | exact numbers, constant d (`trunc`); of DOUBLE refused |
+| `SQRT`, `LN`, `LOG(x)`, `LOG2`, `LOG10` | translated | NULL outside the domain (DuckDB: NaN, -inf) |
+| `EXP`, `POW` / `POWER` | refused | overflow is error 1690 in MySQL, inf in DuckDB |
+| `GREATEST`, `LEAST` | translated | numbers, compared in the function's type; NULL if any argument is NULL (DuckDB skips NULLs); strings and dates not yet |
+| `CHAR_LENGTH` | translated | characters (`length`) |
+| `LENGTH` / `OCTET_LENGTH` | translated | bytes: utf8mb4 / utf8mb3 / ascii only (the copy is UTF-8); latin1 refused |
+| `SUBSTRING` / `SUBSTR` / `MID`, `LEFT`, `RIGHT` | translated | position 0, a length below 1, a negative position beyond the start: '' as MySQL (DuckDB returns characters) |
+| `CONCAT` | translated | strings, integers, DECIMAL, DATE, DATETIME(0); NULL with any NULL (`\|\|`); DOUBLE, DATETIME(n) refused (formatting) |
+| `CONCAT_WS` | translated | NULL values skipped in both; NULL separator gives NULL |
+| `TRIM`, `LTRIM`, `RTRIM` | translated | spaces, or one character; `TRIM('xy' FROM s)` refused (MySQL removes the string, DuckDB any of the characters) |
+| `REPLACE`, `REVERSE` | translated | REPLACE matches bytes in MySQL under any collation, as DuckDB |
+| `LPAD`, `RPAD` | translated | NULL for a negative length; an empty pad returns the value (truncated if longer) as MySQL (DuckDB: error) |
+| `INSTR`, `LOCATE(sub, s)` | translated | binary collations only (a search under `_ci` ignores case); the parser builds LOCATE with the string first; `LOCATE` with a start position not yet |
+| `UPPER`, `LOWER` | refused | case mappings differ (DuckDB `upper('ß')` = 'ẞ', MySQL 'ß') |
+| `ASCII` | refused | MySQL: first byte; DuckDB: code point |
+| not reviewed yet | refused | DATE_FORMAT, STR_TO_DATE, TIMESTAMPDIFF, CAST / CONVERT, bit operators, REGEXP, JSON, STDDEV / VARIANCE, GROUP_CONCAT, window functions |
+
+Also fixed during the review: string constants of these functions'
+arguments no longer take the date type of an enclosing comparison
+(`dt + INTERVAL 30 DAY > '2024-03-01'` was refused); =, <>, IN under a
+binary collation of another character set (latin1_bin) compare characters
+without the weight column, so expressions work there (TPC-H Q22's
+`substr(c_phone, 1, 2) IN (...)`); ordering keeps the weights.
+
+TPC-H after the review: 19 of 22 (Q7, Q8, Q9 added). Q22 now stops at
+grouping by `substr(...)` under PAD SPACE (the shown value is ambiguous:
+next step, the data check).
 
 ### Open points
 

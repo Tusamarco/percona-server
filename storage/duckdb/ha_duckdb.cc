@@ -77,6 +77,11 @@ char *srv_apply_start_position = nullptr;
 char *srv_discard_stale_copy = nullptr;
 const char *history_scope_names[] = {"LIVE", "FULL", nullptr};
 TYPELIB history_scope_typelib = {2, "", history_scope_names, nullptr};
+// duckdb_decimal_overflow (2026-11-17): what a DECIMAL result declared above
+// DuckDB's 38 digits does when a value does not fit.
+const char *decimal_overflow_names[] = {"FALLBACK", "ROUND", "ERROR",
+                                        nullptr};
+TYPELIB decimal_overflow_typelib = {3, "", decimal_overflow_names, nullptr};
 // DWL#5: the dynamic privilege needed for duckdb_history_scope=FULL.
 constexpr char kHistoryReaderPrivilege[] = "DUCKDB_HISTORY_READER";
 SERVICE_TYPE(dynamic_privilege_register) *privilege_service = nullptr;
@@ -549,20 +554,34 @@ MYSQL_THDVAR_ENUM(history_scope,
                   "DUCKDB_HISTORY_READER privilege. Also a SET_VAR hint.",
                   check_history_scope, nullptr, 0, &history_scope_typelib);
 
-MYSQL_THDVAR_BOOL(offload_wait_applied, PLUGIN_VAR_OPCMDARG,
+MYSQL_THDVAR_ENUM(decimal_overflow,
+                  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
+                  "DECIMAL results MySQL declares with more than 38 digits are "
+                  "computed in DuckDB as DECIMAL(38, scale); such statements "
+                  "run in DuckDB first. When a value does not fit: FALLBACK "
+                  "(the query runs on InnoDB; with use_secondary_engine="
+                  "FORCED an error), ROUND (run again in DuckDB with fewer "
+                  "decimals, with a warning), ERROR (no first run: the "
+                  "statement fails with DuckDB's error). Also a SET_VAR "
+                  "hint.",
+                  nullptr, nullptr, 0, &decimal_overflow_typelib);
+
+MYSQL_THDVAR_BOOL(offload_wait_applied,
+                  PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
                   "Before a query runs in DuckDB, wait until the binlog "
                   "applier has applied the session's last commit (at most 5 "
                   "s; otherwise the query runs on InnoDB), so the session "
-                  "reads its own writes.",
+                  "reads its own writes. Also a SET_VAR hint.",
                   nullptr, nullptr, true);
 
-MYSQL_THDVAR_ULONGLONG(offload_min_rows, PLUGIN_VAR_OPCMDARG,
+MYSQL_THDVAR_ULONGLONG(offload_min_rows,
+                       PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
                        "Besides secondary_engine_cost_threshold, a query is "
                        "tried in DuckDB when MySQL's plan reads a loaded "
                        "table of at least this many rows by a full scan, a "
                        "full index scan or a non-unique index lookup (row "
                        "estimates from sampled statistics). 0 disables the "
-                       "rule.",
+                       "rule. Also a SET_VAR hint.",
                        nullptr, nullptr, 1000000, 0, ULLONG_MAX, 0);
 
 MYSQL_THDVAR_BOOL(history_check_only, PLUGIN_VAR_OPCMDARG,
@@ -626,6 +645,7 @@ SYS_VAR *duckdb_system_variables[] = {MYSQL_SYSVAR(enable),
                                       MYSQL_SYSVAR(history_scope),
                                       MYSQL_SYSVAR(offload_wait_applied),
                                       MYSQL_SYSVAR(offload_min_rows),
+                                      MYSQL_SYSVAR(decimal_overflow),
                                       nullptr};
 
 int show_executor_busy(THD *, SHOW_VAR *var, char *buff) {
@@ -1054,6 +1074,12 @@ int duckdb_deinit(MYSQL_PLUGIN p) {
 
 bool history_check_only(THD *thd) {
   return thd != nullptr && THDVAR(thd, history_check_only);
+}
+
+DecimalOverflow decimal_overflow(THD *thd) {
+  return thd != nullptr
+             ? static_cast<DecimalOverflow>(THDVAR(thd, decimal_overflow))
+             : DecimalOverflow::FALLBACK;
 }
 
 unsigned long long offload_min_rows(THD *thd) {

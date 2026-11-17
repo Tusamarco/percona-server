@@ -193,10 +193,12 @@ ALTER TABLE t_nopk SECONDARY_LOAD;               -- EXPECTED ERROR: requires a p
 
 CREATE TABLE t_parent (id INT PRIMARY KEY);
 CREATE TABLE t_fk (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES t_parent(id)) SECONDARY_ENGINE = duckdb;
-ALTER TABLE t_fk SECONDARY_LOAD;                 -- EXPECTED ERROR: foreign keys not supported
+ALTER TABLE t_fk SECONDARY_LOAD;                 -- ok since 2026-11-17 (innodb_native_foreign_keys=OFF:
+                                                 -- cascades are binlogged; with ON a cascading child is refused)
 
-CREATE TABLE t_enum (id INT PRIMARY KEY, e ENUM('a','b')) SECONDARY_ENGINE = duckdb;
-ALTER TABLE t_enum SECONDARY_LOAD;               -- EXPECTED ERROR: column e: type not supported
+CREATE TABLE t_enum (id INT PRIMARY KEY, g GEOMETRY) SECONDARY_ENGINE = duckdb;
+ALTER TABLE t_enum SECONDARY_LOAD;               -- EXPECTED ERROR: column g: type not supported
+                                                 -- (ENUM, SET, TIME, YEAR, BIT are supported since 2026-11-16)
 
 CREATE TABLE t_attr (id INT PRIMARY KEY) SECONDARY_ENGINE = duckdb SECONDARY_ENGINE_ATTRIBUTE = '{"retain_hist": true}';
 ALTER TABLE t_attr SECONDARY_LOAD;               -- EXPECTED ERROR: unknown SECONDARY_ENGINE_ATTRIBUTE key 'retain_hist'
@@ -1381,10 +1383,69 @@ SELECT id, e, e + 0, s, s + 0 FROM eh ORDER BY id;
 -- LIVE: the same as InnoDB (ids 3-6)
 ```
 
+## 39. Foreign keys and the TPC-H check (2026-11-17)
+
+Foreign keys (MTR `foreign_keys`): a parent with children `ON DELETE
+CASCADE`, `ON UPDATE CASCADE`, `ON DELETE SET NULL`, RESTRICT and a history
+child; all load; after deleting / updating parents every copy equals InnoDB;
+a tagged purge on the parent archives the cascaded rows of the history
+child. With `innodb_native_foreign_keys=ON` (restart) the cascading child
+is refused with the reason, the parent and the RESTRICT child load.
+
+TPC-H (`tpch/README.md`): HammerDB's MySQL schema with its foreign keys,
+generated data (SF ~0.01), the 22 queries compared OFF / FORCED.
+
+```bash
+mysql ... < tpch/tpch_schema.sql && mysql ... < tpch/tpch_data.sql
+MYSQL="mysql ... tpch" ./duckdb_offload_compare.sh tpch/tpch_queries.sql   # 7/22 on 2026-11-17
+```
+
+## 40. LIKE on binary collations (2026-11-17)
+
+Table lt of `duckdb_offload_setup.sql` ("LIKE on binary collations" block);
+MTR `offload_like`.
+
+```bash
+MYSQL="mysql --default-character-set=utf8mb4 ... windmills_small" ./duckdb_offload_compare.sh duckdb_offload_like_queries.sql  # 19/19
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_like_refusals.sql                                       # 1/1
+```
+
+Checks: trailing spaces matter (`'abc ' LIKE 'abc'` false), case and
+accents are distinct, `_` matches one character (also é, €), backslash
+escapes as in MySQL (also with NO_BACKSLASH_ESCAPES: no escape character),
+ESCAPE clause; LIKE with a `_ci` COLLATE refused. TPC-H: 12 of 22.
+
+## 41. Grouped CHAR values in joins (2026-11-17)
+
+MTR `offload_grouped_char`: a join grouped by CHAR columns under
+latin1_bin and utf8mb4_bin (values with trailing spaces, one inserted after
+the load) equals InnoDB; VARCHAR and `_ci` CHAR refused
+(`grouped_string_value_in_join`); `PAD_CHAR_TO_FULL_LENGTH` refused.
+TPC-H: 16 of 22.
+
+## 42. Functions reviewed against DuckDB (2026-11-17)
+
+Table fx of `duckdb_offload_setup.sql` ("Functions reviewed" block); MTR
+`offload_functions`. The table of functions and guards: DWL-06, "Function
+review against DuckDB".
+
+```bash
+MYSQL="mysql --default-character-set=utf8mb4 ... windmills_small" ./duckdb_offload_compare.sh duckdb_offload_fn_queries.sql  # 28/28
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_fn_refusals.sql                                     # 11/11
+```
+
+TPC-H: 19 of 22.
+
 ## Results log
 
 | Date | Build | Sections run | Result | Notes |
 |---|---|---|---|---|
+| 2026-11-17 | clang-21, C++23, debug | 42, function review against DuckDB (throwaway instance; MTR offload_functions, offload_refusals) | pass after fixes | fn 28/28 identical and offloaded, refusals 11/11; every earlier list unchanged (6b refusal TRUNCATE now translated, replaced by EXP); TPC-H 19 of 22 (Q7, Q8, Q9). Found by the edge values: DuckDB substring / left / right with 0 or negative values, lpad with an empty pad (error), greatest skipping NULL, sqrt / ln domain (NaN, -inf), extract(microsecond) including seconds, upper('ß'), ascii (code point): guarded or refused; MySQL computes dates down to year 0 (first guard said 1000); the parser builds LOCATE with the string first; constants inside these functions took the date type of an enclosing comparison; the binary-equality rule first also changed GROUP BY keys (TPC-H regression, caught, limited to comparisons) |
+| 2026-11-17 | clang-21, C++23, debug | 41, grouped CHAR in joins (throwaway instance; MTR offload_grouped_char) | pass | 3/3 identical (latin1_bin, utf8mb4_bin, trailing spaces from load and binary log), VARCHAR and _ci refused 2/2, PAD_CHAR_TO_FULL_LENGTH refused; every earlier list unchanged; TPC-H 16 of 22 (Q4, Q5, Q10, Q12 added). Found: PAD_CHAR_TO_FULL_LENGTH was not handled (CHAR results without padding), now refused |
+| 2026-11-17 | clang-21, C++23, debug | 40, LIKE on binary collations (throwaway instance; MTR offload_like, offload_refusals, offload_weights) | pass after a fix | like 19/19 identical and offloaded, refusal 1/1, NO_BACKSLASH_ESCAPES identical; every earlier list unchanged; TPC-H 12 of 22 (Q2, Q13, Q14, Q20 added). Fixed (older than this step, every collation): LIKE without ESCAPE used no escape in DuckDB, MySQL uses `\\` (Item_func_like::escape() now passed always) |
+| 2026-11-17 | clang-21, C++23, debug | DECIMAL above 38 digits, duckdb_decimal_overflow (throwaway instance; MTR decimal_overflow) | pass after a fix | values that fit: identical (run first); SUM of two 38-digit values and a 28-digit value * 1.0000000001: FALLBACK gives InnoDB's values with ON and the reason with FORCED, ROUND as FALLBACK (overflow in DuckDB's own arithmetic), ERROR fails also with ON; a 31-digit value / 3: ROUND gives 3 decimals with a warning. Fixed: an exact division in WHERE overflowed in DuckDB's HUGEINT intermediate without being marked to run first (declared precision below 38): the dividend's digits + shift now decide. BIGNUM tested and unusable (DOUBLE arithmetic). Regressions: all lists pass; TPC-H 8 of 22 (Q11) |
+| 2026-11-17 | clang-21, C++23, debug | TUTORIAL.md, every block of sections 2-15 on a fresh server (port 3410) | pass after fixes | only the four errors the tutorial shows on purpose; 4.5: Last_query_cost and the trace show cost 30174 below the threshold, a lower session threshold and each SET_VAR hint offload the query; 13: duckq built from the build libraries, reads the stopped server's lake (registry, query, live / archived counts), exports Parquet and CSV. Fixed over three runs: world-readable lake warning (chmod), `\G` in piped clients, waits after DDL (wait_applier), the 8.4 partition routine, the order of the clean-up |
+| 2026-11-17 | clang-21, C++23, debug | 39, foreign keys; TPC-H check; fixes (throwaway instance; MTR foreign_keys, transactions, duckdb_plugin) | pass after fixes | foreign keys with every rule, cascades followed, tagged cascade archived; innodb_native_foreign_keys=ON refuses only the cascading child. TPC-H: 7 of 22 offloaded and identical, 15 refused with known reasons, no wrong result. Fixed: FORCED with autocommit=0 crashed a debug server (empty offload reason, assertion in sql_select.cc); `duckdb_offload_min_rows` and `duckdb_offload_wait_applied` ignored SET_VAR hints (not hint-updatable); the recorded duckdb_plugin result lacked the DUCKDB_TABLES plugin. Verified for the docs: Last_query_cost and the optimizer trace show the threshold decision; duckq reads a stopped server's lake, exports Parquet; with mysqld running the catalog is locked |
 | 2026-11-16 | clang-21, C++23, debug | 37 TIME, 38 ENUM and SET (throwaway instance; MTR offload_time, offload_enum, offload_yb; unit tests) | pass after fixes | tt 24/24, refusals 7/7; et 28/28, refusals 6/6; yb 33/33, refusals 7/7; all earlier lists unchanged (6a 19, 6b 45, 6c 37, 6c-2 26, 6c-3 33, div 18, a2 32; refusals 9, 4, 6, 5, 7); history table eh across ENUM/SET reorder: archived indexes recomputed, SET text rewritten (x,z -> z,x), LIVE = InnoDB; unit tests 41 (YEAR, BIT, TIME2, ENUM, SET decoding). Found and fixed: a TIME column inside LIKE / IFNULL would have been translated as its microseconds (special_args() guard for TIME, ENUM, SET, YEAR, BIT); archived SET text kept the old element order. MTR type tests use only table n (the g setup took over 20 minutes with three workers on the HDD) |
 | 2026-11-16 | clang-21, C++23, debug | 36, YEAR and BIT (throwaway instance; MTR offload_yb, offload_refusals) | pass after fixes | yb 33/33 identical and offloaded (after load, inserts, updates, delete), refusals 5/5; regressions 6a 19/19, 6b 45/45, 6c 37/37, 6c-2 26/26, 6c-3 33/33, div 18/18, a2 32/32, refusals 6b 9/9 (u + 1 now exact, replaced by u - 1), 6c 4/4, 6c-2 6/6, 6c-3 5/5, a2 7/7. Found: MySQL sends a YEAR column zero-filled but a YEAR expression as a number (holder per case); an unsigned BIGINT from 2^63 was sent negative (existing bug, fixed); the first setup used ELT (strings: BIT stored ASCII bytes) |
 | 2026-11-16 | clang-21, C++23, debug | 35, INFORMATION_SCHEMA.DUCKDB_TABLES (MTR i_s_tables) | pass | plugin ACTIVE, type INFORMATION SCHEMA; t1 LOADED, PK id, weights s, l (not the utf8mb4_bin column); h1 LOADED YES, PK id1, id2; load file, position and GTID set present; not-loaded t2 absent; RENAME followed (t3); dropped h1 STALE; unload removes the row; no rows without PROCESS, 1 with it; duckdb_enable=OFF: 0 rows, ON: back |

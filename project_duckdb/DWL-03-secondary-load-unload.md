@@ -79,9 +79,14 @@ table for the speedup measurement.
 1. `ALTER TABLE ... SECONDARY_LOAD` copies all rows of the InnoDB table into
    `lake.<db>.<table>` in one DuckLake transaction, together with the registry
    row. A crash or an error leaves nothing in the lake.
-2. The load is refused with an error if the table has no primary key, has
-   foreign keys (referencing or referenced), or has a column of an unsupported
-   type; the error names the reason or the column.
+2. The load is refused with an error if the table has no primary key, or
+   has a column of an unsupported type; the error names the reason or the
+   column. Foreign keys (2026-11-17): allowed with
+   `innodb_native_foreign_keys=OFF` (default; cascades run in the SQL layer
+   and are binlogged as row events, verified for ON DELETE / ON UPDATE
+   CASCADE and SET NULL); with ON, a child of a cascading key (CASCADE, SET
+   NULL, SET DEFAULT) is refused, because InnoDB's own cascades are not
+   binlogged.
 3. The load is refused if `log_bin`, `binlog_format=ROW`,
    `binlog_row_image=FULL`, `gtid_mode=ON` or `binlog_row_metadata=FULL` does
    not hold; the error names the setting. Since DWL#4 step 4a it also
@@ -320,7 +325,9 @@ Lazy (FR 16). No scan of the whole dictionary at startup.
 ### Preconditions
 
 - Primary key: `table.s->primary_key != MAX_KEY`.
-- Foreign keys: `table.s->foreign_keys` and `table.s->foreign_key_parents`.
+- Foreign keys: `cascading_foreign_key()`: `innodb_native_foreign_keys` and
+  the `delete_rule` / `update_rule` of `table.s->foreign_key[]` (the keys
+  where the table is the child).
 - Binlog settings: `opt_bin_log`, `global_system_variables.binlog_format` and
   `.binlog_row_image`, `binlog_row_metadata`, `global_gtid_mode`.
 - Attributes: `table.s->secondary_engine_attribute` parsed with rapidjson.

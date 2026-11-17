@@ -26,7 +26,7 @@
 --source ../include/duckdb_refused.inc
 --let $query= SELECT COUNT(*) FROM p6 WHERE raw LIKE 'k_'
 --source ../include/duckdb_refused.inc
---let $query= SELECT id, TRUNCATE(amount, 1) FROM p6 WHERE id <= 5 ORDER BY id
+--let $query= SELECT id, EXP(amount / 100) FROM p6 WHERE id <= 5 ORDER BY id
 --source ../include/duckdb_refused.inc
 --let $query= SELECT id, ROUND(price) FROM p6 WHERE id <= 5 ORDER BY id
 --source ../include/duckdb_refused.inc

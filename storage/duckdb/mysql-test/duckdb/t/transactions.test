@@ -1,0 +1,45 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# Offload and transactions: MySQL does not use a secondary engine inside a
+# multi-statement transaction (autocommit=0, BEGIN). With FORCED the error
+# gives the reason (the server asks the plugin for one even though it never
+# offered the query to it: an empty reason crashed a debug server).
+--source ../include/have_duckdb.inc
+--source ../include/tables_n.inc
+CREATE TABLE t1 (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO t1 SELECT n, n % 7 FROM n;
+ALTER TABLE t1 SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+SET SESSION autocommit = 0;
+SET SESSION use_secondary_engine = FORCED;
+--error ER_SECONDARY_ENGINE
+SELECT COUNT(*), SUM(v) FROM t1;
+--echo # ON: the query runs on InnoDB
+SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
+SELECT COUNT(*), SUM(v) FROM t1;
+SET SESSION autocommit = 1;
+
+SET SESSION use_secondary_engine = FORCED;
+BEGIN;
+--error ER_SECONDARY_ENGINE
+SELECT COUNT(*), SUM(v) FROM t1;
+COMMIT;
+--echo # autocommit=1, no transaction: DuckDB
+--let $query= SELECT COUNT(*), SUM(v) FROM t1
+--source ../include/duckdb_compare.inc
+SET SESSION use_secondary_engine = DEFAULT, secondary_engine_cost_threshold = DEFAULT;
+--source ../include/cleanup.inc
