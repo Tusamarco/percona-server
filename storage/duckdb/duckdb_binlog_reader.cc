@@ -360,12 +360,12 @@ void BinlogReader::binlog_end() {
 
 bool BinlogReader::wait_applied(const BinlogPos &pos, THD *thd,
                                 bool *not_running, std::string *err,
-                                int timeout_seconds) {
+                                unsigned long long timeout_ms) {
   *not_running = false;
   // The reader commits at once on request, so a long wait means it is far
   // behind.
   const auto limit = std::chrono::steady_clock::now() +
-                     std::chrono::seconds(timeout_seconds);
+                     std::chrono::milliseconds(timeout_ms);
   std::unique_lock<std::mutex> lk(m_mutex);
   // Done when the applied position reaches pos, or when the reader has read
   // past pos and has nothing pending (only binlog headers after its last
@@ -383,8 +383,8 @@ bool BinlogReader::wait_applied(const BinlogPos &pos, THD *thd,
     if (std::chrono::steady_clock::now() >= limit) {
       *err = "the binlog applier has not reached the load position " +
              pos.file + ":" + std::to_string(pos.pos) +
-             " within " + std::to_string(timeout_seconds) +
-             " s (it is at " + m_applied.file + ":" +
+             " within " + std::to_string(timeout_ms) +
+             " ms (it is at " + m_applied.file + ":" +
              std::to_string(m_applied.pos) + "); try again";
       return true;
     }

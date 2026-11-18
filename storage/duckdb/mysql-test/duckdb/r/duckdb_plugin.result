@@ -31,8 +31,10 @@ duckdb_history_check_only
 duckdb_history_scope
 duckdb_lake_relocate
 duckdb_memory_limit
+duckdb_offload_float_aggregates
 duckdb_offload_min_rows
 duckdb_offload_wait_applied
+duckdb_offload_wait_timeout_ms
 duckdb_threads
 duckdb_unload_history_confirm
 # Load and unload

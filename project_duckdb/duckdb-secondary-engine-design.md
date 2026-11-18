@@ -6,7 +6,7 @@ Status: v0.4, 2026-11-17: the POC is implemented and the design below describes 
 
 Changes from v0.3 (what the implementation added or changed, 2026-11-07 to 2026-11-17):
 
-- All five POC features work end to end (DWL#1 to DWL#7), with an MTR suite of 25 tests, unit tests and a release-build performance run (offloaded queries 54x to 584x faster than InnoDB).
+- All five POC features work end to end (DWL#1 to DWL#7), with an MTR suite of 26 tests, unit tests and a release-build performance run (offloaded queries 54x to 584x faster than InnoDB).
 - DDL no longer unloads a copy: the applier refreshes it (archived rows kept), follows RENAME TABLE, and marks it stale only when it cannot follow (DWL#4 step 4d).
 - History copies survive DROP TABLE and can be reattached, resynced or adopted by another table (DWL#3 step 3b).
 - The applier is one reader thread that decodes, collapses and commits batches; the parallel prepare workers of v0.3 were not needed and are deferred.
@@ -391,7 +391,7 @@ With history retention, DuckDB is no longer a disposable copy: it holds the only
 - Resource limits: `duckdb_memory_limit` and `duckdb_threads` are mandatory and dynamic.
 - DDL on a base table without history invalidates the secondary copy and requires a reload; with history, see Durability of the history.
 - Observability (implemented): 31 status variables (applier state and position, applied position and GTID, batches, changes, pieces, purges and archived rows, DDL refreshes / renames / failures, offloaded and refused queries with the last reason, guard counters, executor pool) and `INFORMATION_SCHEMA.DUCKDB_TABLES`; the optimizer trace and EXPLAIN notes for offload. Still to do: apply lag in seconds, time split between decode and commit, DuckDB memory use (Phased plan, phase 3).
-- Testing (implemented): MTR suite `duckdb` (25 tests: plugin, applier, history, guard, super_read_only, foreign keys, transactions, DECIMAL overflow, LIKE, grouped CHAR, functions, INFORMATION_SCHEMA, cached tables, offload rules, the offload query and refusal lists, types); every query runs with use_secondary_engine OFF and FORCED and results are compared; unit tests (41); manual tests for restarts, replicas, semi-sync, relocation and performance (`manual-test-plan.md`).
+- Testing (implemented): MTR suite `duckdb` (26 tests: plugin, applier, history, guard, super_read_only, foreign keys, transactions, DECIMAL overflow, LIKE, grouped CHAR, functions, INFORMATION_SCHEMA, cached tables, offload rules, the offload query and refusal lists, types); every query runs with use_secondary_engine OFF and FORCED and results are compared; unit tests (41); manual tests for restarts, replicas, semi-sync, relocation and performance (`manual-test-plan.md`).
 
 ## Build and source integration
 
@@ -539,7 +539,7 @@ not a read). Last update: 2026-11-17 (function review, TPC-H 19/22,
 
 | Feature | Status | Notes / tests |
 |---|---|---|
-| COUNT, SUM, AVG, MIN, MAX, with DISTINCT | done | exact SUM and AVG (6a, B) |
+| COUNT, SUM, AVG, MIN, MAX, with DISTINCT | done | exact SUM and AVG (6a, B); SUM / AVG of FLOAT and DOUBLE: the last digits can differ (DuckDB's parallel order); allowed by default, `duckdb_offload_float_aggregates = REFUSE` sends them to InnoDB (2026-11-18) |
 | STDDEV, VARIANCE (POP / SAMP) | missing | |
 | BIT_AND, BIT_OR, BIT_XOR | missing | |
 | GROUP_CONCAT (LISTAGG), JSON_ARRAYAGG / JSON_OBJECTAGG | missing | |
@@ -658,7 +658,7 @@ Needed for general availability:
 | Packaging | One tarball; plugin size (about 1.5 GB with debug info, stripped release); ICU symbol clash between the server (ICU 77) and DuckDB's icu extension (hidden visibility, to test) | missing |
 | Security and compliance | Encryption (designed, keyring component), erasure requests against history copies (a purge keeps the personal data), privileges reviewed | designed |
 | Upgrade policy | DuckDB / DuckLake version upgrades and lake format migration (DuckLake has no release tags) | missing |
-| CI | MTR suite in CI, Clang build, ASAN / UBSAN runs of the applier and the offload | missing (MTR suite exists, 25 tests) |
+| CI | MTR suite in CI, Clang build, ASAN / UBSAN runs of the applier and the offload | missing (MTR suite exists, 26 tests) |
 | Documentation | Operations guide (sizing, monitoring, failure scenarios), beyond HOWTO and TUTORIAL | partial |
 
 ### SQL gaps by priority

@@ -58,6 +58,7 @@ default 15-minute limit: add `--testcase-timeout=45`.
 | `offload_functions` | functions reviewed against DuckDB: date, number and string functions with edge values; the refused ones (42) |
 | `offload_yb` | YEAR and BIT: load, applier, results (YEAR columns zero-filled, BIT as bytes), unsigned arithmetic, refusals (36) |
 | `offload_refusals` | the refusal lists `duckdb_offload_*_refusals.sql` |
+| `offload_counters` | SUM / AVG of FLOAT and DOUBLE (`duckdb_offload_float_aggregates`), FLOAT sent as FLOAT, the offload counters (runs, EXPLAIN, waits), `duckdb_offload_wait_timeout_ms`, the user's `optimizer_switch` kept around offload |
 
 Not in MTR (manual-test-plan.md): restarts with special options and long
 runs: startup failures (11), binlog gaps (15), replica with a source (18), the applier

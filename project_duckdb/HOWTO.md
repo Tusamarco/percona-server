@@ -611,7 +611,9 @@ may differ in trailing spaces (`'a'` or `'a '`: MySQL does not define which).
 
 Read your own writes: with `duckdb_offload_wait_applied = ON` (default), a
 query waits until the applier has applied this connection's last commit (at
-most 5 s, otherwise it runs on InnoDB). With OFF it may not see a commit made
+most `duckdb_offload_wait_timeout_ms`, 5000 by default, otherwise it runs on
+InnoDB; `duckdb_offload_waits` and `duckdb_offload_wait_timeouts` count
+them). With OFF it may not see a commit made
 less than about a second earlier.
 
 ### When MySQL uses DuckDB: changing the thresholds
@@ -1027,7 +1029,9 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | `duckdb_apply_debug_log` | global | yes | OFF | ON, OFF | Testing aid: one error log line per change and per table of each batch, with DuckDB row counts (needs `log_error_verbosity=3`). |
 | `duckdb_offload_min_rows` | session, global, `SET_VAR` | yes | 1000000 | 0 .. 2^64-1 | Also try a query in DuckDB when MySQL's plan reads a loaded table of at least this many rows by a full scan, full index scan or non-unique index lookup, whatever its estimated cost. 0: only `secondary_engine_cost_threshold` decides. |
 | `duckdb_decimal_overflow` | session, global, `SET_VAR` | yes | FALLBACK | FALLBACK, ROUND, ERROR | DECIMAL results MySQL declares above 38 digits are computed as DECIMAL(38, scale) and the statement runs in DuckDB first; if a value does not fit: FALLBACK runs it on InnoDB (FORCED: error), ROUND runs it again with fewer decimals and a warning (when that helps; otherwise as FALLBACK), ERROR fails with DuckDB's error (no first run). |
-| `duckdb_offload_wait_applied` | session, `SET_VAR` | yes | ON | ON, OFF | Before a query runs in DuckDB, wait until the applier has applied this connection's last commit (at most 5 s, otherwise InnoDB). |
+| `duckdb_offload_wait_applied` | session, `SET_VAR` | yes | ON | ON, OFF | Before a query runs in DuckDB, wait until the applier has applied this connection's last commit (at most `duckdb_offload_wait_timeout_ms`, otherwise InnoDB). |
+| `duckdb_offload_wait_timeout_ms` | session, `SET_VAR` | yes | 5000 | 0 - 3600000 | How long that wait lasts, in milliseconds. |
+| `duckdb_offload_float_aggregates` | session, global, `SET_VAR` | yes | APPROXIMATE | APPROXIMATE, REFUSE | SUM and AVG of FLOAT / DOUBLE: DuckDB adds in parallel in no fixed order, so the last digits can differ from InnoDB and between runs. APPROXIMATE runs them in DuckDB; REFUSE runs such queries on InnoDB (under FULL scope they fail). |
 | `duckdb_history_check_only` | session | yes | OFF | ON, OFF | SECONDARY_LOAD of a history table only checks that it can take over a history copy (adopt, reattach, resync) and always ends with an error giving the result. |
 | `duckdb_unload_history_confirm` | session | yes | OFF | ON, OFF | Allows SECONDARY_UNLOAD of a history table and `duckdb_discard_stale_copy` of a history copy (archived rows are deleted). |
 
@@ -1058,7 +1062,10 @@ all), `innodb_flush_log_at_trx_commit=1` (recommended), `binlog_encryption=OFF`,
 | `duckdb_apply_batches` / `duckdb_apply_rows_written` | DuckDB commits with changes, rows written. |
 | `duckdb_apply_large_transactions` / `duckdb_apply_pieces` | Transactions applied in pieces, pieces written. |
 | `duckdb_guard_forced` / `duckdb_guard_rejected` | FULL scope statements on history tables sent to DuckDB only / stopped with an error (DWL#7). |
-| `duckdb_offload_queries` / `duckdb_offload_refused` / `duckdb_offload_last_refusal` | Queries run in DuckDB, queries refused (then run on InnoDB, or an error with FORCED), reason of the last refusal. |
+| `duckdb_offload_queries` / `duckdb_offload_refused` / `duckdb_offload_last_refusal` | Queries run in DuckDB to the end (not EXPLAIN, not statements that failed while running), queries refused (then run on InnoDB, or an error with FORCED), reason of the last refusal. |
+| `duckdb_offload_explained` | EXPLAIN of statements that would run in DuckDB. |
+| `duckdb_offload_waits` / `duckdb_offload_wait_timeouts` | Waits for the connection's last commit, and those that timed out (the query ran on InnoDB). |
+| `duckdb_offload_decimal_reruns` | Runs again with fewer decimals under `duckdb_decimal_overflow = ROUND`. |
 | `duckdb_apply_purge_transactions` / `duckdb_apply_archived_rows` | Tagged purge transactions on loaded tables; rows kept as archived rows. |
 | `duckdb_apply_ddl_refreshes` / `duckdb_apply_ddl_renames` / `duckdb_apply_ddl_deferred` / `duckdb_apply_ddl_failures` | Copies refreshed or renamed after DDL, refreshes deferred to a later rename, copies marked stale by a DDL. |
 | `duckdb_applied_file` / `duckdb_applied_position` / `duckdb_applied_gtid` | Applied position: what DuckDB contains. |

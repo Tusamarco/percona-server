@@ -448,7 +448,8 @@ SELECT COUNT(*), SUM(amount) FROM orders;
 ```
 
 Same numbers. A query sent to DuckDB right after your own commit waits until
-the applier has applied it (`duckdb_offload_wait_applied`, at most 5 s).
+the applier has applied it (`duckdb_offload_wait_applied`, at most
+`duckdb_offload_wait_timeout_ms`, 5 s by default).
 Inside a transaction that has written, queries run on InnoDB (they must see
 your uncommitted rows).
 
@@ -872,8 +873,28 @@ SET SESSION duckdb_decimal_overflow = DEFAULT;
 **`duckdb_offload_wait_applied`** (session or `SET_VAR` hint, default ON).
 Before a query
 runs in DuckDB, wait until the applier has applied this connection's last
-commit (at most 5 s; after that the query runs on InnoDB). OFF: a query may
-miss a commit made less than about a second before.
+commit (at most `duckdb_offload_wait_timeout_ms`; after that the query runs
+on InnoDB). OFF: a query may miss a commit made less than about a second
+before.
+
+**`duckdb_offload_wait_timeout_ms`** (session or `SET_VAR` hint, default
+5000, 0 to 3600000). How long that wait lasts, in milliseconds.
+
+```sql
+SELECT /*+ SET_VAR(duckdb_offload_wait_timeout_ms = 20000) */ COUNT(*) FROM orders;
+```
+
+**`duckdb_offload_float_aggregates`** (session, global or `SET_VAR` hint,
+default APPROXIMATE). SUM and AVG of FLOAT and DOUBLE values: DuckDB adds
+them in parallel in no fixed order, so the last digits can differ from
+InnoDB's (and from one run to the next). APPROXIMATE: they run in DuckDB.
+REFUSE: such queries run on InnoDB (under `duckdb_history_scope = FULL` they
+fail). SUM and AVG of integers and DECIMAL are always exact.
+
+```sql
+SELECT /*+ SET_VAR(duckdb_offload_float_aggregates = REFUSE) */ sensor, AVG(value)
+  FROM readings GROUP BY sensor ORDER BY sensor LIMIT 3;   -- InnoDB's digits
+```
 
 **`duckdb_history_scope`** (session, global, `SET_VAR` hint; default LIVE).
 LIVE or FULL (section 7). FULL needs `DUCKDB_HISTORY_READER` and the active
@@ -970,7 +991,10 @@ SHOW GLOBAL STATUS LIKE 'duckdb_applied%';
 
 | Variable | Meaning | Normal |
 |---|---|---|
-| `duckdb_offload_queries` | Queries run in DuckDB. | grows with analytic queries |
+| `duckdb_offload_queries` | Queries run in DuckDB to the end (EXPLAIN and statements that failed during execution are not counted). | grows with analytic queries |
+| `duckdb_offload_explained` | EXPLAIN of statements that would run in DuckDB. | |
+| `duckdb_offload_waits` / `duckdb_offload_wait_timeouts` | Waits for the connection's last commit (`duckdb_offload_wait_applied`), and those that reached `duckdb_offload_wait_timeout_ms` (the query ran on InnoDB). | timeouts near 0; growing: the applier is behind |
+| `duckdb_offload_decimal_reruns` | Runs again with fewer decimals (`duckdb_decimal_overflow = ROUND`). | |
 | `duckdb_offload_refused` | Queries the plugin refused (they ran on InnoDB, or failed with FORCED). | |
 | `duckdb_offload_last_refusal` | Reason of the last refusal (section 12.3). | |
 | `duckdb_guard_forced` | Statements on history tables under FULL sent to DuckDB only. | |

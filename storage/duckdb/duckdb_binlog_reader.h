@@ -96,7 +96,8 @@ class BinlogReader {
     true on timeout (60 s) or KILL, with *err.
   */
   bool wait_applied(const BinlogPos &pos, THD *thd, bool *not_running,
-                    std::string *err, int timeout_seconds = 60);
+                    std::string *err,
+                    unsigned long long timeout_ms = 60000);
 
   /**
     Called by the transaction observer (after_commit) after the InnoDB

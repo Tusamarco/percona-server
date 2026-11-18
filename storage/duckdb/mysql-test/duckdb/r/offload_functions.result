@@ -72,4 +72,13 @@ Got one of the listed errors
 SET SESSION use_secondary_engine = FORCED;
 SELECT LEFT(s, 1) AS c, COUNT(*) FROM fx GROUP BY c ORDER BY c;
 Got one of the listed errors
+# REVERSE by code points as MySQL: combining marks and emoji modifiers
+CREATE TABLE rv (id INT PRIMARY KEY, s VARCHAR(30) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO rv VALUES (1, CONCAT('e', _utf16 0x0301, 'x')), (2, CONCAT(_utf16 0xD83DDC4D, _utf16 0xD83CDFFD, 'a')),
+(3, ''), (4, NULL), (5, 'abc');
+ALTER TABLE rv SECONDARY_LOAD;
+# SELECT id, REVERSE(s), CHAR_LENGTH(REVERSE(s)) FROM rv ORDER BY id
+DROP TABLE rv;
+# Negated negative constants ("--" is a comment in DuckDB), a newline in a string
+# SELECT id, -(-1.5), - -2.25, -(-d), -(0 - 1.5) * n FROM fx WHERE s <> 'a\nb' ORDER BY id
 DROP TABLE fx;

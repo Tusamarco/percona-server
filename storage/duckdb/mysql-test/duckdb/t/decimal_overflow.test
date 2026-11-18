@@ -29,6 +29,13 @@ ALTER TABLE big SECONDARY_LOAD;
 --let $query= SELECT id, b / 3, a * 0 + b FROM big WHERE id IN (2, 3) ORDER BY id
 --source ../include/duckdb_compare.inc
 
+--echo # A literal of more than 38 digits: DuckDB would read it as DOUBLE
+--echo # (in WHERE, MySQL folds a comparison of a column with an out-of-range constant)
+--let $query= SELECT id, a < 123456789012345678901234567890123456789 FROM big ORDER BY id
+--source ../include/duckdb_refused.inc
+--let $query= SELECT id FROM big WHERE b - 1234567890123456789012345678.1234567890123 < 0 ORDER BY id
+--source ../include/duckdb_refused.inc
+
 --echo # FALLBACK (default): ON gives InnoDB's values, FORCED the reason
 SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
 SELECT SUM(a) FROM big WHERE id <= 2;

@@ -82,6 +82,9 @@ TYPELIB history_scope_typelib = {2, "", history_scope_names, nullptr};
 const char *decimal_overflow_names[] = {"FALLBACK", "ROUND", "ERROR",
                                         nullptr};
 TYPELIB decimal_overflow_typelib = {3, "", decimal_overflow_names, nullptr};
+// duckdb_offload_float_aggregates (2026-11-18): SUM / AVG of FLOAT, DOUBLE.
+const char *float_aggregates_names[] = {"REFUSE", "APPROXIMATE", nullptr};
+TYPELIB float_aggregates_typelib = {2, "", float_aggregates_names, nullptr};
 // DWL#5: the dynamic privilege needed for duckdb_history_scope=FULL.
 constexpr char kHistoryReaderPrivilege[] = "DUCKDB_HISTORY_READER";
 SERVICE_TYPE(dynamic_privilege_register) *privilege_service = nullptr;
@@ -569,10 +572,31 @@ MYSQL_THDVAR_ENUM(decimal_overflow,
 MYSQL_THDVAR_BOOL(offload_wait_applied,
                   PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
                   "Before a query runs in DuckDB, wait until the binlog "
-                  "applier has applied the session's last commit (at most 5 "
-                  "s; otherwise the query runs on InnoDB), so the session "
-                  "reads its own writes. Also a SET_VAR hint.",
+                  "applier has applied the session's last commit (at most "
+                  "duckdb_offload_wait_timeout_ms; otherwise the query runs "
+                  "on InnoDB), so the session reads its own writes. Also a "
+                  "SET_VAR hint.",
                   nullptr, nullptr, true);
+
+MYSQL_THDVAR_ULONGLONG(offload_wait_timeout_ms,
+                       PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
+                       "How long a query waits for the binlog applier to "
+                       "apply the session's last commit "
+                       "(duckdb_offload_wait_applied), in milliseconds; "
+                       "then the query runs on InnoDB (with "
+                       "use_secondary_engine=FORCED an error). Also a "
+                       "SET_VAR hint.",
+                       nullptr, nullptr, 5000, 0, 3600000, 0);
+
+MYSQL_THDVAR_ENUM(offload_float_aggregates,
+                  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
+                  "SUM and AVG of FLOAT and DOUBLE values: DuckDB adds them "
+                  "in parallel in no fixed order, so the last digits differ "
+                  "from InnoDB's and between runs. APPROXIMATE (default): "
+                  "they run in DuckDB. REFUSE: such queries run on InnoDB "
+                  "(under duckdb_history_scope=FULL they fail). Also a "
+                  "SET_VAR hint.",
+                  nullptr, nullptr, 1, &float_aggregates_typelib);
 
 MYSQL_THDVAR_ULONGLONG(offload_min_rows,
                        PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
@@ -644,6 +668,8 @@ SYS_VAR *duckdb_system_variables[] = {MYSQL_SYSVAR(enable),
                                       MYSQL_SYSVAR(discard_stale_copy),
                                       MYSQL_SYSVAR(history_scope),
                                       MYSQL_SYSVAR(offload_wait_applied),
+                                      MYSQL_SYSVAR(offload_wait_timeout_ms),
+                                      MYSQL_SYSVAR(offload_float_aggregates),
                                       MYSQL_SYSVAR(offload_min_rows),
                                       MYSQL_SYSVAR(decimal_overflow),
                                       nullptr};
@@ -763,6 +789,22 @@ int show_offloaded(THD *, SHOW_VAR *var, char *buff) {
   return show_number(var, buff, offload_status().offloaded);
 }
 
+int show_offload_explained(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, offload_status().explained);
+}
+
+int show_offload_waits(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, offload_status().waits);
+}
+
+int show_offload_wait_timeouts(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, offload_status().wait_timeouts);
+}
+
+int show_offload_decimal_reruns(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, offload_status().decimal_reruns);
+}
+
 int show_offload_refused(THD *, SHOW_VAR *var, char *buff) {
   return show_number(var, buff, offload_status().refused);
 }
@@ -858,6 +900,17 @@ SHOW_VAR duckdb_status_variables[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_offload_last_refusal",
      reinterpret_cast<char *>(&show_offload_last_refusal), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_offload_explained",
+     reinterpret_cast<char *>(&show_offload_explained), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_offload_waits", reinterpret_cast<char *>(&show_offload_waits),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_offload_wait_timeouts",
+     reinterpret_cast<char *>(&show_offload_wait_timeouts), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_offload_decimal_reruns",
+     reinterpret_cast<char *>(&show_offload_decimal_reruns), SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"duckdb_apply_archived_rows",
      reinterpret_cast<char *>(&show_archived_rows), SHOW_FUNC,
@@ -1080,6 +1133,16 @@ DecimalOverflow decimal_overflow(THD *thd) {
   return thd != nullptr
              ? static_cast<DecimalOverflow>(THDVAR(thd, decimal_overflow))
              : DecimalOverflow::FALLBACK;
+}
+
+unsigned long long offload_wait_timeout_ms(THD *thd) {
+  return thd != nullptr ? THDVAR(thd, offload_wait_timeout_ms) : 5000;
+}
+
+FloatAggregates float_aggregates(THD *thd) {
+  return thd != nullptr ? static_cast<FloatAggregates>(
+                              THDVAR(thd, offload_float_aggregates))
+                        : FloatAggregates::APPROXIMATE;
 }
 
 unsigned long long offload_min_rows(THD *thd) {

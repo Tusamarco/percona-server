@@ -1,0 +1,99 @@
+CREATE TABLE fa (id INT PRIMARY KEY, g INT, f DOUBLE, r FLOAT, d DECIMAL(10,2), s VARCHAR(10) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO fa VALUES (1, 1, 1e16, 1.5, 1.10, 'a'), (2, 1, 1, 2.5, 2.20, 'b'), (3, 1, -1e16, 0.1, 3.30, 'c'),
+(4, 2, 0.1, 0.2, 4.40, 'd'), (5, 2, 0.2, 0.3, 5.50, NULL), (6, 2, NULL, NULL, NULL, 'f');
+ALTER TABLE fa SECONDARY_LOAD;
+CREATE TABLE fb (id INT PRIMARY KEY, a INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO fb VALUES (1, 1), (2, 2), (4, 4);
+ALTER TABLE fb SECONDARY_LOAD;
+# APPROXIMATE is the default
+SELECT @@duckdb_offload_float_aggregates;
+@@duckdb_offload_float_aggregates
+APPROXIMATE
+# REFUSE: SUM / AVG of FLOAT and DOUBLE run on InnoDB
+SET SESSION duckdb_offload_float_aggregates = REFUSE;
+# SELECT g, SUM(f) FROM fa GROUP BY g ORDER BY g
+SET SESSION use_secondary_engine = FORCED;
+SELECT g, SUM(f) FROM fa GROUP BY g ORDER BY g;
+Got one of the listed errors
+# SELECT AVG(r) FROM fa
+SET SESSION use_secondary_engine = FORCED;
+SELECT AVG(r) FROM fa;
+Got one of the listed errors
+# SELECT SUM(DISTINCT f), AVG(DISTINCT f) FROM fa
+SET SESSION use_secondary_engine = FORCED;
+SELECT SUM(DISTINCT f), AVG(DISTINCT f) FROM fa;
+Got one of the listed errors
+# SELECT SUM(d * 1e0) FROM fa
+SET SESSION use_secondary_engine = FORCED;
+SELECT SUM(d * 1e0) FROM fa;
+Got one of the listed errors
+# FLOAT values are sent as FLOAT (shortest float digits, as InnoDB)
+# SELECT id, r, r * 2, f FROM fa ORDER BY id
+# Exact numbers and MIN / MAX / COUNT of DOUBLE still run in DuckDB
+# SELECT g, SUM(d), AVG(d), MIN(f), MAX(r), COUNT(f) FROM fa GROUP BY g ORDER BY g
+# APPROXIMATE: they run in DuckDB (values where the order cannot matter)
+# SELECT /*+ SET_VAR(duckdb_offload_float_aggregates = APPROXIMATE) */ g, SUM(r), AVG(r) FROM fa WHERE id IN (1, 2, 6) GROUP BY g ORDER BY g
+SET SESSION duckdb_offload_float_aggregates = DEFAULT;
+# SELECT COUNT(*) FROM fa HAVING SUM(r) > 0
+# REFUSE per statement
+# SELECT /*+ SET_VAR(duckdb_offload_float_aggregates = REFUSE) */ AVG(f) FROM fa WHERE id IN (4, 5)
+SET SESSION use_secondary_engine = FORCED;
+SELECT /*+ SET_VAR(duckdb_offload_float_aggregates = REFUSE) */ AVG(f) FROM fa WHERE id IN (4, 5);
+Got one of the listed errors
+SET SESSION duckdb_offload_float_aggregates = EXACT;
+ERROR 42000: Variable 'duckdb_offload_float_aggregates' can't be set to the value of 'EXACT'
+# duckdb_offload_queries counts runs, EXPLAIN goes to duckdb_offload_explained
+SET SESSION use_secondary_engine = FORCED;
+EXPLAIN SELECT COUNT(*) FROM fa;
+EXPLAIN FORMAT=TREE SELECT g, COUNT(*) FROM fa GROUP BY g;
+SELECT COUNT(*) FROM fa;
+COUNT(*)
+6
+queries_after_explain	explained	queries_after_select
+0	2	1
+# Waits for the session's last commit, with the timeout variable
+SELECT @@duckdb_offload_wait_timeout_ms;
+@@duckdb_offload_wait_timeout_ms
+5000
+SET SESSION duckdb_offload_wait_timeout_ms = 20000;
+INSERT INTO fa VALUES (7, 3, 7, 7, 7.00, 'g');
+SELECT /*+ SET_VAR(duckdb_offload_wait_timeout_ms = 30000) */ COUNT(*) FROM fa WHERE g = 3;
+COUNT(*)
+1
+waited
+1
+SET SESSION duckdb_offload_wait_timeout_ms = 4000000;
+Warnings:
+Warning	1292	Truncated incorrect duckdb_offload_wait_timeout_ms value: '4000000'
+SELECT @@duckdb_offload_wait_timeout_ms;
+@@duckdb_offload_wait_timeout_ms
+3600000
+SET SESSION duckdb_offload_wait_timeout_ms = DEFAULT;
+# optimizer_switch: semi-join materialization is off only while we optimize
+SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
+# SELECT /*+ SET_VAR(optimizer_switch = 'materialization=on') */ id FROM fa WHERE id IN (SELECT a FROM fb) ORDER BY id
+SET SESSION use_secondary_engine = ON;
+# refused (runs on InnoDB) with the hint
+SELECT /*+ SET_VAR(optimizer_switch = 'materialization=on') SET_VAR(duckdb_offload_float_aggregates = REFUSE) */ id, SUM(f) FROM fa WHERE id IN (SELECT a FROM fb) GROUP BY id ORDER BY id;
+id	SUM(f)
+1	1e16
+2	1
+4	0.1
+SELECT id FROM fa WHERE id IN (SELECT a FROM fb) ORDER BY id;
+id
+1
+2
+4
+optimizer_switch_unchanged	materialization_on
+1	1
+SET SESSION optimizer_switch = 'materialization=off';
+SELECT id FROM fa WHERE id IN (SELECT a FROM fb) ORDER BY id;
+id
+1
+2
+4
+SELECT LOCATE('materialization=off', @@optimizer_switch) > 0 AS still_off;
+still_off
+1
+SET SESSION optimizer_switch = DEFAULT, use_secondary_engine = DEFAULT, secondary_engine_cost_threshold = DEFAULT;
+DROP TABLE fa, fb;

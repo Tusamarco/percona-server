@@ -39,7 +39,9 @@ Decisions (2026-11-12):
   used (MySQL dialect).
 - Freshness: `duckdb_offload_wait_applied` (session, default ON): before a
   query runs in DuckDB, the applier must have applied the session's last
-  commit (at most 5 s, otherwise InnoDB).
+  commit (at most `duckdb_offload_wait_timeout_ms`, default 5000, otherwise
+  InnoDB; counters `duckdb_offload_waits`, `duckdb_offload_wait_timeouts`,
+  2026-11-18).
 - Collations in the POC: binary strings and NO PAD binary collations
   (`utf8mb4_0900_bin`) are exact; PAD SPACE binary collations (`utf8mb3_bin`,
   `utf8mb4_bin`) are exact since 6b (`rtrim`, padded sort key); other
@@ -272,7 +274,8 @@ Files: `duckdb_offload.h/.cc`.
   transaction (the server also refuses multi-statement transactions, error
   3889), applier behind (5 s) or not running.
 - Status: `duckdb_offload_queries`, `duckdb_offload_refused`,
-  `duckdb_offload_last_refusal`; optimizer trace `duckdb_offload` with the SQL
+  `duckdb_offload_last_refusal` (later also `_explained`, `_waits`,
+  `_wait_timeouts`, `_decimal_reruns`); optimizer trace `duckdb_offload` with the SQL
   or the refusal reason.
 
 ### Lessons from step 6a
@@ -788,7 +791,33 @@ return DOUBLE and `sum` returns NULL.
   arithmetic (SUM accumulator, multiplication) fewer decimals do not help
   and it ends as FALLBACK; ERROR does not run first: an overflow is the
   statement's error, also with ON. EXPLAIN never runs the statement.
+- An overflow is recognised by DuckDB's error type (OUT_OF_RANGE for
+  arithmetic, CONVERSION for a cast to DECIMAL(38, s)) and a DECIMAL /
+  HUGEINT / INT128 value in the message; any other error is a plain
+  refusal, never retried with fewer decimals (2026-11-18). Each ROUND rerun
+  is counted in `duckdb_offload_decimal_reruns`.
+- Literals of more than 38 digits are refused (DuckDB reads them as DOUBLE
+  or HUGEINT).
 - Tests: MTR `decimal_overflow`; TPC-H Q11 now offloaded (8 of 22).
+
+### FLOAT and DOUBLE (2026-11-18)
+
+- SUM and AVG of FLOAT / DOUBLE: DuckDB adds in parallel in no fixed order;
+  on 3 million rows `sum()` gave different last digits on each run, and
+  `fsum()` (compensated) differs too and is not MySQL's row-order sum.
+  `duckdb_offload_float_aggregates` (session, global, SET_VAR):
+  APPROXIMATE (default, decided 2026-11-18: runs in DuckDB; under FULL
+  scope no InnoDB answer exists anyway), REFUSE (reason
+  `sum_or_avg_of_float`).
+  MIN, MAX, COUNT of FLOAT / DOUBLE and every aggregate of exact numbers are
+  not affected.
+- FLOAT values are sent with a FLOAT holder (the metadata type): before,
+  the DOUBLE holder printed 0.10000000149011612 where InnoDB prints 0.1 (a
+  debug server asserted in `Protocol_text::store_double`).
+- Counters: `duckdb_offload_queries` now counts statements run to the end
+  (in `execute_offloaded`), EXPLAIN goes to `duckdb_offload_explained`.
+- Tests: MTR `offload_counters` (also the user's `optimizer_switch` kept
+  around offload with a `SET_VAR(optimizer_switch=...)` hint).
 
 ### LIKE on binary collations (2026-11-17)
 
@@ -853,7 +882,8 @@ only where the results match, with the guards listed. Tests:
 | `CONCAT` | translated | strings, integers, DECIMAL, DATE, DATETIME(0); NULL with any NULL (`\|\|`); DOUBLE, DATETIME(n) refused (formatting) |
 | `CONCAT_WS` | translated | NULL values skipped in both; NULL separator gives NULL |
 | `TRIM`, `LTRIM`, `RTRIM` | translated | spaces, or one character; `TRIM('xy' FROM s)` refused (MySQL removes the string, DuckDB any of the characters) |
-| `REPLACE`, `REVERSE` | translated | REPLACE matches bytes in MySQL under any collation, as DuckDB |
+| `REPLACE`, `REVERSE` | translated | REPLACE matches bytes in MySQL under any collation, as DuckDB; REVERSE reverses code points (`list_reverse(string_split(s, ''))`): DuckDB's `reverse()` keeps grapheme clusters together (fixed 2026-11-18) |
+| DECIMAL literals over 38 digits | refused | DuckDB reads them as DOUBLE or HUGEINT (`decimal_literal_over_38_digits`, 2026-11-18) |
 | `LPAD`, `RPAD` | translated | NULL for a negative length; an empty pad returns the value (truncated if longer) as MySQL (DuckDB: error) |
 | `INSTR`, `LOCATE(sub, s)` | translated | binary collations only (a search under `_ci` ignores case); the parser builds LOCATE with the string first; `LOCATE` with a start position not yet |
 | `UPPER`, `LOWER` | refused | case mappings differ (DuckDB `upper('ß')` = 'ẞ', MySQL 'ß') |

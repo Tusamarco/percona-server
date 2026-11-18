@@ -7,6 +7,16 @@ INSERT INTO big VALUES (1, 99999999999999999999999999999999999999, 1234567890123
 ALTER TABLE big SECONDARY_LOAD;
 # Declared wide, values that fit: DuckDB, the same as InnoDB
 # SELECT id, b / 3, a * 0 + b FROM big WHERE id IN (2, 3) ORDER BY id
+# A literal of more than 38 digits: DuckDB would read it as DOUBLE
+# (in WHERE, MySQL folds a comparison of a column with an out-of-range constant)
+# SELECT id, a < 123456789012345678901234567890123456789 FROM big ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, a < 123456789012345678901234567890123456789 FROM big ORDER BY id;
+Got one of the listed errors
+# SELECT id FROM big WHERE b - 1234567890123456789012345678.1234567890123 < 0 ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id FROM big WHERE b - 1234567890123456789012345678.1234567890123 < 0 ORDER BY id;
+Got one of the listed errors
 # FALLBACK (default): ON gives InnoDB's values, FORCED the reason
 SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
 SELECT SUM(a) FROM big WHERE id <= 2;

@@ -141,6 +141,10 @@ bool freshness_target(THD *thd, BinlogPos *target) {
 
 std::atomic<unsigned long long> g_offloaded{0};
 std::atomic<unsigned long long> g_refused{0};
+std::atomic<unsigned long long> g_explained{0};
+std::atomic<unsigned long long> g_waits{0};
+std::atomic<unsigned long long> g_wait_timeouts{0};
+std::atomic<unsigned long long> g_decimal_reruns{0};
 std::mutex g_reason_mutex;
 std::string g_last_refusal;
 
@@ -548,6 +552,11 @@ bool Generator::literal(Item *item, std::string *out) {
       return false;
     }
     case Item::DECIMAL_ITEM:
+      // DuckDB reads a numeric literal of more than 38 digits as DOUBLE (or
+      // HUGEINT): the comparison would no longer be exact.
+      if (item->decimal_precision() > 38)
+        return refuse("decimal_literal_over_38_digits");
+      [[fallthrough]];
     case Item::REAL_ITEM: {
       String buf;
       String *s = item->val_str(&buf);
@@ -1106,6 +1115,16 @@ bool Generator::aggregate(Item_sum *s, std::string *out) {
     case Item_sum::AVG_DISTINCT_FUNC: {
       if (is_string(arg) || arg->is_temporal())
         return refuse("sum_or_avg_of_non_number");
+      // DuckDB adds FLOAT / DOUBLE values in parallel, in no fixed order:
+      // the last digits differ from InnoDB's (which adds in row order) and
+      // from one run to the next. Refused only when the user asks for it
+      // (duckdb_offload_float_aggregates=REFUSE; the default accepts it).
+      if (arg->result_type() == REAL_RESULT &&
+          float_aggregates(m_thd) == FloatAggregates::REFUSE)
+        return refuse(
+            "sum_or_avg_of_float: DuckDB adds FLOAT / DOUBLE values in no "
+            "fixed order, the last digits can differ from InnoDB "
+            "(duckdb_offload_float_aggregates=REFUSE)");
       if (expr(arg, &a)) return true;
       const bool distinct = f == Item_sum::SUM_DISTINCT_FUNC ||
                             f == Item_sum::AVG_DISTINCT_FUNC;
@@ -1379,7 +1398,8 @@ bool Generator::function(Item_func *fn, std::string *out) {
     case Item_func::NEG_FUNC: {
       std::string a;
       if (numeric(args[0], &a)) return true;
-      *out = "(-" + a + ")";
+      // A space: "--" would start a comment when `a` is a negative literal.
+      *out = "(- " + a + ")";
       return false;
     }
     case Item_func::ABS_FUNC: {
@@ -1859,7 +1879,10 @@ bool Generator::function(Item_func *fn, std::string *out) {
     std::string a, b, c;
     if (text_arg(0, &a)) return true;
     if (name == "reverse") {
-      *out = "reverse(" + a + ")";
+      // MySQL reverses code points; DuckDB's reverse() keeps grapheme
+      // clusters together ('e' + U+0301 stays one). We split into code
+      // points and join them reversed ('' and NULL stay as they are).
+      *out = "array_to_string(list_reverse(string_split(" + a + ", '')), '')";
       return false;
     }
     if (text_arg(1, &b) || text_arg(2, &c)) return true;
@@ -2828,6 +2851,10 @@ Item_cache *make_holder(Item *item, Kind kind) {
     }
     case Kind::DOUBLE:
       h = new Item_cache_real();
+      // A FLOAT is sent as FLOAT (the metadata says so): MySQL prints its
+      // shortest float digits, 0.1 and not 0.10000000149011612.
+      if (h != nullptr && item->data_type() == MYSQL_TYPE_FLOAT)
+        h->set_data_type(MYSQL_TYPE_FLOAT);
       break;
     case Kind::DECIMAL:
       h = new Item_cache_decimal();
@@ -3219,6 +3246,7 @@ bool execute_offloaded(JOIN *join, Query_result *result) {
         &ignored);
   }
   cleanup();
+  g_offloaded++;  // run in DuckDB to the end
   return false;
 }
 
@@ -3313,12 +3341,16 @@ bool wrote_in_transaction(THD *thd) {
   return false;
 }
 
-// DuckDB errors that mean a DECIMAL value did not fit in 38 digits.
-bool is_decimal_overflow(const std::string &msg) {
-  return msg.find("Overflow") != std::string::npos ||
-         msg.find("out of range") != std::string::npos ||
-         msg.find("Out of Range") != std::string::npos ||
-         msg.find("Could not cast") != std::string::npos;
+// DuckDB errors that mean a DECIMAL value did not fit in 38 digits: by
+// error type (an overflow in arithmetic is OUT_OF_RANGE, in a cast to
+// DECIMAL(38, s) CONVERSION), and the value is a DECIMAL (its 128-bit
+// integer). Other errors are never retried with fewer decimals.
+bool is_decimal_overflow(duckdb_error_type type, const std::string &msg) {
+  if (type != DUCKDB_ERROR_OUT_OF_RANGE && type != DUCKDB_ERROR_CONVERSION)
+    return false;
+  return msg.find("DECIMAL") != std::string::npos ||
+         msg.find("HUGEINT") != std::string::npos ||
+         msg.find("INT128") != std::string::npos;
 }
 
 bool optimize(THD *thd, LEX *lex) {
@@ -3351,10 +3383,13 @@ bool optimize(THD *thd, LEX *lex) {
     } else if (!target.empty()) {
       bool not_running = false;
       std::string err;
-      if (BinlogReader::instance().wait_applied(target, thd, &not_running,
-                                                &err, 5))
+      g_waits++;
+      if (BinlogReader::instance().wait_applied(
+              target, thd, &not_running, &err,
+              offload_wait_timeout_ms(thd))) {
+        if (!thd_killed(thd)) g_wait_timeouts++;
         reason = "applier_behind";
-      else if (not_running)
+      } else if (not_running)
         reason = "applier_not_running";
     }
   }
@@ -3378,13 +3413,15 @@ bool optimize(THD *thd, LEX *lex) {
   };
   // Run now, materialized (a DECIMAL overflow is then a refusal, not an
   // error in the middle of sending rows).
+  duckdb_error_type run_error = DUCKDB_ERROR_INVALID;
   auto run_first = [&](std::string *err) {
     return ctx->con->execute(
-        [ctx](duckdb_connection, std::string *e) {
+        [ctx, &run_error](duckdb_connection, std::string *e) {
           if (duckdb_execute_prepared(ctx->stmt, &ctx->pre_result) ==
               DuckDBError) {
             const char *m = duckdb_result_error(&ctx->pre_result);
             *e = m != nullptr ? m : "execution failed";
+            run_error = duckdb_result_error_type(&ctx->pre_result);
             duckdb_destroy_result(&ctx->pre_result);
             return true;
           }
@@ -3410,7 +3447,7 @@ bool optimize(THD *thd, LEX *lex) {
       !lex->is_explain()) {
     std::string err;
     if (run_first(&err)) {
-      if (!is_decimal_overflow(err)) {
+      if (!is_decimal_overflow(run_error, err)) {
         reason = "duckdb_execution: " + err.substr(0, 200);
       } else if (mode == DecimalOverflow::FALLBACK) {
         reason = "decimal_overflow: a DECIMAL value exceeds DuckDB's 38 "
@@ -3427,6 +3464,7 @@ bool optimize(THD *thd, LEX *lex) {
           step *= 2;
           build(cap);
           if (!reason.empty()) break;
+          g_decimal_reruns++;
           if (prepare_sql(&err)) {
             reason = "duckdb_prepare: " + err.substr(0, 200);
           } else if (!run_first(&err)) {
@@ -3437,7 +3475,7 @@ bool optimize(THD *thd, LEX *lex) {
                 "exceeds DuckDB's 38 digits with %d decimals "
                 "(duckdb_decimal_overflow=ROUND)",
                 cap, max_scale);
-          } else if (!is_decimal_overflow(err)) {
+          } else if (!is_decimal_overflow(run_error, err)) {
             reason = "duckdb_execution: " + err.substr(0, 200);
           }
         }
@@ -3459,7 +3497,8 @@ bool optimize(THD *thd, LEX *lex) {
   for (Query_block *qb = lex->unit->first_query_block(); qb != nullptr;
        qb = qb->next_query_block())
     if (qb->join != nullptr) qb->join->override_executor_func = execute_offloaded;
-  g_offloaded++;
+  // Counted when it has run (execute_offloaded); EXPLAIN separately.
+  if (lex->is_explain()) g_explained++;
   Opt_trace_context *const trace = &thd->opt_trace;
   if (trace->is_started()) {
     const Opt_trace_object wrapper(trace);
@@ -3528,6 +3567,10 @@ OffloadStatus offload_status() {
   OffloadStatus s;
   s.offloaded = g_offloaded;
   s.refused = g_refused;
+  s.explained = g_explained;
+  s.waits = g_waits;
+  s.wait_timeouts = g_wait_timeouts;
+  s.decimal_reruns = g_decimal_reruns;
   std::lock_guard<std::mutex> guard(g_reason_mutex);
   s.last_refusal = g_last_refusal;
   return s;

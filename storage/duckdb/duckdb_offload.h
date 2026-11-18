@@ -32,8 +32,12 @@ namespace duckdb_se {
 void install_offload_hooks(handlerton *hton);
 
 struct OffloadStatus {
-  unsigned long long offloaded{0};
+  unsigned long long offloaded{0};  // run in DuckDB to the end
   unsigned long long refused{0};
+  unsigned long long explained{0};  // EXPLAIN of an offloaded statement
+  unsigned long long waits{0};      // waits for the session's last commit
+  unsigned long long wait_timeouts{0};
+  unsigned long long decimal_reruns{0};  // ROUND runs with fewer decimals
   std::string last_refusal;
 };
 OffloadStatus offload_status();
@@ -45,6 +49,15 @@ void unregister_offload_observer(void *plugin);
 
 /** duckdb_offload_wait_applied of the session (ha_duckdb.cc). */
 bool offload_wait_applied(THD *thd);
+
+/** duckdb_offload_wait_timeout_ms of the session (ha_duckdb.cc). */
+unsigned long long offload_wait_timeout_ms(THD *thd);
+
+/** duckdb_offload_float_aggregates (ha_duckdb.cc): SUM / AVG of FLOAT and
+    DOUBLE. DuckDB adds in parallel in no fixed order, so the last digits
+    differ from InnoDB's (and between runs). */
+enum class FloatAggregates : unsigned long { REFUSE = 0, APPROXIMATE = 1 };
+FloatAggregates float_aggregates(THD *thd);
 
 /** duckdb_offload_min_rows of the session (ha_duckdb.cc). */
 unsigned long long offload_min_rows(THD *thd);
