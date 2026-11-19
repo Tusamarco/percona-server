@@ -54,6 +54,7 @@
 #include "sql/query_result.h"
 #include "sql/query_term.h"
 #include "sql/replication.h"  // Trans_observer
+#include "storage/duckdb/duckdb_progress.h"
 #include "sql/sql_class.h"
 #include "sql/sql_executor.h"  // QEP_TAB
 #include "sql/sql_lex.h"
@@ -3381,16 +3382,25 @@ bool optimize(THD *thd, LEX *lex) {
     if (freshness_target(thd, &target)) {
       reason = "binary_log_position_unknown";
     } else if (!target.empty()) {
-      bool not_running = false;
-      std::string err;
       g_waits++;
-      if (BinlogReader::instance().wait_applied(
-              target, thd, &not_running, &err,
-              offload_wait_timeout_ms(thd))) {
-        if (!thd_killed(thd)) g_wait_timeouts++;
+      // A statement that can only run in DuckDB (history table under FULL:
+      // InnoDB has no archived rows) waits without a limit; KILL QUERY and
+      // max_execution_time stop it. Others wait duckdb_offload_wait_timeout_ms
+      // and then run on InnoDB. The wait shows its progress (SHOW
+      // PROCESSLIST, Performance Schema).
+      const bool only_duckdb = lex->can_execute_only_in_secondary_engine();
+      const unsigned long long limit = offload_wait_timeout_ms(thd);
+      const WaitResult w = wait_for_applier(
+          thd, target, only_duckdb ? 0 : (limit == 0 ? 1 : limit),
+          "the session's last commit", nullptr, nullptr, nullptr);
+      if (w == WaitResult::TIMEOUT) {
+        g_wait_timeouts++;
         reason = "applier_behind";
-      } else if (not_running)
+      } else if (w == WaitResult::KILLED) {
+        reason = "applier_behind";
+      } else if (w == WaitResult::NOT_RUNNING) {
         reason = "applier_not_running";
+      }
     }
   }
   // Prepared now: a DuckDB bind error (types MySQL accepts but DuckDB does
@@ -3561,6 +3571,10 @@ void install_offload_hooks(handlerton *hton) {
       SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
       SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN,
       SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
+}
+
+bool session_commit_position(THD *thd, BinlogPos *pos) {
+  return freshness_target(thd, pos);
 }
 
 OffloadStatus offload_status() {

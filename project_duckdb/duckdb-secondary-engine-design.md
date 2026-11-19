@@ -175,7 +175,7 @@ All variables are plugin variables of the `duckdb` plugin, so the server adds th
 | `duckdb_offload_wait_applied` | BOOL | ON | session, SET_VAR hint | yes | Read your own writes: wait (at most 5 s) until the session's last commit is applied |
 | `duckdb_history_check_only` | BOOL | OFF | session | yes | SECONDARY_LOAD of a history table only checks the structure |
 | `duckdb_unload_history_confirm` | BOOL | OFF | session | yes | Required to unload or discard a history copy |
-| `duckdb_discard_stale_copy` | string (command) | empty | global | yes | Drop the stale copy of a table that no longer exists |
+| `duckdb_discard_stale_copy` | string (command) | empty | global | yes | Drop a stale copy (table dropped, detached with SECONDARY_ENGINE = NULL, or a failed refresh); history copies need `duckdb_unload_history_confirm` |
 
 `duckdb_apply_workers` (parallel prepare workers) was not implemented: one reader thread decodes, collapses and commits fast enough so far; it stays an option if the apply lag requires it.
 
@@ -630,6 +630,86 @@ reference instance; the SQL coverage tracker is updated).
    position; 3-4 days), backup integration (XtraBackup), encryption.
 10. **General availability**: observability, packaging, security and
     compliance, upgrade policy, CI (detail below).
+
+### TODO from 2026-11-18: limits that stop a result set
+
+Agreed 2026-11-18, before the next steps above: what makes a query fail or
+never reach DuckDB (not only run slower). Order of work: T1 to T5, then the
+leftovers. Each item: design note for Marco, implementation, MTR test,
+coverage tracker updated.
+
+**T0. No more `wait_applier()`: DDL waits for its refresh, with progress**
+(agreed 2026-11-19)
+- [ ] A DDL on a table with a copy returns when the applier has refreshed
+      the copy (`duckdb_guard`, end of statement, in the client thread):
+      `duckdb_ddl_wait_refresh` (ON default, session, global, SET_VAR) and
+      `duckdb_ddl_wait_refresh_timeout` (seconds, 0 = until done). The DDL is
+      committed: a timeout or KILL QUERY stops only the wait (warning).
+- [ ] Progress while waiting: SHOW PROCESSLIST state ("Waiting for DuckDB
+      copy refresh of db.t: N of M rows (P%), S s"), Performance Schema
+      stages `stage/duckdb/waiting for copy refresh`, `waiting for applier`,
+      `copy load` with WORK_COMPLETED / WORK_ESTIMATED,
+      a Note at the end (waited S s, N rows), a warning when the wait stops,
+      error log progress at info level every 10 s for long refreshes.
+- [ ] `INFORMATION_SCHEMA.DUCKDB_TABLES`: STATE 'refreshing',
+      REFRESH_ROWS_DONE, REFRESH_ROWS_TOTAL, applied position.
+- [ ] FULL scope queries wait without the `duckdb_offload_wait_timeout_ms`
+      limit (KILL / max_execution_time stop them): no InnoDB answer exists.
+- [ ] Remove `wait_applier()` from the tutorial; HOWTO keeps waiting for the
+      whole applier only as an operator step.
+
+**T1. Prepared statements and variables** (check 1/2 day, then 1-2 days)
+- [ ] Check server-side prepared statements with parameters (`?`): the
+      translator has no case for `Item::PARAM_ITEM`, most likely refused.
+      Connectors use them (JDBC `useServerPrepStmts`, PDO without emulation).
+- [ ] Check stored procedure variables (`Item_splocal`) and user variables
+      (`@x`): not handled, refused.
+- [ ] If confirmed: translate them as constants at execution (as literals,
+      typed as the parameter / variable).
+
+**T2. DuckDB errors during execution** (1 day or a redesign: to find out)
+- [ ] Today an error after optimization (out of memory, spill disk full,
+      any runtime error) is the statement's error, also with
+      `use_secondary_engine=ON`, where InnoDB would answer.
+- [ ] Find out what MySQL allows at execution time (going back to the
+      primary engine from the external executor).
+- [ ] Fall back when the error comes before the first row is sent; if MySQL
+      does not allow it, run blocking statements first (as the DECIMAL path).
+
+**T3. FULL scope survival** (a refusal under FULL is an error: InnoDB has no
+archived rows)
+- [ ] A stale history copy (DDL not followed, applier stopped): read it as
+      of its last applied state with a warning instead of refusing.
+- [ ] Translate first what history reports use: CAST / CONVERT, NOW() /
+      CURRENT_DATE, DATE_FORMAT, functions on TIMESTAMP columns.
+- [ ] Applier: XA transactions on loaded tables, `binlog_encryption=ON`.
+
+**T4. Loadability** (a table that cannot be loaded has no offload and no
+history)
+- [ ] JSON columns loaded as text, JSON functions refused (small); also
+      decide spatial and VECTOR (VECTOR: exact distance first).
+- [ ] Zero dates (`0000-00-00`): stored as NULL plus a hidden flag, as the
+      `__n_` / `__w_` columns.
+- [ ] Tables without a primary key: design first (no row identity in the
+      binary log).
+
+**T5. Concurrency** (with the HammerDB run, next step 4)
+- [ ] More concurrent offloaded statements than `duckdb_executor_threads`:
+      queueing, wait time, behaviour.
+- [ ] Client character sets other than utf8mb4 (`character_set_results`).
+
+**Leftovers of the 2026-11-18 review**
+- [ ] B1: the DECIMAL first run materializes the whole result (memory);
+      policy: run first only grouped / LIMIT statements, or bound by
+      `duckdb_memory_limit` and fall back (decide).
+- [ ] D1: more edge data in the shared test tables (combining marks, emoji
+      modifiers, 'ß', Turkish 'İ' / 'ı', trailing spaces vs tabs,
+      `_ai_ci`-equal strings, 39-digit literals); a difference is a bug or a
+      refusal, never a re-recorded result.
+- [ ] E1: split `duckdb_offload.cc` (about 3.6k lines) into literals,
+      strings, temporal, aggregates, blocks, execution; no behaviour change.
+- [ ] Document `autocommit=0` / `BEGIN` (MySQL never offloads there) in the
+      HOWTO limits, with the HammerDB note.
 
 ### Production readiness
 

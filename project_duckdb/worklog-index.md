@@ -35,6 +35,15 @@ consistency tests, compaction, lag, resource governance, backup), then
 translations by real usage (design doc "Production readiness" and "SQL
 gaps by priority").
 
+Done 2026-11-18: review fixes (REVERSE by code points, FLOAT sent as FLOAT,
+literals over 38 digits refused, DECIMAL overflow by error type),
+`duckdb_offload_float_aggregates` (default APPROXIMATE),
+`duckdb_offload_wait_timeout_ms`, offload counters (MTR `offload_counters`,
+26 tests). **TODO from now**: design doc "TODO from 2026-11-18: limits that
+stop a result set" (T1 prepared statements and variables, T2 DuckDB errors
+during execution, T3 FULL scope survival, T4 loadability, T5 concurrency,
+leftovers B1, D1, E1).
+
 Development order follows the table. DWL#6 must not be enabled before DWL#4:
 without the applier, DML on InnoDB does not reach DuckDB and offloaded queries
 would return stale data. Its translation code can be developed earlier, with

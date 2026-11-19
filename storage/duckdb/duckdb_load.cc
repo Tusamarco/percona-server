@@ -52,6 +52,7 @@
 #include "storage/duckdb/duckdb_collation.h"
 #include "storage/duckdb/duckdb_lake.h"
 #include "storage/duckdb/duckdb_log.h"
+#include "storage/duckdb/duckdb_progress.h"
 #include "storage/duckdb/duckdb_registry.h"
 #include "storage/duckdb/duckdb_types.h"
 
@@ -842,6 +843,10 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
   // Full scan of the primary (InnoDB) table, opened by the server.
   handler *file = table.file;
   unsigned long long rows = 0;
+  // Progress (SHOW PROCESSLIST, Performance Schema stage, error log; a DDL
+  // waiting for this refresh shows it too), against InnoDB's estimate.
+  file->info(HA_STATUS_VARIABLE | HA_STATUS_NO_LOCK);
+  LoadTracker progress(thd, db, name, ddl_refresh, file->stats.records);
   int rc = file->ha_rnd_init(true);
   while (rc == 0 && err.empty()) {
     rc = file->ha_rnd_next(table.record[0]);
@@ -884,7 +889,10 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
     }
     row++;
     rows++;
-    if (row == capacity && flush()) break;
+    if (row == capacity) {
+      if (flush()) break;
+      progress.rows(rows);
+    }
   }
   file->ha_rnd_end();
   if (rc != 0 && rc != HA_ERR_END_OF_FILE && err.empty())
@@ -892,6 +900,8 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
   if (err.empty() && row > 0) flush();
   if (!err.empty()) return rollback(err);
 
+  progress.rows(rows);
+  progress.phase("committing");
   // T1: close the appender, check the count, commit the build table.
   if (con->execute(
           [&](duckdb_connection c, std::string *e) {
@@ -941,6 +951,8 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
                     " it has not applied are not in the archived rows");
   }
 
+  progress.phase(retain_history || takeover ? "copying archived rows, swapping"
+                                            : "swapping the copy");
   // T2, under apply_mutex like every registry writer: archived rows, swap,
   // registry row.
   std::lock_guard<std::mutex> apply_guard(Lake::instance().apply_mutex());
@@ -1095,19 +1107,23 @@ bool discard_stale_copy(THD *thd, const std::string &spec) {
     return report("the copy " + full +
                   " holds archived rows, which exist only in the lake: SET "
                   "SESSION duckdb_unload_history_confirm = ON first");
+  // A stale copy is no longer applied, so it can go whether the MySQL table
+  // exists or not: dropped, detached with SECONDARY_ENGINE = NULL (then
+  // SECONDARY_UNLOAD is not possible), or after a refresh that failed. A
+  // table that still has SECONDARY_ENGINE = duckdb is then simply not loaded:
+  // its next SECONDARY_LOAD makes a new copy.
   bool exists = false;
   if (mysql_table_exists(thd, db, table, &exists, &err)) return report(err);
-  if (exists)
-    return report("the table " + full +
-                  " exists: unload its copy with ALTER TABLE ... "
-                  "SECONDARY_UNLOAD (or load it again to reattach the copy)");
   auto con = Lake::instance().connect(thd, &err);
   if (!con) return report(err);
   std::lock_guard<std::mutex> apply_guard(Lake::instance().apply_mutex());
   if (drop_copy(*con, db, table, &err)) return report(err);
-  DUCKDB_LOG_WARNING("discarded the stale copy %s from the lake%s",
+  DUCKDB_LOG_WARNING("discarded the stale copy %s from the lake%s%s",
                      full.c_str(),
-                     state.retain_history ? " with its archived rows" : "");
+                     state.retain_history ? " with its archived rows" : "",
+                     exists ? " (the MySQL table exists and is not loaded "
+                              "now)"
+                            : "");
   return false;
 }
 

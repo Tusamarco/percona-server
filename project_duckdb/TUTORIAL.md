@@ -65,7 +65,7 @@ m() { "$BUILD/runtime_output_directory/mysql" -S "$BASE/mysql.sock" -uroot "$@";
 
 ```bash
 cd "$SRC"
-git submodule update --init extra/duckdb/duckdb extra/duckdb/ducklake extra/duckdb/croaring
+git submodule update --init --recursive
 ```
 
 ### 1.3 Configure
@@ -751,16 +751,71 @@ SET SESSION duckdb_unload_history_confirm = OFF;
 
 ### 9.3 Drop
 
-`DROP TABLE` of a classic table removes its copy. `DROP TABLE` of a history
-table keeps the copy (`STALE`, with a warning): creating the table again
-with the same structure and `SECONDARY_LOAD` reattaches the history;
-`"adopt_history_from": "db.table"` in `SECONDARY_ENGINE_ATTRIBUTE` gives it
-to a table with another name. To delete it for good:
+`DROP TABLE` of a classic table removes its copy too. `DROP TABLE` of a
+history table does **not** delete its history: the copy stays in the lake,
+marked `STALE`, with a warning. The archived rows exist only there, so they
+are never deleted by accident.
+
+A table to try it on:
+
+```sql
+CREATE TABLE old_h (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb
+  SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true}';
+INSERT INTO old_h VALUES (1, 10), (2, 20), (3, 30);
+ALTER TABLE old_h SECONDARY_LOAD;
+SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
+DELETE FROM old_h WHERE id = 1;                 -- archived in DuckDB
+SET gtid_next = 'AUTOMATIC';
+```
+
+**Drop the table, keep the history** (the default):
+
+```sql
+DROP TABLE old_h;
+SHOW WARNINGS;      -- DuckDB copy of tut.old_h kept and marked stale
+SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES
+ WHERE TABLE_SCHEMA = 'tut' AND TABLE_NAME = 'old_h';      -- STALE
+```
+
+From here the history can come back: create the table again with the same
+structure and run `SECONDARY_LOAD` (it reattaches the archived rows), or
+give it to a table with another name with
+`SECONDARY_ENGINE_ATTRIBUTE = '{"retain_history": true, "adopt_history_from": "tut.old_h"}'`
+(HOWTO section 5).
+
+**Delete the history for good** (after the DROP):
 
 ```sql
 SET SESSION duckdb_unload_history_confirm = ON;
--- SET GLOBAL duckdb_discard_stale_copy = 'tut.old_table';
+SET GLOBAL duckdb_discard_stale_copy = 'tut.old_h';
 SET SESSION duckdb_unload_history_confirm = OFF;
+SELECT COUNT(*) FROM information_schema.DUCKDB_TABLES
+ WHERE TABLE_SCHEMA = 'tut' AND TABLE_NAME = 'old_h';      -- 0: gone
+```
+
+**Drop the table and its history in one go**: unload with the confirmation
+first, then drop:
+
+```sql
+SET SESSION duckdb_unload_history_confirm = ON;
+ALTER TABLE some_history_table SECONDARY_UNLOAD;   -- copy and archived rows deleted
+SET SESSION duckdb_unload_history_confirm = OFF;
+DROP TABLE some_history_table;
+```
+
+**Any other stale copy** is removed the same way, with
+`duckdb_discard_stale_copy`: a history table detached with
+`SECONDARY_ENGINE = NULL` (the table still exists, `SECONDARY_UNLOAD` is no
+longer possible), or a copy that became stale because a refresh after DDL
+failed. A classic (non-history) stale copy needs no confirmation. If the
+MySQL table still has `SECONDARY_ENGINE = duckdb`, it is simply not loaded
+afterwards: `SECONDARY_LOAD` makes a new copy.
+
+To see every stale copy:
+
+```sql
+SELECT TABLE_SCHEMA, TABLE_NAME, RETAIN_HISTORY FROM information_schema.DUCKDB_TABLES
+ WHERE STATE = 'STALE';
 ```
 
 ---
@@ -911,7 +966,10 @@ unload a history copy or discard a stale history copy (the archived rows
 are deleted).
 
 **`duckdb_discard_stale_copy`** (global, a command). `'db.table'`: drops
-the stale copy of a table that no longer exists. Reads back as empty.
+a stale copy (after `DROP TABLE` or `SECONDARY_ENGINE = NULL` of a history
+table, or after a refresh that failed), whether the MySQL table still exists
+or not. A history copy needs `duckdb_unload_history_confirm = ON`. Reads
+back as empty. Example in section 9.3.
 
 **`duckdb_history_check_only`** (session, default OFF). ON: SECONDARY_LOAD
 of a history table only checks whether it can take over an existing

@@ -407,20 +407,34 @@ SET SESSION duckdb_unload_history_confirm = OFF;
 
 ```sql
 DROP TABLE orders;     -- classic: its copy is dropped too
-DROP TABLE orders_h;   -- history: its copy is KEPT, marked stale
+DROP TABLE orders_h;   -- history: its copy is KEPT, marked stale (warning)
 ```
 
 A stale history copy can be reattached (same name, section 5), adopted by
-another table (section 5), or deleted:
+another table (section 5), or deleted for good.
+
+### Delete a history table and its history
+
+| You want | Do |
+|---|---|
+| Drop the table **and** its history | `SET SESSION duckdb_unload_history_confirm = ON;` `ALTER TABLE orders_h SECONDARY_UNLOAD;` `SET SESSION duckdb_unload_history_confirm = OFF;` then `DROP TABLE orders_h;` |
+| Delete the history of a table already dropped | `SET SESSION duckdb_unload_history_confirm = ON;` `SET GLOBAL duckdb_discard_stale_copy = 'shop.orders_h';` `SET SESSION duckdb_unload_history_confirm = OFF;` |
+| Delete the history of a table detached with `SECONDARY_ENGINE = NULL` (the table stays; `SECONDARY_UNLOAD` is no longer possible) | the same `duckdb_discard_stale_copy` |
+| Remove a copy that became stale because a refresh after DDL failed | `SECONDARY_UNLOAD` (history: with the confirmation), or `duckdb_discard_stale_copy` |
+| Drop the table, keep the history for later | `DROP TABLE orders_h;` (nothing else) |
 
 ```sql
-SET SESSION duckdb_unload_history_confirm = ON;
-SET GLOBAL duckdb_discard_stale_copy = 'shop.orders_h';
-SET SESSION duckdb_unload_history_confirm = OFF;
+-- every stale copy in the lake
+SELECT TABLE_SCHEMA, TABLE_NAME, RETAIN_HISTORY
+  FROM information_schema.DUCKDB_TABLES WHERE STATE = 'STALE';
 ```
 
-`duckdb_discard_stale_copy` is refused if the copy is not stale or if the
-MySQL table still exists (use SECONDARY_UNLOAD then). Until a stale copy is
+`duckdb_discard_stale_copy` works on stale copies only (a copy being
+applied is removed with `SECONDARY_UNLOAD`), whether the MySQL table still
+exists or not (2026-11-19; before, a stale copy whose table still existed
+could not be removed). History copies need `duckdb_unload_history_confirm =
+ON`; classic copies do not. If the MySQL table still has `SECONDARY_ENGINE =
+duckdb`, it is simply not loaded afterwards. Until a stale copy is
 discarded, a new table with the same name and `retain_history` reattaches it
 on its first SECONDARY_LOAD (if the structure is the same).
 
@@ -447,8 +461,10 @@ ALTER TABLE orders_h SECONDARY_ENGINE = NULL;
 -- warning: DuckDB copy of shop.orders_h kept and marked stale: it holds archived rows
 ```
 
-The copy is no longer updated. To reattach it later (live rows from InnoDB,
-archived rows kept):
+The copy is no longer updated. To delete it instead (the table stays):
+`duckdb_discard_stale_copy` with the confirmation (section 4, "Delete a
+history table and its history"). To reattach it later (live rows from
+InnoDB, archived rows kept):
 
 ```sql
 ALTER TABLE orders_h SECONDARY_ENGINE = duckdb,
@@ -1024,7 +1040,7 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | `duckdb_apply_batch_max_delay_ms` | global | yes | 1000 | 10 .. 60000 | A batch is committed at most this long after its first change (bounds the lag under light load). |
 | `duckdb_apply_gap_action` | global | yes | STOP | STOP, FIRST_AVAILABLE | When binary logs the applier needs were purged and loaded tables miss changes: stop in error state, or warn and continue at the first available binary log. |
 | `duckdb_apply_start_position` | global | yes (command) | `""` | binary log name, FIRST, CURRENT | Setting it restarts the applier at the start of that binary log, which becomes the applied position. Positions before the applied position are refused. A command: the variable stays empty afterwards. Not persisted. |
-| `duckdb_discard_stale_copy` | global | yes (command) | `""` | `'db.table'` | Setting it drops the stale copy of a table that no longer exists. History copies need `duckdb_unload_history_confirm=ON`. A command: the variable stays empty afterwards. Not persisted. |
+| `duckdb_discard_stale_copy` | global | yes (command) | `""` | `'db.table'` | Setting it drops a stale copy (after DROP TABLE or SECONDARY_ENGINE = NULL of a history table, or a failed refresh), whether the MySQL table exists or not. History copies need `duckdb_unload_history_confirm=ON`. A command: the variable stays empty afterwards. Not persisted. |
 | `duckdb_history_scope` | session, global, `SET_VAR` | yes | LIVE | LIVE, FULL | What queries see in history tables: live rows only, or also archived rows. FULL requires `DUCKDB_HISTORY_READER` and the `duckdb_guard` plugin, and always runs in DuckDB (or fails with the reason). |
 | `duckdb_apply_debug_log` | global | yes | OFF | ON, OFF | Testing aid: one error log line per change and per table of each batch, with DuckDB row counts (needs `log_error_verbosity=3`). |
 | `duckdb_offload_min_rows` | session, global, `SET_VAR` | yes | 1000000 | 0 .. 2^64-1 | Also try a query in DuckDB when MySQL's plan reads a loaded table of at least this many rows by a full scan, full index scan or non-unique index lookup, whatever its estimated cost. 0: only `secondary_engine_cost_threshold` decides. |

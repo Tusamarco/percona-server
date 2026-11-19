@@ -27,6 +27,7 @@
 #include "sql/sql_show.h"  // schema_table_store_record
 #include "sql/table.h"     // ST_FIELD_INFO, ST_SCHEMA_TABLE
 #include "storage/duckdb/duckdb_lake.h"
+#include "storage/duckdb/duckdb_progress.h"
 #include "storage/duckdb/duckdb_registry.h"
 
 namespace duckdb_se {
@@ -43,7 +44,9 @@ enum Column {
   WEIGHT_COLUMNS,
   LOAD_BINLOG_FILE,
   LOAD_BINLOG_POSITION,
-  LOAD_GTID_SET
+  LOAD_GTID_SET,
+  REFRESH_ROWS_DONE,
+  REFRESH_ROWS_TOTAL
 };
 
 ST_FIELD_INFO fields[] = {
@@ -60,6 +63,12 @@ ST_FIELD_INFO fields[] = {
      MY_I_S_MAYBE_NULL | MY_I_S_UNSIGNED, nullptr, 0},
     {"LOAD_GTID_SET", 65535, MYSQL_TYPE_STRING, 0, MY_I_S_MAYBE_NULL, nullptr,
      0},
+    // While the applier refreshes the copy after DDL (STATE REFRESHING):
+    // rows copied so far and InnoDB's estimate of the total.
+    {"REFRESH_ROWS_DONE", 21, MYSQL_TYPE_LONGLONG, 0,
+     MY_I_S_MAYBE_NULL | MY_I_S_UNSIGNED, nullptr, 0},
+    {"REFRESH_ROWS_TOTAL", 21, MYSQL_TYPE_LONGLONG, 0,
+     MY_I_S_MAYBE_NULL | MY_I_S_UNSIGNED, nullptr, 0},
     {nullptr, 0, MYSQL_TYPE_NULL, 0, 0, nullptr, 0}};
 
 void store(TABLE *table, Column c, const std::string &s) {
@@ -92,8 +101,12 @@ int fill_rows(THD *thd, TABLE *table) {
   for (const Registry::Listed &l : Registry::instance().list()) {
     store(table, TABLE_SCHEMA, l.db);
     store(table, TABLE_NAME, l.table);
+    LoadProgress p;
+    const bool refreshing =
+        load_progress(l.db, l.table, &p) && p.refresh;
     store(table, STATE,
           l.state.stale             ? "STALE"
+          : refreshing              ? "REFRESHING"
           : l.state.refresh_pending ? "REFRESH_PENDING"
                                     : "LOADED");
     store(table, RETAIN_HISTORY, l.state.retain_history ? "YES" : "NO");
@@ -109,6 +122,17 @@ int fill_rows(THD *thd, TABLE *table) {
           static_cast<longlong>(l.state.load_position.pos), true);
     }
     store_or_null(table, LOAD_GTID_SET, l.load_gtid_set);
+    if (refreshing) {
+      table->field[REFRESH_ROWS_DONE]->set_notnull();
+      table->field[REFRESH_ROWS_DONE]->store(
+          static_cast<longlong>(p.rows_done), true);
+      table->field[REFRESH_ROWS_TOTAL]->set_notnull();
+      table->field[REFRESH_ROWS_TOTAL]->store(
+          static_cast<longlong>(p.rows_total), true);
+    } else {
+      table->field[REFRESH_ROWS_DONE]->set_null();
+      table->field[REFRESH_ROWS_TOTAL]->set_null();
+    }
     if (schema_table_store_record(thd, table)) return 1;
   }
   return 0;

@@ -151,11 +151,14 @@ table for the speedup measurement.
     checks and always ends with an error giving the result (a success would
     make the server record the table as loaded).
 20. (3b) Discarding history (SECONDARY_UNLOAD of a history table, or
-    `SET GLOBAL duckdb_discard_stale_copy = 'db.table'` for a stale copy whose
-    table no longer exists) requires `SET SESSION
-    duckdb_unload_history_confirm = ON`. Lake data is never deleted
-    implicitly. The discard is refused for a copy that is not stale or whose
-    table exists.
+    `SET GLOBAL duckdb_discard_stale_copy = 'db.table'` for a stale copy)
+    requires `SET SESSION duckdb_unload_history_confirm = ON`. Lake data is
+    never deleted implicitly. The discard is refused for a copy that is not
+    stale (SECONDARY_UNLOAD removes those). Since 2026-11-19 it also works
+    when the MySQL table still exists: a history table detached with
+    SECONDARY_ENGINE = NULL could otherwise never lose its history
+    (SECONDARY_UNLOAD needs the engine); a table that keeps SECONDARY_ENGINE =
+    duckdb is then not loaded, and SECONDARY_LOAD makes a new copy.
 21. Loaded tables survive a server restart: after restart they are loaded
     without a new SECONDARY_LOAD.
 22. With `duckdb_enable=FALSE`, SECONDARY_LOAD gives the same warning as when the
@@ -285,7 +288,7 @@ THR_LOCK) for the handler, the applier and the guard.
 | ALTER, TRUNCATE, RENAME TABLE, DROP PARTITION | copy refreshed or renamed by the applier (DWL#4 4d) | same, archived rows kept |
 | SECONDARY_LOAD when already in the lake | refused: unload first | stale: reattach; loaded: resync (same structure) |
 | SECONDARY_LOAD with `adopt_history_from` | n/a | takes over a stale copy (same structure) |
-| `duckdb_discard_stale_copy` | drops a stale copy whose table is gone | same, with confirmation |
+| `duckdb_discard_stale_copy` | drops a stale copy (table dropped, detached or still there) | same, with confirmation |
 
 ### Load: two DuckLake transactions (3b)
 

@@ -23,10 +23,15 @@
 #include "mysql/plugin_audit.h"
 #include "mysqld_error.h"
 #include "sql/sql_class.h"
+#include "sql/sql_alter.h"  // Alter_info
 #include "sql/sql_lex.h"
+#include "sql/sql_parse.h"  // sql_command_flags
+#include "sql/table.h"      // Table_ref
 #include "storage/duckdb/duckdb_lake.h"
 #include "storage/duckdb/duckdb_load.h"  // history_scope_full
 #include "storage/duckdb/duckdb_log.h"
+#include "storage/duckdb/duckdb_offload.h"   // ddl_wait_refresh
+#include "storage/duckdb/duckdb_progress.h"  // wait_for_applier
 #include "storage/duckdb/duckdb_registry.h"
 #include "storage/duckdb/duckdb_session.h"  // is_internal_session
 
@@ -117,9 +122,98 @@ int on_table_access(THD *thd, const mysql_event_table_access *ev) {
   return 0;
 }
 
+// The end of a DDL on a table with a DuckDB copy (duckdb_ddl_wait_refresh):
+// the binlog applier refreshes the copy (an internal SECONDARY_LOAD) when it
+// reads the statement, and the client gets its OK once that is done, so the
+// next statements see the copy in DuckDB. The event comes after the DDL has
+// committed (DDL commits inside its execution) and before the OK is sent, in
+// the client's thread; the progress is in its SHOW PROCESSLIST state and
+// Performance Schema stage. Nothing here can fail the DDL: it is committed.
+void on_ddl_end(THD *thd, const mysql_event_query *ev) {
+  if (ev->event_subclass != MYSQL_AUDIT_QUERY_STATUS_END || ev->status != 0)
+    return;
+  // The replica applier must not wait (replication would stall), nor our own
+  // internal statements (the refresh itself).
+  if (thd->system_thread != NON_SYSTEM_THREAD || is_internal_session(thd))
+    return;
+  LEX *lex = thd->lex;
+  if (lex == nullptr ||
+      (sql_command_flags[lex->sql_command] & CF_IMPLICIT_COMMIT_END) == 0)
+    return;
+  // SECONDARY_LOAD / UNLOAD are synchronous already and not in the binlog.
+  if (lex->sql_command == SQLCOM_ALTER_TABLE && lex->alter_info != nullptr &&
+      (lex->alter_info->flags & (Alter_info::ALTER_SECONDARY_LOAD |
+                                 Alter_info::ALTER_SECONDARY_UNLOAD)) != 0)
+    return;
+  if (!ddl_wait_refresh(thd) || !Lake::instance().is_open()) return;
+  // Only DDL on a table with a copy (RENAME lists both names).
+  std::string copy;
+  for (Table_ref *t = lex->query_tables; t != nullptr && copy.empty();
+       t = t->next_global) {
+    if (t->db == nullptr || t->table_name == nullptr) continue;
+    TableState state;
+    if (Registry::instance().snapshot(t->db, t->table_name, &state))
+      copy = std::string(t->db) + "." + t->table_name;
+  }
+  if (copy.empty()) return;
+  BinlogPos target;
+  if (session_commit_position(thd, &target) || target.empty()) return;
+
+  double waited = 0;
+  std::string refreshed;
+  unsigned long long rows = 0;
+  const WaitResult r = wait_for_applier(
+      thd, target, ddl_wait_refresh_timeout(thd) * 1000,
+      ("refresh of the DuckDB copy of " + copy + " after this DDL").c_str(),
+      &waited, &refreshed, &rows);
+  switch (r) {
+    case WaitResult::APPLIED:
+      if (!refreshed.empty())
+        push_warning_printf(
+            thd, Sql_condition::SL_NOTE, ER_SECONDARY_ENGINE_PLUGIN,
+            "DuckDB: the copy of %s was refreshed after this DDL (%llu "
+            "rows); waited %.1f s",
+            refreshed.c_str(), rows, waited);
+      else if (waited >= 1)
+        push_warning_printf(thd, Sql_condition::SL_NOTE,
+                            ER_SECONDARY_ENGINE_PLUGIN,
+                            "DuckDB: waited %.1f s for the binlog applier to "
+                            "apply this DDL to the copy of %s",
+                            waited, copy.c_str());
+      break;
+    case WaitResult::TIMEOUT:
+    case WaitResult::KILLED:
+      push_warning_printf(
+          thd, Sql_condition::SL_WARNING, ER_SECONDARY_ENGINE_PLUGIN,
+          "DuckDB: stopped waiting after %.1f s (%s); the DDL is committed "
+          "and the copy of %s is still being refreshed: until then queries "
+          "on it run on InnoDB (duckdb_history_scope=FULL: they wait)",
+          waited,
+          r == WaitResult::KILLED ? "KILL QUERY"
+                                  : "duckdb_ddl_wait_refresh_timeout",
+          copy.c_str());
+      break;
+    case WaitResult::NOT_RUNNING:
+      push_warning_printf(
+          thd, Sql_condition::SL_WARNING, ER_SECONDARY_ENGINE_PLUGIN,
+          "DuckDB: the binlog applier is not running: the copy of %s is "
+          "refreshed when it runs again (duckdb_apply_reader_state)",
+          copy.c_str());
+      break;
+  }
+}
+
 int guard_notify(MYSQL_THD thd, mysql_event_class_t event_class,
                  const void *event) {
   if (thd == nullptr) return 0;
+  if (event_class == MYSQL_AUDIT_QUERY_CLASS) {
+    try {
+      on_ddl_end(thd, static_cast<const mysql_event_query *>(event));
+    } catch (...) {
+      // Never affect the (committed) DDL.
+    }
+    return 0;
+  }
   if (event_class == MYSQL_AUDIT_PARSE_CLASS) {
     // The plugin's internal statements (refresh after DDL) write only to
     // DuckDB and run with sql_log_bin=0: let them pass read_only and
@@ -162,7 +256,8 @@ st_mysql_audit guard_descriptor = {
      static_cast<unsigned long>(MYSQL_AUDIT_TABLE_ACCESS_READ |
                                 MYSQL_AUDIT_TABLE_ACCESS_UPDATE |
                                 MYSQL_AUDIT_TABLE_ACCESS_DELETE),
-     0, 0, 0, 0, 0, 0, 0}};
+     0, 0, 0, 0, static_cast<unsigned long>(MYSQL_AUDIT_QUERY_STATUS_END), 0,
+     0}};
 
 int guard_init(MYSQL_PLUGIN) {
   g_active = true;

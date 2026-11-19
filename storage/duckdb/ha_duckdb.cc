@@ -48,6 +48,7 @@
 #include "storage/duckdb/duckdb_load.h"
 #include "storage/duckdb/duckdb_log.h"
 #include "storage/duckdb/duckdb_offload.h"
+#include "storage/duckdb/duckdb_progress.h"
 #include "storage/duckdb/duckdb_registry.h"
 #include "storage/duckdb/duckdb_session.h"
 
@@ -588,6 +589,23 @@ MYSQL_THDVAR_ULONGLONG(offload_wait_timeout_ms,
                        "SET_VAR hint.",
                        nullptr, nullptr, 5000, 0, 3600000, 0);
 
+MYSQL_THDVAR_BOOL(ddl_wait_refresh,
+                  PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
+                  "A DDL on a table with a DuckDB copy (ALTER, RENAME, "
+                  "TRUNCATE, partition changes...) returns when the binlog "
+                  "applier has refreshed the copy, so the next statements "
+                  "see it in DuckDB. While waiting, SHOW PROCESSLIST and the "
+                  "Performance Schema stage stage/duckdb/waiting for copy "
+                  "refresh show the progress. The DDL itself is committed "
+                  "before: KILL QUERY or the timeout stop only the wait.",
+                  nullptr, nullptr, true);
+
+MYSQL_THDVAR_ULONGLONG(ddl_wait_refresh_timeout,
+                       PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
+                       "Longest wait of duckdb_ddl_wait_refresh, in seconds; "
+                       "0 means until the refresh is done.",
+                       nullptr, nullptr, 0, 0, 31536000, 0);
+
 MYSQL_THDVAR_ENUM(offload_float_aggregates,
                   PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
                   "SUM and AVG of FLOAT and DOUBLE values: DuckDB adds them "
@@ -626,9 +644,11 @@ MYSQL_THDVAR_BOOL(unload_history_confirm, PLUGIN_VAR_OPCMDARG,
 MYSQL_SYSVAR_STR(discard_stale_copy, srv_discard_stale_copy,
                  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC |
                      PLUGIN_VAR_NOPERSIST,
-                 "Setting it to 'db.table' drops the stale DuckDB copy of a "
-                 "table that no longer exists (after DROP TABLE). History "
-                 "copies require duckdb_unload_history_confirm=ON.",
+                 "Setting it to 'db.table' drops a stale DuckDB copy: after "
+                 "DROP TABLE or SECONDARY_ENGINE = NULL of a history table, "
+                 "or after a refresh that failed. History copies require "
+                 "duckdb_unload_history_confirm=ON. A command: it reads back "
+                 "as empty.",
                  check_discard_stale_copy, nullptr, "");
 
 MYSQL_SYSVAR_ENUM(apply_gap_action, srv_apply_gap_action, PLUGIN_VAR_RQCMDARG,
@@ -670,6 +690,8 @@ SYS_VAR *duckdb_system_variables[] = {MYSQL_SYSVAR(enable),
                                       MYSQL_SYSVAR(offload_wait_applied),
                                       MYSQL_SYSVAR(offload_wait_timeout_ms),
                                       MYSQL_SYSVAR(offload_float_aggregates),
+                                      MYSQL_SYSVAR(ddl_wait_refresh),
+                                      MYSQL_SYSVAR(ddl_wait_refresh_timeout),
                                       MYSQL_SYSVAR(offload_min_rows),
                                       MYSQL_SYSVAR(decimal_overflow),
                                       nullptr};
@@ -971,6 +993,7 @@ int duckdb_init_impl(MYSQL_PLUGIN p) {
   if (init_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs)) return 1;
   Executor::register_psi();
   BinlogReader::register_psi();
+  register_progress_stages();
   auto fail = [] {
     release_privilege();
     unregister_offload_observer(plugin_handle);
@@ -1133,6 +1156,14 @@ DecimalOverflow decimal_overflow(THD *thd) {
   return thd != nullptr
              ? static_cast<DecimalOverflow>(THDVAR(thd, decimal_overflow))
              : DecimalOverflow::FALLBACK;
+}
+
+bool ddl_wait_refresh(THD *thd) {
+  return thd != nullptr && THDVAR(thd, ddl_wait_refresh);
+}
+
+unsigned long long ddl_wait_refresh_timeout(THD *thd) {
+  return thd != nullptr ? THDVAR(thd, ddl_wait_refresh_timeout) : 0;
 }
 
 unsigned long long offload_wait_timeout_ms(THD *thd) {

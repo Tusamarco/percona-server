@@ -18,6 +18,8 @@
 
 #include <string>
 
+#include "storage/duckdb/duckdb_registry.h"  // BinlogPos
+
 class THD;
 struct handlerton;
 
@@ -49,6 +51,15 @@ void unregister_offload_observer(void *plugin);
 
 /** duckdb_offload_wait_applied of the session (ha_duckdb.cc). */
 bool offload_wait_applied(THD *thd);
+
+/** The binary log position of this session's last commit (the current end
+    of the binary log the first time). true on error. */
+bool session_commit_position(THD *thd, BinlogPos *pos);
+
+/** duckdb_ddl_wait_refresh and duckdb_ddl_wait_refresh_timeout (seconds, 0 =
+    no limit) of the session (ha_duckdb.cc). */
+bool ddl_wait_refresh(THD *thd);
+unsigned long long ddl_wait_refresh_timeout(THD *thd);
 
 /** duckdb_offload_wait_timeout_ms of the session (ha_duckdb.cc). */
 unsigned long long offload_wait_timeout_ms(THD *thd);
