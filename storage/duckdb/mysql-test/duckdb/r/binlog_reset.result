@@ -1,0 +1,23 @@
+CREATE TABLE br (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO br VALUES (1, 1), (2, 2);
+FLUSH BINARY LOGS;
+FLUSH BINARY LOGS;
+ALTER TABLE br SECONDARY_LOAD;
+INSERT INTO br VALUES (3, 3);
+RESET BINARY LOGS AND GTIDS;
+SET GLOBAL duckdb_enable = OFF;
+SET GLOBAL duckdb_enable = ON;
+SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_apply_reader_state_code';
+VARIABLE_VALUE
+5
+# FIRST is accepted after the reset
+SET GLOBAL duckdb_apply_start_position = 'FIRST';
+Warnings:
+Warning	3877	loaded tables that may be behind InnoDB (reload them): test.br
+INSERT INTO br VALUES (4, 4), (5, 5);
+UPDATE br SET v = 10 WHERE id = 1;
+# SELECT id, v FROM br ORDER BY id
+SELECT TABLE_NAME, STATE, LOAD_BINLOG_FILE FROM information_schema.DUCKDB_TABLES WHERE TABLE_NAME = 'br';
+TABLE_NAME	STATE	LOAD_BINLOG_FILE
+br	LOADED	NULL
+DROP TABLE br;

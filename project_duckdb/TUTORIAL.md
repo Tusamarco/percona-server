@@ -1053,6 +1053,12 @@ SHOW GLOBAL STATUS LIKE 'duckdb_applied%';
 | `duckdb_offload_explained` | EXPLAIN of statements that would run in DuckDB. | |
 | `duckdb_offload_waits` / `duckdb_offload_wait_timeouts` | Waits for the connection's last commit (`duckdb_offload_wait_applied`), and those that reached `duckdb_offload_wait_timeout_ms` (the query ran on InnoDB). | timeouts near 0; growing: the applier is behind |
 | `duckdb_offload_decimal_reruns` | Runs again with fewer decimals (`duckdb_decimal_overflow = ROUND`). | |
+| `duckdb_offload_time_us` | Total time in DuckDB of the queries it ran, in microseconds. Divide by `duckdb_offload_queries` for the average. | grows with offloaded queries |
+| `duckdb_apply_lag_seconds` | How far DuckDB is behind: age of the oldest commit not yet applied. | 0, or below 1-2 s under load |
+| `duckdb_apply_lag_bytes` | The same in binary log bytes, across files. | near 0 |
+| `duckdb_apply_reader_state_code` | Applier state as a number (0 idle ... 5 error, 6 stopped). | 0 to 3; 5 is an alert |
+| `duckdb_memory_used_bytes` | DuckDB memory in use (sampled every ~5 s). | below `duckdb_memory_limit` |
+| `duckdb_temp_spill_bytes` | Data DuckDB moved to disk for lack of memory. | 0; growing: raise the memory limit |
 | `duckdb_offload_refused` | Queries the plugin refused (they ran on InnoDB, or failed with FORCED). | |
 | `duckdb_offload_last_refusal` | Reason of the last refusal (section 12.3). | |
 | `duckdb_guard_forced` | Statements on history tables under FULL sent to DuckDB only. | |

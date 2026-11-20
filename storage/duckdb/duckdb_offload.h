@@ -40,6 +40,7 @@ struct OffloadStatus {
   unsigned long long waits{0};      // waits for the session's last commit
   unsigned long long wait_timeouts{0};
   unsigned long long decimal_reruns{0};  // ROUND runs with fewer decimals
+  unsigned long long time_us{0};  // time in DuckDB of the offloaded ones
   std::string last_refusal;
 };
 OffloadStatus offload_status();

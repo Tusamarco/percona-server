@@ -21,6 +21,8 @@ duckdb_apply_debug_log
 duckdb_apply_gap_action
 duckdb_apply_start_position
 duckdb_data_path
+duckdb_ddl_wait_refresh
+duckdb_ddl_wait_refresh_timeout
 duckdb_decimal_overflow
 duckdb_discard_stale_copy
 duckdb_enable

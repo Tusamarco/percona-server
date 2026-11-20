@@ -1010,6 +1010,22 @@ ALTER TABLE <each named history table> SECONDARY_LOAD;   -- resync, history kept
 SET GLOBAL duckdb_apply_start_position = 'FIRST';        -- restart the applier
 ```
 
+Binary logs reset (`RESET BINARY LOGS AND GTIDS`) while copies are loaded:
+at its next start the applier stops with "the applied position ... is after
+the end of the binary log". Restart it at the new log, then reload the
+copies that changed before the reset (those changes never reached DuckDB):
+
+```sql
+SET GLOBAL duckdb_apply_start_position = 'FIRST';   -- accepted after a reset
+ALTER TABLE <each changed classic table> SECONDARY_UNLOAD;
+ALTER TABLE <each changed classic table> SECONDARY_LOAD;
+ALTER TABLE <each changed history table> SECONDARY_LOAD;   -- resync, history kept
+```
+
+The repoint forgets the load positions of the old log (they would make the
+applier skip the new log's changes) and lists every copy in the warning.
+Before 2026-11-20 `FIRST` was refused here ("before the applied position").
+
 A query that should run in DuckDB but does not: `SHOW GLOBAL STATUS LIKE
 'duckdb_offload_last_refusal'` gives the reason of the last refusal; run it
 with `use_secondary_engine = FORCED` to get the reason as an error, or look
@@ -1082,6 +1098,11 @@ all), `innodb_flush_log_at_trx_commit=1` (recommended), `binlog_encryption=OFF`,
 | `duckdb_offload_explained` | EXPLAIN of statements that would run in DuckDB. |
 | `duckdb_offload_waits` / `duckdb_offload_wait_timeouts` | Waits for the connection's last commit, and those that timed out (the query ran on InnoDB). |
 | `duckdb_offload_decimal_reruns` | Runs again with fewer decimals under `duckdb_decimal_overflow = ROUND`. |
+| `duckdb_offload_time_us` | Total time in DuckDB of the queries counted in `duckdb_offload_queries` (microseconds); divided by them, the average offloaded query time. |
+| `duckdb_apply_lag_seconds` | Age of the oldest transaction committed in MySQL and not yet in DuckDB (0 when everything is applied). |
+| `duckdb_apply_lag_bytes` | Binary log between the applied position and its end, across files. |
+| `duckdb_apply_reader_state_code` | The applier state as a number: 0 idle, 1 reading, 2 waiting to commit, 3 committing, 4 refreshing, 5 error, 6 stopped (for alerts). |
+| `duckdb_memory_used_bytes` / `duckdb_temp_spill_bytes` | DuckDB memory in use and data spilled to its temporary directory, sampled about every 5 s. |
 | `duckdb_apply_purge_transactions` / `duckdb_apply_archived_rows` | Tagged purge transactions on loaded tables; rows kept as archived rows. |
 | `duckdb_apply_ddl_refreshes` / `duckdb_apply_ddl_renames` / `duckdb_apply_ddl_deferred` / `duckdb_apply_ddl_failures` | Copies refreshed or renamed after DDL, refreshes deferred to a later rename, copies marked stale by a DDL. |
 | `duckdb_applied_file` / `duckdb_applied_position` / `duckdb_applied_gtid` | Applied position: what DuckDB contains. |

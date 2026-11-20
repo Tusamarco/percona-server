@@ -390,7 +390,7 @@ With history retention, DuckDB is no longer a disposable copy: it holds the only
 
 - Resource limits: `duckdb_memory_limit` and `duckdb_threads` are mandatory and dynamic.
 - DDL on a base table without history invalidates the secondary copy and requires a reload; with history, see Durability of the history.
-- Observability (implemented): 31 status variables (applier state and position, applied position and GTID, batches, changes, pieces, purges and archived rows, DDL refreshes / renames / failures, offloaded and refused queries with the last reason, guard counters, executor pool) and `INFORMATION_SCHEMA.DUCKDB_TABLES`; the optimizer trace and EXPLAIN notes for offload. Still to do: apply lag in seconds, time split between decode and commit, DuckDB memory use (Phased plan, phase 3).
+- Observability (implemented): 31 status variables (applier state and position, applied position and GTID, batches, changes, pieces, purges and archived rows, DDL refreshes / renames / failures, offloaded and refused queries with the last reason, guard counters, executor pool) and `INFORMATION_SCHEMA.DUCKDB_TABLES`; the optimizer trace and EXPLAIN notes for offload. Since 2026-11-20 also the apply lag in seconds and in bytes across files, a numeric applier state, DuckDB memory and spill, the total offloaded query time, and a PMM / Grafana dashboard with custom queries (`monitoring/`). Still to do: time split between decode and commit, lake size on disk (Phased plan, phase 3).
 - Testing (implemented): MTR suite `duckdb` (26 tests: plugin, applier, history, guard, super_read_only, foreign keys, transactions, DECIMAL overflow, LIKE, grouped CHAR, functions, INFORMATION_SCHEMA, cached tables, offload rules, the offload query and refusal lists, types); every query runs with use_secondary_engine OFF and FORCED and results are compared; unit tests (41); manual tests for restarts, replicas, semi-sync, relocation and performance (`manual-test-plan.md`).
 
 ## Build and source integration
@@ -640,20 +640,26 @@ coverage tracker updated.
 
 **T0. No more `wait_applier()`: DDL waits for its refresh, with progress**
 (agreed 2026-11-19)
-- [ ] A DDL on a table with a copy returns when the applier has refreshed
-      the copy (`duckdb_guard`, end of statement, in the client thread):
-      `duckdb_ddl_wait_refresh` (ON default, session, global, SET_VAR) and
-      `duckdb_ddl_wait_refresh_timeout` (seconds, 0 = until done). The DDL is
-      committed: a timeout or KILL QUERY stops only the wait (warning).
-- [ ] Progress while waiting: SHOW PROCESSLIST state ("Waiting for DuckDB
+- [x] After a DDL on a table with a copy, the session's **next statement**
+      waits until the applier has refreshed the copy (`duckdb_guard`:
+      the DDL is recorded at its end, the wait is at the next statement's
+      pre-parse). The DDL itself cannot wait: it holds the table's metadata
+      lock until the server sends its OK, and the refresh (internal
+      SECONDARY_LOAD) needs that lock; the first version deadlocked there
+      (found by MTR, 2026-11-20). `duckdb_ddl_wait_refresh` (ON default) and
+      `duckdb_ddl_wait_refresh_timeout` (seconds, 0 = until done); KILL
+      QUERY or the timeout stop only the wait (error log line). MTR
+      `ddl_wait`.
+- [x] Progress while waiting: SHOW PROCESSLIST state ("Waiting for DuckDB
       copy refresh of db.t: N of M rows (P%), S s"), Performance Schema
       stages `stage/duckdb/waiting for copy refresh`, `waiting for applier`,
       `copy load` with WORK_COMPLETED / WORK_ESTIMATED,
-      a Note at the end (waited S s, N rows), a warning when the wait stops,
-      error log progress at info level every 10 s for long refreshes.
-- [ ] `INFORMATION_SCHEMA.DUCKDB_TABLES`: STATE 'refreshing',
+      error log progress at info level every 10 s for long loads, and a
+      line when a wait ends or stops (a note would be cleared by the
+      statement that waited).
+- [x] `INFORMATION_SCHEMA.DUCKDB_TABLES`: STATE 'refreshing',
       REFRESH_ROWS_DONE, REFRESH_ROWS_TOTAL, applied position.
-- [ ] FULL scope queries wait without the `duckdb_offload_wait_timeout_ms`
+- [x] FULL scope queries wait without the `duckdb_offload_wait_timeout_ms`
       limit (KILL / max_execution_time stop them): no InnoDB answer exists.
 - [ ] Remove `wait_applier()` from the tutorial; HOWTO keeps waiting for the
       whole applier only as an operator step.
@@ -734,7 +740,7 @@ Needed for general availability:
 
 | Item | What | Status |
 |---|---|---|
-| Observability | Apply lag in seconds per table, offload ratio, refusal reasons aggregated (not only the last), lake size, Performance Schema instruments, PMM dashboards | partial (status variables, `INFORMATION_SCHEMA.DUCKDB_TABLES`) |
+| Observability | Apply lag per table, refusal reasons aggregated (not only the last), lake size | partial: lag in seconds and bytes, state code, memory and spill, offloaded query time (status variables), Performance Schema stages with progress, PMM / Grafana dashboard and custom queries (`monitoring/`, 2026-11-20) |
 | Packaging | One tarball; plugin size (about 1.5 GB with debug info, stripped release); ICU symbol clash between the server (ICU 77) and DuckDB's icu extension (hidden visibility, to test) | missing |
 | Security and compliance | Encryption (designed, keyring component), erasure requests against history copies (a purge keeps the personal data), privileges reviewed | designed |
 | Upgrade policy | DuckDB / DuckLake version upgrades and lake format migration (DuckLake has no release tags) | missing |

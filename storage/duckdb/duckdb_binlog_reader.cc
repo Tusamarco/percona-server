@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <string>
@@ -32,12 +33,14 @@
 #include "mysql/binlog/event/statement_events.h"
 #include "mysql/psi/mysql_thread.h"
 #include "sql/binlog.h"         // mysql_bin_log, Log_info
+#include "my_dir.h"             // my_stat
 #include "sql/binlog_reader.h"  // Binlog_file_reader
 #include "sql/mysqld.h"  // opt_bin_log, binlog_expire_logs_seconds
 #include "storage/duckdb/duckdb_ddl.h"
 #include "storage/duckdb/duckdb_load.h"  // refresh and rename after DDL
 #include "storage/duckdb/duckdb_log.h"
 #include "storage/duckdb/duckdb_session.h"
+#include "storage/duckdb/duckdb_types.h"  // quote_literal
 
 namespace duckdb_se {
 
@@ -200,7 +203,19 @@ bool BinlogReader::repoint(const BinlogPos &to, THD *thd,
     BinlogPos applied;
     std::string gtid;
     failed = !con || read_applied_position(*con, &applied, &gtid, err);
-    if (!failed && !applied.empty() && to < applied) {
+    // The binary logs were reset after our last commit (RESET BINARY LOGS
+    // AND GTIDS): the applied position is after the end of the binary log
+    // and names a file of the old log, so "before the applied position"
+    // means nothing; nothing can be applied twice. Load positions of the
+    // old log are cleared: otherwise the new log's changes up to them would
+    // be skipped as already loaded, silently.
+    BinlogPos end;
+    bool reset = false;
+    if (!failed && !applied.empty()) {
+      std::string end_err;
+      reset = !current_end(&end, &end_err) && end < applied;
+    }
+    if (!failed && !reset && !applied.empty() && to < applied) {
       *err = "the position " + to.file + ":" + std::to_string(to.pos) +
              " is before the applied position " + applied.file + ":" +
              std::to_string(applied.pos) +
@@ -208,9 +223,29 @@ bool BinlogReader::repoint(const BinlogPos &to, THD *thd,
       failed = true;
     }
     moved = applied.empty() || applied < to;
+    if (!failed && reset) {
+      if (con->run("UPDATE lake.__mysql.tables SET load_binlog_file = NULL, "
+                   "load_binlog_pos = NULL WHERE load_binlog_file > " +
+                       quote_literal(end.file) +
+                       " OR (load_binlog_file = " + quote_literal(end.file) +
+                       " AND load_binlog_pos > " + std::to_string(end.pos) +
+                       ")",
+                   err))
+        failed = true;
+      else
+        *behind = Registry::instance().forget_old_log_positions(end);
+      if (!failed)
+        DUCKDB_LOG_WARNING(
+            "binlog applier: the binary logs were reset after the applied "
+            "position %s:%llu; repointing to %s:%llu. Changes committed "
+            "between the applied position and the reset are not in DuckDB: "
+            "reload the copies that changed then",
+            applied.file.c_str(), applied.pos, to.file.c_str(), to.pos);
+    }
     if (!failed) failed = store_applied_position(*con, to, "", err);
   }
-  if (!failed && moved) *behind = Registry::instance().loaded_before(to);
+  if (!failed && moved && behind->empty())
+    *behind = Registry::instance().loaded_before(to);
   std::string start_err;
   if (start(m_stack_size, &start_err)) {
     if (!failed) *err = start_err;
@@ -408,6 +443,9 @@ void BinlogReader::notify_committed(const char *file, my_off_t pos) {
   if (!m_running) return;
   BinlogPos committed{file, pos};
   if (m_committed < committed) {
+    // Everything was read and applied: DuckDB is behind from now on.
+    if (m_caught_up && !(m_position < m_committed) && m_behind_since == 0)
+      m_behind_since = now_micros();
     m_committed = std::move(committed);
     m_cv.notify_one();
   }
@@ -435,6 +473,28 @@ BinlogReader::Status BinlogReader::status() {
   s.purge_transactions = m_purge_transactions;
   s.applied = m_applied;
   s.applied_gtid = m_applied_gtid;
+  // Lag: the oldest transaction committed in MySQL and not in DuckDB.
+  if (!(m_caught_up && !(m_position < m_committed))) {
+    unsigned long long oldest = m_pending_since;
+    if (oldest == 0 && m_read_time > m_applied_time) oldest = m_read_time;
+    if (oldest == 0) oldest = m_behind_since;
+    const unsigned long long now = now_micros();
+    if (oldest != 0 && now > oldest)
+      s.lag_seconds = static_cast<double>(now - oldest) / 1e6;
+  }
+  auto starts = [this](const char *p) {
+    return m_state.compare(0, strlen(p), p) == 0;
+  };
+  s.state_code = starts("idle:")               ? 6
+                 : starts("idle")              ? 0
+                 : starts("reading")           ? 1
+                 : starts("waiting to commit") ? 2
+                 : starts("committing")        ? 3
+                 : starts("refreshing")        ? 4
+                 : starts("error")             ? 5
+                                               : 6;
+  s.memory_used = m_memory_used;
+  s.temp_storage = m_temp_storage;
   return s;
 }
 
@@ -485,9 +545,9 @@ void BinlogReader::loop() {
         // The binary logs were reset after our last commit: a gap.
         err = "the applied position " + start.file + ":" +
               std::to_string(start.pos) +
-              " is after the end of the binary log (binary logs reset?). "
-              "Reload the tables and SET GLOBAL duckdb_apply_start_position "
-              "= 'FIRST'";
+              " is after the end of the binary log (binary logs reset?): "
+              "SET GLOBAL duckdb_apply_start_position = 'FIRST', then reload "
+              "the copies that changed before the reset";
         failed_start = true;
       }
     } else {
@@ -573,8 +633,18 @@ void BinlogReader::loop() {
       m_state = "idle";
       // Everything read is committed: wait_applied() may stop waiting.
       m_caught_up = true;
+      m_behind_since = 0;
       m_cv.notify_all();
-      m_cv.wait(lk);
+      // The DuckDB memory sample for monitoring, also while idle: outside
+      // m_mutex, then everything is checked again.
+      if (std::chrono::steady_clock::now() - m_memory_sampled >=
+          std::chrono::seconds(5)) {
+        lk.unlock();
+        sample_memory();
+        lk.lock();
+        continue;
+      }
+      m_cv.wait_for(lk, std::chrono::seconds(5));
       continue;
     }
     m_state = "reading";
@@ -734,6 +804,15 @@ bool BinlogReader::handle_event(const unsigned char *data, const BinlogPos &at,
       m_trx.commit_time = ev.original_commit_timestamp;
       // 0 would mean "not archived": we never use it as an archive time.
       if (m_trx.commit_time == 0) m_trx.commit_time = now_micros();
+      // The commit on this server (on a replica: when the replica committed
+      // it), for the lag in seconds.
+      m_trx.local_time = ev.immediate_commit_timestamp != 0
+                             ? ev.immediate_commit_timestamp
+                             : m_trx.commit_time;
+      {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_read_time = m_trx.local_time;
+      }
       m_table_map.clear();
       m_table_info.clear();
       return false;
@@ -1207,6 +1286,9 @@ bool BinlogReader::commit_large(const BinlogPos &at, std::string *err) {
     if (m_trx.purge) m_purge_transactions++;
     m_applied = at;
     m_applied_gtid = gtid;
+    m_applied_time = m_trx.local_time;
+    m_pending_since = 0;
+    m_behind_since = 0;
   }
   DUCKDB_LOG_INFO("binlog applier: transaction %s applied in pieces, %llu rows "
                   "written",
@@ -1258,6 +1340,13 @@ bool BinlogReader::end_transaction(bool commit, const BinlogPos &at,
   m_batch.end = at;
   if (!m_trx.gtid.empty()) m_batch.last_gtid = m_trx.gtid;
   m_batch.pending = true;
+  {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    const unsigned long long t =
+        m_trx.local_time != 0 ? m_trx.local_time : now_micros();
+    if (m_pending_since == 0) m_pending_since = t;
+    m_batch_last_time = t;
+  }
   m_trx = Trx();
   return maybe_commit(false, err);
 }
@@ -1288,10 +1377,70 @@ bool BinlogReader::commit_pending(std::string *err) {
     m_archived_rows += stats.archived_rows;
     m_applied = m_batch.end;
     m_applied_gtid = m_batch.last_gtid;
+    m_applied_time = m_batch_last_time;
+    m_pending_since = 0;
+    m_behind_since = 0;
   }
   m_batch.clear();
   m_last_commit = std::chrono::steady_clock::now();
+  sample_memory();
   return false;
+}
+
+void BinlogReader::sample_memory() {
+  const auto now = std::chrono::steady_clock::now();
+  if (!m_con || now - m_memory_sampled < std::chrono::seconds(5)) return;
+  m_memory_sampled = now;
+  unsigned long long used = 0, temp = 0;
+  std::string err;
+  const bool failed = m_con->execute(
+      [&](duckdb_connection c, std::string *e) {
+        duckdb_result res;
+        if (duckdb_query(c,
+                         "SELECT COALESCE(sum(memory_usage_bytes), 0)::UBIGINT, "
+                         "COALESCE(sum(temporary_storage_bytes), 0)::UBIGINT "
+                         "FROM duckdb_memory()",
+                         &res) == DuckDBError) {
+          const char *m = duckdb_result_error(&res);
+          *e = m != nullptr ? m : "duckdb_memory() failed";
+          duckdb_destroy_result(&res);
+          return true;
+        }
+        used = duckdb_value_uint64(&res, 0, 0);
+        temp = duckdb_value_uint64(&res, 1, 0);
+        duckdb_destroy_result(&res);
+        return false;
+      },
+      &err);
+  if (failed) return;  // keep the last sample; monitoring never stops us
+  m_memory_used = used;
+  m_temp_storage = temp;
+}
+
+unsigned long long BinlogReader::lag_bytes() {
+  BinlogPos from, to;
+  {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    if (m_caught_up && !(m_position < m_committed)) return 0;
+    from = m_applied;
+    to = m_committed;
+  }
+  if (from.empty() || to.empty() || !(from < to)) return 0;
+  if (from.file == to.file) return to.pos - from.pos;
+  // Across files: the rest of the applied file, the files in between, and
+  // the start of the current one.
+  auto size = [](const std::string &file) -> unsigned long long {
+    MY_STAT st;
+    return my_stat(binlog_full_path(file).c_str(), &st, MYF(0)) != nullptr
+               ? static_cast<unsigned long long>(st.st_size)
+               : 0;
+  };
+  unsigned long long bytes = 0;
+  const unsigned long long first = size(from.file);
+  if (first > from.pos) bytes += first - from.pos;
+  for (const std::string &f : binlog_files())
+    if (from.file < f && f < to.file) bytes += size(f);
+  return bytes + to.pos;
 }
 
 void BinlogReader::flush_on_stop() {

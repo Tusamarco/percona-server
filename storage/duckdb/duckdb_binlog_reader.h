@@ -76,6 +76,18 @@ class BinlogReader {
     unsigned long long purge_transactions{0};
     BinlogPos applied;
     std::string applied_gtid;
+    /** Monitoring (2026-11-20). How far DuckDB is behind: 0 when every
+        committed transaction is applied; otherwise the age of the oldest
+        transaction committed in MySQL and not yet in DuckDB (its
+        immediate_commit_timestamp), like Seconds_Behind_Source. */
+    double lag_seconds{0};
+    /** The state as a number: 0 idle, 1 reading, 2 waiting to commit,
+        3 committing, 4 refreshing a copy, 5 error, 6 stopped. */
+    unsigned state_code{6};
+    /** DuckDB memory and spill (duckdb_memory()), sampled about every 5 s by
+        the reader thread (no DuckDB call on the session that asks). */
+    unsigned long long memory_used{0};
+    unsigned long long temp_storage{0};
   };
 
   static BinlogReader &instance();
@@ -107,6 +119,10 @@ class BinlogReader {
   */
   void notify_committed(const char *file, my_off_t pos);
   Status status();
+  /** Bytes of binary log between the applied position and the end of the
+      binary log, across files (file sizes from the binary log directory); 0
+      when everything is applied. */
+  unsigned long long lag_bytes();
   /** duckdb_apply_debug_log: one error log line per collapsed change. */
   void set_debug_log(bool on) { m_debug_log = on; }
   /**
@@ -152,6 +168,9 @@ class BinlogReader {
     bool purge{false};
     /** Original commit time in microseconds: the archive time (DWL#5). */
     unsigned long long commit_time{0};
+    /** Commit time on this server (immediate_commit_timestamp), for the
+        lag in seconds. */
+    unsigned long long local_time{0};
     /**
       Collapsed changes per (db, table): of the whole transaction, or of the
       current piece when it is applied in pieces.
@@ -264,6 +283,21 @@ class BinlogReader {
   unsigned long long m_purge_transactions{0};
   BinlogPos m_applied;  // last committed (applied) position
   std::string m_applied_gtid;
+  // Lag (under m_mutex): local commit time of the oldest transaction in the
+  // pending batch, of the last transaction read, and the time the reader
+  // fell behind after being caught up (microseconds since the epoch).
+  unsigned long long m_pending_since{0};
+  unsigned long long m_read_time{0};
+  unsigned long long m_behind_since{0};
+  unsigned long long m_batch_last_time{0};  // newest transaction in the batch
+  unsigned long long m_applied_time{0};     // newest applied transaction
+  // DuckDB memory sample (duckdb_memory()), written by the reader thread.
+  std::atomic<unsigned long long> m_memory_used{0};
+  std::atomic<unsigned long long> m_temp_storage{0};
+  std::chrono::steady_clock::time_point m_memory_sampled{};
+  /** Samples duckdb_memory() when the last sample is 5 s old (reader thread,
+      outside m_mutex). */
+  void sample_memory();
   // Used only by the reader thread.
   std::map<unsigned long long, std::pair<std::string, std::string>>
       m_table_map;

@@ -1,0 +1,45 @@
+SET NAMES utf8mb4;
+# MTR enables every instrument and consumer; on a server see monitoring/README.md
+SELECT NAME, ENABLED FROM performance_schema.setup_instruments WHERE NAME LIKE 'stage/duckdb/%' ORDER BY NAME;
+NAME	ENABLED
+stage/duckdb/copy load	YES
+stage/duckdb/waiting for applier	YES
+stage/duckdb/waiting for copy refresh	YES
+SELECT @@duckdb_ddl_wait_refresh, @@duckdb_ddl_wait_refresh_timeout;
+@@duckdb_ddl_wait_refresh	@@duckdb_ddl_wait_refresh_timeout
+1	0
+CREATE TABLE dw (id INT PRIMARY KEY, a INT) SECONDARY_ENGINE = duckdb;
+ALTER TABLE dw SECONDARY_LOAD;
+# The statement after the DDL waits for the refresh; the new column is in DuckDB at once
+ALTER TABLE dw ADD COLUMN c INT NOT NULL DEFAULT 5;
+SELECT TABLE_NAME, STATE, REFRESH_ROWS_DONE, REFRESH_ROWS_TOTAL FROM information_schema.DUCKDB_TABLES WHERE TABLE_NAME = 'dw';
+TABLE_NAME	STATE	REFRESH_ROWS_DONE	REFRESH_ROWS_TOTAL
+dw	LOADED	NULL	NULL
+SET SESSION use_secondary_engine = FORCED, duckdb_offload_wait_applied = OFF;
+SELECT c, COUNT(*) FROM dw GROUP BY c;
+c	COUNT(*)
+5	1000
+SET SESSION use_secondary_engine = DEFAULT, duckdb_offload_wait_applied = DEFAULT;
+# Another session sees the wait in SHOW PROCESSLIST and Performance Schema
+ALTER TABLE dw ADD COLUMN d INT NOT NULL DEFAULT 6;
+SELECT COUNT(*) FROM dw;
+COUNT(*)
+1000
+SET SESSION use_secondary_engine = FORCED, duckdb_offload_wait_applied = OFF;
+SELECT c, d, COUNT(*) FROM dw GROUP BY c, d;
+c	d	COUNT(*)
+5	6	1000
+SET SESSION use_secondary_engine = DEFAULT, duckdb_offload_wait_applied = DEFAULT;
+# A DDL on a table without a copy does not make the next statement wait
+CREATE TABLE nocopy (id INT PRIMARY KEY);
+ALTER TABLE nocopy ADD COLUMN x INT;
+SHOW WARNINGS;
+Level	Code	Message
+DROP TABLE nocopy;
+# duckdb_ddl_wait_refresh = OFF: the next statement does not wait
+SET SESSION duckdb_ddl_wait_refresh = OFF;
+ALTER TABLE dw ADD COLUMN e INT NOT NULL DEFAULT 7;
+SHOW WARNINGS;
+Level	Code	Message
+SET SESSION duckdb_ddl_wait_refresh = DEFAULT;
+DROP TABLE dw;

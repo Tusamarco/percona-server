@@ -591,13 +591,15 @@ MYSQL_THDVAR_ULONGLONG(offload_wait_timeout_ms,
 
 MYSQL_THDVAR_BOOL(ddl_wait_refresh,
                   PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_HINTUPDATEABLE,
-                  "A DDL on a table with a DuckDB copy (ALTER, RENAME, "
-                  "TRUNCATE, partition changes...) returns when the binlog "
-                  "applier has refreshed the copy, so the next statements "
-                  "see it in DuckDB. While waiting, SHOW PROCESSLIST and the "
-                  "Performance Schema stage stage/duckdb/waiting for copy "
-                  "refresh show the progress. The DDL itself is committed "
-                  "before: KILL QUERY or the timeout stop only the wait.",
+                  "After a DDL on a table with a DuckDB copy (ALTER, RENAME, "
+                  "TRUNCATE, partition changes...), the session's next "
+                  "statement waits until the binlog applier has refreshed "
+                  "the copy, so it sees the copy in DuckDB. (The DDL itself "
+                  "cannot wait: it holds the table's metadata lock, which "
+                  "the refresh needs.) While waiting, SHOW PROCESSLIST and "
+                  "the Performance Schema stage stage/duckdb/waiting for "
+                  "copy refresh show the progress. KILL QUERY or the timeout "
+                  "stop only the wait.",
                   nullptr, nullptr, true);
 
 MYSQL_THDVAR_ULONGLONG(ddl_wait_refresh_timeout,
@@ -732,6 +734,38 @@ int show_number(SHOW_VAR *var, char *buff, unsigned long long value) {
 
 int show_reader_state(THD *, SHOW_VAR *var, char *buff) {
   return show_text(var, buff, safe_status().state);
+}
+
+// Monitoring (2026-11-20): numbers PMM / Prometheus collect as they are.
+int show_reader_state_code(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, safe_status().state_code);
+}
+
+int show_lag_seconds(THD *, SHOW_VAR *var, char *buff) {
+  char text[32];
+  snprintf(text, sizeof(text), "%.3f", safe_status().lag_seconds);
+  return show_text(var, buff, text);
+}
+
+int show_lag_bytes(THD *, SHOW_VAR *var, char *buff) {
+  unsigned long long bytes = 0;
+  try {
+    bytes = BinlogReader::instance().lag_bytes();
+  } catch (...) {
+  }
+  return show_number(var, buff, bytes);
+}
+
+int show_memory_used(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, safe_status().memory_used);
+}
+
+int show_temp_spill(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, safe_status().temp_storage);
+}
+
+int show_offload_time(THD *, SHOW_VAR *var, char *buff) {
+  return show_number(var, buff, offload_status().time_us);
 }
 
 int show_reader_file(THD *, SHOW_VAR *var, char *buff) {
@@ -934,6 +968,19 @@ SHOW_VAR duckdb_status_variables[] = {
     {"duckdb_offload_decimal_reruns",
      reinterpret_cast<char *>(&show_offload_decimal_reruns), SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"duckdb_offload_time_us", reinterpret_cast<char *>(&show_offload_time),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_apply_reader_state_code",
+     reinterpret_cast<char *>(&show_reader_state_code), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_apply_lag_seconds", reinterpret_cast<char *>(&show_lag_seconds),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_apply_lag_bytes", reinterpret_cast<char *>(&show_lag_bytes),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_memory_used_bytes", reinterpret_cast<char *>(&show_memory_used),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_temp_spill_bytes", reinterpret_cast<char *>(&show_temp_spill),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_apply_archived_rows",
      reinterpret_cast<char *>(&show_archived_rows), SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},

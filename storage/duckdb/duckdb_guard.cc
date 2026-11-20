@@ -122,14 +122,27 @@ int on_table_access(THD *thd, const mysql_event_table_access *ev) {
   return 0;
 }
 
-// The end of a DDL on a table with a DuckDB copy (duckdb_ddl_wait_refresh):
-// the binlog applier refreshes the copy (an internal SECONDARY_LOAD) when it
-// reads the statement, and the client gets its OK once that is done, so the
-// next statements see the copy in DuckDB. The event comes after the DDL has
-// committed (DDL commits inside its execution) and before the OK is sent, in
-// the client's thread; the progress is in its SHOW PROCESSLIST state and
-// Performance Schema stage. Nothing here can fail the DDL: it is committed.
-void on_ddl_end(THD *thd, const mysql_event_query *ev) {
+// T0: a DDL on a table with a DuckDB copy, and the statement after it.
+//
+// The binlog applier refreshes the copy (an internal SECONDARY_LOAD) when it
+// reads the DDL. The DDL's own client thread cannot wait for that: until the
+// statement ends it holds the table's metadata lock, which the refresh needs
+// (a deadlock), and the server sends the OK right after releasing it, with
+// no plugin event in between. So at the end of the DDL we record what to
+// wait for, and the session's next statement waits at its start (pre-parse:
+// no lock held yet), showing the progress in SHOW PROCESSLIST and the
+// Performance Schema stage. Whatever the session runs after the DDL sees the
+// refreshed copy (duckdb_ddl_wait_refresh).
+struct PendingDdl {
+  BinlogPos target;
+  std::string copy;  // db.table, for the messages
+};
+std::mutex g_ddl_mutex;
+std::unordered_map<const THD *, PendingDdl> g_pending_ddl;
+
+// End of a statement (QUERY_STATUS_END): a committed DDL on a table with a
+// copy is recorded for the next statement.
+void on_statement_end(THD *thd, const mysql_event_query *ev) {
   if (ev->event_subclass != MYSQL_AUDIT_QUERY_STATUS_END || ev->status != 0)
     return;
   // The replica applier must not wait (replication would stall), nor our own
@@ -158,49 +171,47 @@ void on_ddl_end(THD *thd, const mysql_event_query *ev) {
   if (copy.empty()) return;
   BinlogPos target;
   if (session_commit_position(thd, &target) || target.empty()) return;
+  std::lock_guard<std::mutex> g(g_ddl_mutex);
+  g_pending_ddl[thd] = PendingDdl{target, copy};
+}
 
+// Start of the session's next statement: wait for the refresh of the copy
+// the DDL changed. The result goes to the error log (info level): a note
+// pushed here would be cleared when the statement starts executing.
+void wait_for_ddl_refresh(THD *thd) {
+  PendingDdl p;
+  {
+    std::lock_guard<std::mutex> g(g_ddl_mutex);
+    auto it = g_pending_ddl.find(thd);
+    if (it == g_pending_ddl.end()) return;
+    p = it->second;
+    g_pending_ddl.erase(it);
+  }
+  if (!ddl_wait_refresh(thd) || thd->locked_tables_mode != LTM_NONE) return;
   double waited = 0;
   std::string refreshed;
   unsigned long long rows = 0;
   const WaitResult r = wait_for_applier(
-      thd, target, ddl_wait_refresh_timeout(thd) * 1000,
-      ("refresh of the DuckDB copy of " + copy + " after this DDL").c_str(),
+      thd, p.target, ddl_wait_refresh_timeout(thd) * 1000,
+      ("refresh of the DuckDB copy of " + p.copy + " after the last DDL")
+          .c_str(),
       &waited, &refreshed, &rows);
-  switch (r) {
-    case WaitResult::APPLIED:
-      if (!refreshed.empty())
-        push_warning_printf(
-            thd, Sql_condition::SL_NOTE, ER_SECONDARY_ENGINE_PLUGIN,
-            "DuckDB: the copy of %s was refreshed after this DDL (%llu "
-            "rows); waited %.1f s",
-            refreshed.c_str(), rows, waited);
-      else if (waited >= 1)
-        push_warning_printf(thd, Sql_condition::SL_NOTE,
-                            ER_SECONDARY_ENGINE_PLUGIN,
-                            "DuckDB: waited %.1f s for the binlog applier to "
-                            "apply this DDL to the copy of %s",
-                            waited, copy.c_str());
-      break;
-    case WaitResult::TIMEOUT:
-    case WaitResult::KILLED:
-      push_warning_printf(
-          thd, Sql_condition::SL_WARNING, ER_SECONDARY_ENGINE_PLUGIN,
-          "DuckDB: stopped waiting after %.1f s (%s); the DDL is committed "
-          "and the copy of %s is still being refreshed: until then queries "
-          "on it run on InnoDB (duckdb_history_scope=FULL: they wait)",
-          waited,
-          r == WaitResult::KILLED ? "KILL QUERY"
-                                  : "duckdb_ddl_wait_refresh_timeout",
-          copy.c_str());
-      break;
-    case WaitResult::NOT_RUNNING:
-      push_warning_printf(
-          thd, Sql_condition::SL_WARNING, ER_SECONDARY_ENGINE_PLUGIN,
-          "DuckDB: the binlog applier is not running: the copy of %s is "
-          "refreshed when it runs again (duckdb_apply_reader_state)",
-          copy.c_str());
-      break;
+  if (r == WaitResult::APPLIED) {
+    if (waited >= 1)
+      DUCKDB_LOG_INFO(
+          "connection %u waited %.1f s for the DuckDB copy of %s to be "
+          "refreshed after its DDL (%llu rows)",
+          thd->thread_id(), waited, p.copy.c_str(), rows);
+    return;
   }
+  DUCKDB_LOG_INFO(
+      "connection %u stopped waiting for the refresh of the DuckDB copy of %s "
+      "after %.1f s (%s): until it is done, queries on it run on InnoDB "
+      "(duckdb_history_scope=FULL: they wait)",
+      thd->thread_id(), p.copy.c_str(), waited,
+      r == WaitResult::KILLED    ? "KILL QUERY"
+      : r == WaitResult::TIMEOUT ? "duckdb_ddl_wait_refresh_timeout"
+                                 : "the binlog applier is not running");
 }
 
 int guard_notify(MYSQL_THD thd, mysql_event_class_t event_class,
@@ -208,7 +219,7 @@ int guard_notify(MYSQL_THD thd, mysql_event_class_t event_class,
   if (thd == nullptr) return 0;
   if (event_class == MYSQL_AUDIT_QUERY_CLASS) {
     try {
-      on_ddl_end(thd, static_cast<const mysql_event_query *>(event));
+      on_statement_end(thd, static_cast<const mysql_event_query *>(event));
     } catch (...) {
       // Never affect the (committed) DDL.
     }
@@ -223,9 +234,12 @@ int guard_notify(MYSQL_THD thd, mysql_event_class_t event_class,
     // pre-parse comes after that and before the check.
     const auto *ev = static_cast<const mysql_event_parse *>(event);
     try {
-      if (ev->event_subclass == MYSQL_AUDIT_PARSE_PREPARSE &&
-          is_internal_session(thd))
-        thd->set_skip_readonly_check();
+      if (ev->event_subclass == MYSQL_AUDIT_PARSE_PREPARSE) {
+        if (is_internal_session(thd))
+          thd->set_skip_readonly_check();
+        else if (thd->system_thread == NON_SYSTEM_THREAD)
+          wait_for_ddl_refresh(thd);  // T0: the statement after a DDL
+      }
     } catch (...) {
     }
     return 0;
@@ -273,8 +287,12 @@ bool guard_active() { return g_active; }
 
 void guard_forget(THD *thd) {
   try {
-    std::lock_guard<std::mutex> guard(g_marks_mutex);
-    g_marks.erase(thd);
+    {
+      std::lock_guard<std::mutex> guard(g_marks_mutex);
+      g_marks.erase(thd);
+    }
+    std::lock_guard<std::mutex> guard(g_ddl_mutex);
+    g_pending_ddl.erase(thd);
   } catch (...) {
   }
 }

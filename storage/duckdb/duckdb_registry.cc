@@ -215,6 +215,20 @@ std::vector<std::string> Registry::loaded_before(const BinlogPos &pos) {
   return names;
 }
 
+std::vector<std::string> Registry::forget_old_log_positions(
+    const BinlogPos &end) {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  std::vector<std::string> names;
+  for (auto &entry : m_tables) {
+    LoadedTable &t = entry.second;
+    if (!t.present) continue;
+    if (end < t.load_position) t.load_position = BinlogPos();
+    if (!t.stale && !t.refresh_pending)
+      names.push_back(entry.first.first + "." + entry.first.second);
+  }
+  return names;
+}
+
 void Registry::mark_stale(const std::string &db, const std::string &table) {
   std::lock_guard<std::mutex> guard(m_mutex);
   if (LoadedTable *t = live(Key(db, table)); t != nullptr) t->stale = true;

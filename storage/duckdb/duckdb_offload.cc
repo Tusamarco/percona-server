@@ -23,6 +23,7 @@
 
 #include "storage/duckdb/duckdb_offload.h"
 
+#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
@@ -54,6 +55,7 @@
 #include "sql/query_result.h"
 #include "sql/query_term.h"
 #include "sql/replication.h"  // Trans_observer
+#include "scope_guard.h"
 #include "storage/duckdb/duckdb_progress.h"
 #include "sql/sql_class.h"
 #include "sql/sql_executor.h"  // QEP_TAB
@@ -146,6 +148,16 @@ std::atomic<unsigned long long> g_explained{0};
 std::atomic<unsigned long long> g_waits{0};
 std::atomic<unsigned long long> g_wait_timeouts{0};
 std::atomic<unsigned long long> g_decimal_reruns{0};
+// Time in DuckDB of the statements counted in g_offloaded (execution and
+// fetch, plus a first run during optimization), in microseconds.
+std::atomic<unsigned long long> g_offload_time_us{0};
+
+unsigned long long micros_since(std::chrono::steady_clock::time_point t) {
+  return static_cast<unsigned long long>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - t)
+          .count());
+}
 std::mutex g_reason_mutex;
 std::string g_last_refusal;
 
@@ -195,6 +207,7 @@ class OffloadContext : public Secondary_engine_execution_context {
   // optimization (duckdb_decimal_overflow): its materialized result, sent by
   // execute_offloaded().
   duckdb_result pre_result;
+  unsigned long long pre_run_us{0};  // first runs during optimization
   bool have_pre_result{false};
 
   // Semi-join materialization is turned off while the server optimizes a
@@ -3128,6 +3141,7 @@ bool execute_offloaded(JOIN *join, Query_result *result) {
   OffloadContext *ctx = context(thd);
   if (ctx == nullptr || ctx->executed) return false;
   ctx->executed = true;
+  const auto started = std::chrono::steady_clock::now();
 
   mem_root_deque<Item *> holders(thd->mem_root);
   std::vector<Item_cache *> caches;
@@ -3248,6 +3262,7 @@ bool execute_offloaded(JOIN *join, Query_result *result) {
   }
   cleanup();
   g_offloaded++;  // run in DuckDB to the end
+  g_offload_time_us += micros_since(started) + ctx->pre_run_us;
   return false;
 }
 
@@ -3425,6 +3440,9 @@ bool optimize(THD *thd, LEX *lex) {
   // error in the middle of sending rows).
   duckdb_error_type run_error = DUCKDB_ERROR_INVALID;
   auto run_first = [&](std::string *err) {
+    const auto started = std::chrono::steady_clock::now();
+    auto timed = create_scope_guard(
+        [&] { ctx->pre_run_us += micros_since(started); });
     return ctx->con->execute(
         [ctx, &run_error](duckdb_connection, std::string *e) {
           if (duckdb_execute_prepared(ctx->stmt, &ctx->pre_result) ==
@@ -3585,6 +3603,7 @@ OffloadStatus offload_status() {
   s.waits = g_waits;
   s.wait_timeouts = g_wait_timeouts;
   s.decimal_reruns = g_decimal_reruns;
+  s.time_us = g_offload_time_us;
   std::lock_guard<std::mutex> guard(g_reason_mutex);
   s.last_refusal = g_last_refusal;
   return s;

@@ -153,6 +153,15 @@ class Registry {
     binlog range that ends at pos and that we do not read.
   */
   std::vector<std::string> loaded_before(const BinlogPos &pos);
+
+  /**
+    After the binary logs were reset: load positions after `end` belong to
+    the old log and would make the applier skip the new log's changes as
+    "already loaded". They are cleared (as for a copy loaded before 4a:
+    every change is applied). Returns the names of every usable copy (all
+    may miss changes of the lost log).
+  */
+  std::vector<std::string> forget_old_log_positions(const BinlogPos &end);
   void mark_stale(const std::string &db, const std::string &table);
   void mark_refresh_pending(const std::string &db, const std::string &table,
                             const std::string &pending_renames);

@@ -1,0 +1,52 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# Binary logs reset under the applier (2026-11-20): the applier stops with a
+# clear error, duckdb_apply_start_position = 'FIRST' is accepted (it was
+# refused as "before the applied position"), and changes of the new log are
+# applied to copies loaded in the old log (their load positions are cleared;
+# before, they were skipped as already loaded).
+--source ../include/have_duckdb.inc
+--disable_query_log
+CALL mtr.add_suppression("binlog reader: the applied position .* is after the end of the binary log");
+CALL mtr.add_suppression("binlog applier: the binary logs were reset after the applied position");
+CALL mtr.add_suppression("binlog applier repointed to");
+--enable_query_log
+CREATE TABLE br (id INT PRIMARY KEY, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO br VALUES (1, 1), (2, 2);
+FLUSH BINARY LOGS;
+FLUSH BINARY LOGS;
+ALTER TABLE br SECONDARY_LOAD;
+INSERT INTO br VALUES (3, 3);
+--source ../include/wait_applier.inc
+
+RESET BINARY LOGS AND GTIDS;
+SET GLOBAL duckdb_enable = OFF;
+SET GLOBAL duckdb_enable = ON;
+--let $wait_condition= SELECT VARIABLE_VALUE LIKE 'error:%reset%' FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_apply_reader_state'
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_apply_reader_state_code';
+
+--echo # FIRST is accepted after the reset
+SET GLOBAL duckdb_apply_start_position = 'FIRST';
+INSERT INTO br VALUES (4, 4), (5, 5);
+UPDATE br SET v = 10 WHERE id = 1;
+--source ../include/wait_applier.inc
+--let $query= SELECT id, v FROM br ORDER BY id
+--source ../include/duckdb_compare.inc
+SELECT TABLE_NAME, STATE, LOAD_BINLOG_FILE FROM information_schema.DUCKDB_TABLES WHERE TABLE_NAME = 'br';
+
+DROP TABLE br;
+--source ../include/cleanup.inc

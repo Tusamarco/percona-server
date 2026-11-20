@@ -13,17 +13,15 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 #
-# T0 (2026-11-19): a DDL on a table with a DuckDB copy returns once the
-# applier has refreshed the copy (duckdb_ddl_wait_refresh), showing its
-# progress in SHOW PROCESSLIST and the Performance Schema stage; the copy is
-# usable right after, with no wait_applier.
+# T0 (2026-11-19): after a DDL on a table with a DuckDB copy, the session's
+# next statement waits until the applier has refreshed the copy
+# (duckdb_ddl_wait_refresh), showing its progress in SHOW PROCESSLIST and
+# the Performance Schema stage; the copy is usable right after, with no
+# wait_applier.
 --source ../include/have_duckdb.inc
 SET NAMES utf8mb4;
-UPDATE performance_schema.setup_instruments SET ENABLED = 'YES', TIMED = 'YES'
-  WHERE NAME LIKE 'stage/duckdb/%';
-UPDATE performance_schema.setup_consumers SET ENABLED = 'YES'
-  WHERE NAME = 'events_stages_current';
-SELECT NAME FROM performance_schema.setup_instruments WHERE NAME LIKE 'stage/duckdb/%' ORDER BY NAME;
+--echo # MTR enables every instrument and consumer; on a server see monitoring/README.md
+SELECT NAME, ENABLED FROM performance_schema.setup_instruments WHERE NAME LIKE 'stage/duckdb/%' ORDER BY NAME;
 SELECT @@duckdb_ddl_wait_refresh, @@duckdb_ddl_wait_refresh_timeout;
 
 CREATE TABLE dw (id INT PRIMARY KEY, a INT) SECONDARY_ENGINE = duckdb;
@@ -33,10 +31,8 @@ INSERT INTO dw WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WH
 ALTER TABLE dw SECONDARY_LOAD;
 --source ../include/wait_applier.inc
 
---echo # The DDL returns after the refresh, with a note; the new column is in DuckDB at once
+--echo # The statement after the DDL waits for the refresh; the new column is in DuckDB at once
 ALTER TABLE dw ADD COLUMN c INT NOT NULL DEFAULT 5;
---replace_regex /waited [0-9.]+ s/waited N s/
-SHOW WARNINGS;
 SELECT TABLE_NAME, STATE, REFRESH_ROWS_DONE, REFRESH_ROWS_TOTAL FROM information_schema.DUCKDB_TABLES WHERE TABLE_NAME = 'dw';
 SET SESSION use_secondary_engine = FORCED, duckdb_offload_wait_applied = OFF;
 SELECT c, COUNT(*) FROM dw GROUP BY c;
@@ -45,7 +41,8 @@ SET SESSION use_secondary_engine = DEFAULT, duckdb_offload_wait_applied = DEFAUL
 --echo # Another session sees the wait in SHOW PROCESSLIST and Performance Schema
 --connect (con_ddl, localhost, root,,)
 --let $ddl_id= `SELECT CONNECTION_ID()`
---send ALTER TABLE dw ADD COLUMN d INT NOT NULL DEFAULT 6
+ALTER TABLE dw ADD COLUMN d INT NOT NULL DEFAULT 6;
+--send SELECT COUNT(*) FROM dw
 --connection default
 --let $wait_timeout= 120
 --let $wait_condition= SELECT COUNT(*) = 1 FROM information_schema.PROCESSLIST WHERE ID = $ddl_id AND STATE LIKE 'Waiting for%DuckDB%'
@@ -54,30 +51,24 @@ SET SESSION use_secondary_engine = DEFAULT, duckdb_offload_wait_applied = DEFAUL
 --source include/wait_condition.inc
 --connection con_ddl
 --reap
---replace_regex /waited [0-9.]+ s/waited N s/
-SHOW WARNINGS;
 --disconnect con_ddl
 --connection default
 SET SESSION use_secondary_engine = FORCED, duckdb_offload_wait_applied = OFF;
 SELECT c, d, COUNT(*) FROM dw GROUP BY c, d;
 SET SESSION use_secondary_engine = DEFAULT, duckdb_offload_wait_applied = DEFAULT;
 
---echo # A DDL on a table without a copy, and SECONDARY_LOAD, do not wait (no note)
+--echo # A DDL on a table without a copy does not make the next statement wait
 CREATE TABLE nocopy (id INT PRIMARY KEY);
 ALTER TABLE nocopy ADD COLUMN x INT;
 SHOW WARNINGS;
 DROP TABLE nocopy;
 
---echo # duckdb_ddl_wait_refresh = OFF: the DDL returns at once (no note)
+--echo # duckdb_ddl_wait_refresh = OFF: the next statement does not wait
 SET SESSION duckdb_ddl_wait_refresh = OFF;
 ALTER TABLE dw ADD COLUMN e INT NOT NULL DEFAULT 7;
 SHOW WARNINGS;
 SET SESSION duckdb_ddl_wait_refresh = DEFAULT;
 --source ../include/wait_applier.inc
 
-UPDATE performance_schema.setup_instruments SET ENABLED = 'NO', TIMED = 'NO'
-  WHERE NAME LIKE 'stage/duckdb/%';
-UPDATE performance_schema.setup_consumers SET ENABLED = 'NO'
-  WHERE NAME = 'events_stages_current';
 DROP TABLE dw;
 --source ../include/cleanup.inc
