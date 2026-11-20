@@ -105,6 +105,14 @@ def row(title, y, collapsed=False):
 
 
 GREEN_RED = [{"color": "green", "value": None}, {"color": "red", "value": 1}]
+STATE_CODES = [{"type": "value", "options": {
+    "0": {"text": "idle", "color": "green", "index": 0},
+    "1": {"text": "reading", "color": "blue", "index": 1},
+    "2": {"text": "waiting to commit", "color": "blue", "index": 2},
+    "3": {"text": "committing", "color": "blue", "index": 3},
+    "4": {"text": "refreshing", "color": "purple", "index": 4},
+    "5": {"text": "ERROR", "color": "red", "index": 5},
+    "6": {"text": "stopped", "color": "orange", "index": 6}}}]
 ON_OFF = [{"type": "value", "options": {
     "0": {"text": "OFF", "color": "red", "index": 0},
     "1": {"text": "ON", "color": "green", "index": 1}}}]
@@ -121,34 +129,37 @@ panels += [
          thresholds=[{"color": "red", "value": None},
                      {"color": "green", "value": 1}]),
     stat("Applier state",
-         [target(f"mysql_duckdb_applier_state_info{{{SVC}}}", "{{state}}",
-                 instant=True)], 3, y, w=4,
-         desc="duckdb_apply_reader_state (custom query). idle: everything "
-              "applied; reading / waiting / committing: working; refreshing: "
-              "reloading a copy after DDL; error: the applier stopped (see "
-              "the error log).",
-         text_mode="name", color_mode="background",
-         thresholds=[{"color": "green", "value": None}]),
-    stat("Applier error",
-         [target(f"count(mysql_duckdb_applier_state_info{{{SVC},state=\"error\"}}) or vector(0)",
-                 "error")], 7, y, w=3,
-         desc="1: the applier stopped with an error; copies are no longer "
-              "kept current.", thresholds=GREEN_RED,
-         mappings=[{"type": "value", "options": {
-             "0": {"text": "no", "index": 0}, "1": {"text": "STOPPED", "index": 1}}}],
-         color_mode="background"),
-    stat("Binlog files behind",
-         [target(f"mysql_duckdb_applier_lag_files{{{SVC}}}")], 10, y, w=3,
-         desc="Binary log files the applier has not read yet.",
+         [target(gs("duckdb_apply_reader_state_code"), "state")], 3, y, w=4,
+         desc="duckdb_apply_reader_state_code: idle (everything applied), "
+              "reading, waiting to commit, committing, refreshing (a copy "
+              "after DDL), error (the applier stopped: see the error log), "
+              "stopped.",
+         mappings=STATE_CODES, color_mode="background",
          thresholds=[{"color": "green", "value": None},
-                     {"color": "orange", "value": 1},
-                     {"color": "red", "value": 3}]),
-    stat("Bytes behind",
-         [target(f"mysql_duckdb_applier_lag_bytes{{{SVC}}}")], 13, y, w=3,
-         unit="bytes", desc="Bytes of the current binary log not read yet.",
+                     {"color": "red", "value": 5}]),
+    stat("Lag",
+         [target(gs("duckdb_apply_lag_seconds"), "lag")], 7, y, w=3, unit="s",
+         decimals=1,
+         desc="duckdb_apply_lag_seconds: age of the oldest transaction "
+              "committed in MySQL and not yet in DuckDB (0 when everything "
+              "is applied), as Seconds_Behind_Source.",
+         thresholds=[{"color": "green", "value": None},
+                     {"color": "orange", "value": 5},
+                     {"color": "red", "value": 60}], graph=True),
+    stat("Lag (binlog bytes)",
+         [target(gs("duckdb_apply_lag_bytes"), "bytes")], 10, y, w=3,
+         unit="bytes",
+         desc="duckdb_apply_lag_bytes: binary log between the applied "
+              "position and the end of the binary log, across files.",
          thresholds=[{"color": "green", "value": None},
                      {"color": "orange", "value": 10 * 1024 * 1024},
                      {"color": "red", "value": 100 * 1024 * 1024}]),
+    stat("Avg offloaded query",
+         [target(f"sum(increase({gs('duckdb_offload_time_us')}[$__range])) / "
+                 f"clamp_min(sum(increase({gs('duckdb_offload_queries')}[$__range])), 1) / 1e6",
+                 "avg")], 13, y, w=3, unit="s", decimals=3,
+         desc="Average time in DuckDB of the queries it ran, over the time "
+              "range (duckdb_offload_time_us / duckdb_offload_queries)."),
     stat("Offload ratio",
          [target(f"100 * sum(increase({gs('duckdb_offload_queries')}[$__range])) / "
                  f"clamp_min(sum(increase({gs('duckdb_offload_queries')}[$__range])) + "
@@ -208,8 +219,15 @@ panels += [
         target(f"100 * sum({rate('duckdb_offload_queries')}) / clamp_min("
                f"sum({rate('duckdb_offload_queries')}) + "
                f"sum({rate('duckdb_offload_refused')}), 1e-9)", "ratio")],
-        12, y, unit="percent",
+        12, y, w=6, unit="percent",
         desc="Share of the queries tried in DuckDB that ran there."),
+    timeseries("Average offloaded query time", [
+        target(f"sum({rate('duckdb_offload_time_us')}) / clamp_min("
+               f"sum({rate('duckdb_offload_queries')}), 1e-9) / 1e6", "avg")],
+        18, y, w=6, unit="s",
+        desc="duckdb_offload_time_us / duckdb_offload_queries: time in DuckDB "
+             "(execution and fetch, plus a first run during optimization) "
+             "per query run there."),
 ]
 y += 8
 panels += [
@@ -258,17 +276,16 @@ panels += [
 ]
 y += 8
 panels += [
-    timeseries("Applier lag", [
-        target(f"mysql_duckdb_applier_lag_bytes{{{SVC}}}", "bytes behind")],
-        0, y, unit="bytes",
-        desc="Bytes of the current binary log not read yet "
-             "(mysql_duckdb_applier custom query)."),
-    timeseries("Applier lag (files)", [
-        target(f"mysql_duckdb_applier_lag_files{{{SVC}}}", "files behind")],
-        12, y, unit="short",
-        desc="Binary log files not read yet. More than 0 for long: the "
-             "applier is far behind; if they are purged, "
-             "duckdb_apply_gap_action decides."),
+    timeseries("Applier lag (seconds)", [
+        target(gs("duckdb_apply_lag_seconds"), "{{service_name}}")],
+        0, y, unit="s",
+        desc="duckdb_apply_lag_seconds: age of the oldest transaction "
+             "committed in MySQL and not yet in DuckDB (0 when caught up)."),
+    timeseries("Applier lag (binlog bytes)", [
+        target(gs("duckdb_apply_lag_bytes"), "{{service_name}}")],
+        12, y, unit="bytes",
+        desc="duckdb_apply_lag_bytes: binary log not yet applied, across "
+             "files (it does not drop when a file rotates)."),
 ]
 y += 8
 
@@ -336,7 +353,7 @@ panels.append({
                "refresh {{table_schema}}.{{table_name}}", instant=True),
         target(f"100 * mysql_duckdb_stages_work_completed{{{SVC}}} / "
                f"(mysql_duckdb_stages_work_estimated{{{SVC}}} > 0)",
-               "connection {{connection_id}}: {{stage}}", instant=True)]),
+               "{{stage}}", instant=True)]),
     "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100,
                                  "thresholds": {"mode": "absolute", "steps": [
                                      {"color": "blue", "value": None}]}},
@@ -346,6 +363,23 @@ panels.append({
                 "reduceOptions": {"calcs": ["lastNotNull"], "values": False}},
 })
 y += 10
+
+# -------------------------------------------------------------- DuckDB engine
+panels.append(row("DuckDB engine", y)); y += 1
+panels += [
+    timeseries("DuckDB memory", [
+        target(gs("duckdb_memory_used_bytes"), "used"),
+        target(gv("duckdb_memory_limit"), "limit (duckdb_memory_limit)")],
+        0, y, unit="bytes",
+        desc="duckdb_memory_used_bytes (duckdb_memory(), sampled about every "
+             "5 s) against duckdb_memory_limit."),
+    timeseries("Spill to disk", [
+        target(gs("duckdb_temp_spill_bytes"), "temporary storage")],
+        12, y, unit="bytes",
+        desc="duckdb_temp_spill_bytes: data DuckDB moved to its temporary "
+             "directory (tmp/ in the lake) because of the memory limit."),
+]
+y += 8
 
 # ----------------------------------------------------------------- Executor
 panels.append(row("Executor (threads that run DuckDB calls)", y)); y += 1
@@ -385,7 +419,7 @@ dashboard = {
     "description": "DuckDB secondary engine plugin: query offload, binlog "
                    "applier, copies, history, executor. Status counters from "
                    "PMM's mysqld_exporter; applier lag, copies and progress "
-                   "from the custom queries in queries-duckdb-medium.yml.",
+                   "from the custom queries in queries-duckdb-medium.yml (copies, stages, last refusal code).",
     "tags": ["Percona", "MySQL", "DuckDB"],
     "editable": True, "graphTooltip": 1, "schemaVersion": 39,
     "time": {"from": "now-3h", "to": "now"}, "refresh": "30s",

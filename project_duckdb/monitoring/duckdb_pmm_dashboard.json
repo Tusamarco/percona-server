@@ -1,7 +1,7 @@
 {
   "title": "MySQL DuckDB Secondary Engine",
   "uid": "mysql-duckdb-secondary-engine",
-  "description": "DuckDB secondary engine plugin: query offload, binlog applier, copies, history, executor. Status counters from PMM's mysqld_exporter; applier lag, copies and progress from the custom queries in queries-duckdb-medium.yml.",
+  "description": "DuckDB secondary engine plugin: query offload, binlog applier, copies, history, executor. Status counters from PMM's mysqld_exporter; applier lag, copies and progress from the custom queries in queries-duckdb-medium.yml (copies, stages, last refusal code).",
   "tags": [
     "Percona",
     "MySQL",
@@ -155,7 +155,7 @@
       "id": 3,
       "type": "stat",
       "title": "Applier state",
-      "description": "duckdb_apply_reader_state (custom query). idle: everything applied; reading / waiting / committing: working; refreshing: reloading a copy after DDL; error: the applier stopped (see the error log).",
+      "description": "duckdb_apply_reader_state_code: idle (everything applied), reading, waiting to commit, committing, refreshing (a copy after DDL), error (the applier stopped: see the error log), stopped.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -172,70 +172,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "mysql_duckdb_applier_state_info{service_name=~\"$service_name\"}",
-          "legendFormat": "{{state}}",
-          "refId": "A",
-          "instant": true,
-          "range": false
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "mappings": [],
-          "color": {
-            "mode": "thresholds"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "name",
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto"
-      }
-    },
-    {
-      "id": 4,
-      "type": "stat",
-      "title": "Applier error",
-      "description": "1: the applier stopped with an error; copies are no longer kept current.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "x": 7,
-        "y": 1,
-        "w": 3,
-        "h": 4
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "count(mysql_duckdb_applier_state_info{service_name=~\"$service_name\",state=\"error\"}) or vector(0)",
-          "legendFormat": "error",
+          "expr": "mysql_global_status_duckdb_apply_reader_state_code{service_name=~\"$service_name\"}",
+          "legendFormat": "state",
           "refId": "A"
         }
       ],
@@ -251,7 +189,7 @@
               },
               {
                 "color": "red",
-                "value": 1
+                "value": 5
               }
             ]
           },
@@ -260,12 +198,39 @@
               "type": "value",
               "options": {
                 "0": {
-                  "text": "no",
+                  "text": "idle",
+                  "color": "green",
                   "index": 0
                 },
                 "1": {
-                  "text": "STOPPED",
+                  "text": "reading",
+                  "color": "blue",
                   "index": 1
+                },
+                "2": {
+                  "text": "waiting to commit",
+                  "color": "blue",
+                  "index": 2
+                },
+                "3": {
+                  "text": "committing",
+                  "color": "blue",
+                  "index": 3
+                },
+                "4": {
+                  "text": "refreshing",
+                  "color": "purple",
+                  "index": 4
+                },
+                "5": {
+                  "text": "ERROR",
+                  "color": "red",
+                  "index": 5
+                },
+                "6": {
+                  "text": "stopped",
+                  "color": "orange",
+                  "index": 6
                 }
               }
             }
@@ -292,10 +257,79 @@
       }
     },
     {
+      "id": 4,
+      "type": "stat",
+      "title": "Lag",
+      "description": "duckdb_apply_lag_seconds: age of the oldest transaction committed in MySQL and not yet in DuckDB (0 when everything is applied), as Seconds_Behind_Source.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 7,
+        "y": 1,
+        "w": 3,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mysql_global_status_duckdb_apply_lag_seconds{service_name=~\"$service_name\"}",
+          "legendFormat": "lag",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          },
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
       "id": 5,
       "type": "stat",
-      "title": "Binlog files behind",
-      "description": "Binary log files the applier has not read yet.",
+      "title": "Lag (binlog bytes)",
+      "description": "duckdb_apply_lag_bytes: binary log between the applied position and the end of the binary log, across files.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -312,14 +346,14 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "mysql_duckdb_applier_lag_files{service_name=~\"$service_name\"}",
-          "legendFormat": "{{service_name}}",
+          "expr": "mysql_global_status_duckdb_apply_lag_bytes{service_name=~\"$service_name\"}",
+          "legendFormat": "bytes",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "bytes",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -329,11 +363,11 @@
               },
               {
                 "color": "orange",
-                "value": 1
+                "value": 10485760
               },
               {
                 "color": "red",
-                "value": 3
+                "value": 104857600
               }
             ]
           },
@@ -362,8 +396,8 @@
     {
       "id": 6,
       "type": "stat",
-      "title": "Bytes behind",
-      "description": "Bytes of the current binary log not read yet.",
+      "title": "Avg offloaded query",
+      "description": "Average time in DuckDB of the queries it ran, over the time range (duckdb_offload_time_us / duckdb_offload_queries).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -380,35 +414,28 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "mysql_duckdb_applier_lag_bytes{service_name=~\"$service_name\"}",
-          "legendFormat": "{{service_name}}",
+          "expr": "sum(increase(mysql_global_status_duckdb_offload_time_us{service_name=~\"$service_name\"}[$__range])) / clamp_min(sum(increase(mysql_global_status_duckdb_offload_queries{service_name=~\"$service_name\"}[$__range])), 1) / 1e6",
+          "legendFormat": "avg",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "bytes",
+          "unit": "s",
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "blue",
                 "value": null
-              },
-              {
-                "color": "orange",
-                "value": 10485760
-              },
-              {
-                "color": "red",
-                "value": 104857600
               }
             ]
           },
           "mappings": [],
           "color": {
             "mode": "thresholds"
-          }
+          },
+          "decimals": 3
         },
         "overrides": []
       },
@@ -911,7 +938,7 @@
       "gridPos": {
         "x": 12,
         "y": 10,
-        "w": 12,
+        "w": 6,
         "h": 8
       },
       "targets": [
@@ -960,6 +987,65 @@
     },
     {
       "id": 16,
+      "type": "timeseries",
+      "title": "Average offloaded query time",
+      "description": "duckdb_offload_time_us / duckdb_offload_queries: time in DuckDB (execution and fetch, plus a first run during optimization) per query run there.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 10,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mysql_global_status_duckdb_offload_time_us{service_name=~\"$service_name\"}[$__rate_interval])) / clamp_min(sum(rate(mysql_global_status_duckdb_offload_queries{service_name=~\"$service_name\"}[$__rate_interval])), 1e-9) / 1e6",
+          "legendFormat": "avg",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 17,
       "type": "timeseries",
       "title": "Read your own writes",
       "description": "Queries that waited for the session's last commit (duckdb_offload_wait_applied) and those that hit duckdb_offload_wait_timeout_ms. Timeouts growing: the applier is behind.",
@@ -1027,7 +1113,7 @@
       }
     },
     {
-      "id": 17,
+      "id": 18,
       "type": "timeseries",
       "title": "FULL scope guard",
       "description": "duckdb_guard: statements on history tables under FULL scope.",
@@ -1095,7 +1181,7 @@
       }
     },
     {
-      "id": 18,
+      "id": 19,
       "type": "timeseries",
       "title": "DECIMAL reruns",
       "description": "Runs again with fewer decimals (duckdb_decimal_overflow=ROUND).",
@@ -1154,7 +1240,7 @@
       }
     },
     {
-      "id": 19,
+      "id": 20,
       "type": "row",
       "title": "Binlog applier",
       "collapsed": false,
@@ -1167,7 +1253,7 @@
       "panels": []
     },
     {
-      "id": 20,
+      "id": 21,
       "type": "timeseries",
       "title": "Read from the binary log",
       "description": "Transactions and row events read (all tables).",
@@ -1235,7 +1321,7 @@
       }
     },
     {
-      "id": 21,
+      "id": 22,
       "type": "timeseries",
       "title": "Rows",
       "description": "Rows of loaded tables decoded, changes after collapsing per primary key, rows written to DuckDB.",
@@ -1312,7 +1398,7 @@
       }
     },
     {
-      "id": 22,
+      "id": 23,
       "type": "timeseries",
       "title": "Batches",
       "description": "One DuckLake commit per batch; large transactions are applied in pieces (duckdb_apply_batch_max_rows).",
@@ -1389,10 +1475,10 @@
       }
     },
     {
-      "id": 23,
+      "id": 24,
       "type": "timeseries",
-      "title": "Applier lag",
-      "description": "Bytes of the current binary log not read yet (mysql_duckdb_applier custom query).",
+      "title": "Applier lag (seconds)",
+      "description": "duckdb_apply_lag_seconds: age of the oldest transaction committed in MySQL and not yet in DuckDB (0 when caught up).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1409,8 +1495,67 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "mysql_duckdb_applier_lag_bytes{service_name=~\"$service_name\"}",
-          "legendFormat": "bytes behind",
+          "expr": "mysql_global_status_duckdb_apply_lag_seconds{service_name=~\"$service_name\"}",
+          "legendFormat": "{{service_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Applier lag (binlog bytes)",
+      "description": "duckdb_apply_lag_bytes: binary log not yet applied, across files (it does not drop when a file rotates).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 35,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mysql_global_status_duckdb_apply_lag_bytes{service_name=~\"$service_name\"}",
+          "legendFormat": "{{service_name}}",
           "refId": "A"
         }
       ],
@@ -1448,66 +1593,7 @@
       }
     },
     {
-      "id": 24,
-      "type": "timeseries",
-      "title": "Applier lag (files)",
-      "description": "Binary log files not read yet. More than 0 for long: the applier is far behind; if they are purged, duckdb_apply_gap_action decides.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "x": 12,
-        "y": 35,
-        "w": 12,
-        "h": 8
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "mysql_duckdb_applier_lag_files{service_name=~\"$service_name\"}",
-          "legendFormat": "files behind",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "min": 0,
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 10,
-            "stacking": {
-              "mode": "none"
-            },
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max",
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "id": 25,
+      "id": 26,
       "type": "row",
       "title": "History and DDL",
       "collapsed": false,
@@ -1520,7 +1606,7 @@
       "panels": []
     },
     {
-      "id": 26,
+      "id": 27,
       "type": "timeseries",
       "title": "History",
       "description": "Deletes in transactions tagged duckdb_avoid_purge become archived rows in DuckDB.",
@@ -1588,7 +1674,7 @@
       }
     },
     {
-      "id": 27,
+      "id": 28,
       "type": "timeseries",
       "title": "DDL handled by the applier",
       "description": "Refreshes after DDL, RENAMEs followed, refreshes deferred to a later rename, failures (copy marked STALE).",
@@ -1674,7 +1760,7 @@
       }
     },
     {
-      "id": 28,
+      "id": 29,
       "type": "row",
       "title": "Copies and progress",
       "collapsed": false,
@@ -1687,7 +1773,7 @@
       "panels": []
     },
     {
-      "id": 29,
+      "id": 30,
       "type": "table",
       "title": "DuckDB copies",
       "description": "INFORMATION_SCHEMA.DUCKDB_TABLES (custom query).",
@@ -1806,7 +1892,7 @@
       }
     },
     {
-      "id": 30,
+      "id": 31,
       "type": "bargauge",
       "title": "Refresh / load progress",
       "description": "Copies being refreshed after DDL (DUCKDB_TABLES) and loads or waits in progress (Performance Schema stages stage/duckdb/%, README.md). Rows done / InnoDB's estimate.",
@@ -1838,7 +1924,7 @@
             "uid": "${datasource}"
           },
           "expr": "100 * mysql_duckdb_stages_work_completed{service_name=~\"$service_name\"} / (mysql_duckdb_stages_work_estimated{service_name=~\"$service_name\"} > 0)",
-          "legendFormat": "connection {{connection_id}}: {{stage}}",
+          "legendFormat": "{{stage}}",
           "refId": "B",
           "instant": true,
           "range": false
@@ -1874,9 +1960,9 @@
       }
     },
     {
-      "id": 31,
+      "id": 32,
       "type": "row",
-      "title": "Executor (threads that run DuckDB calls)",
+      "title": "DuckDB engine",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -1887,7 +1973,147 @@
       "panels": []
     },
     {
-      "id": 32,
+      "id": 33,
+      "type": "timeseries",
+      "title": "DuckDB memory",
+      "description": "duckdb_memory_used_bytes (duckdb_memory(), sampled about every 5 s) against duckdb_memory_limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mysql_global_status_duckdb_memory_used_bytes{service_name=~\"$service_name\"}",
+          "legendFormat": "used",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mysql_global_variables_duckdb_memory_limit{service_name=~\"$service_name\"}",
+          "legendFormat": "limit (duckdb_memory_limit)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Spill to disk",
+      "description": "duckdb_temp_spill_bytes: data DuckDB moved to its temporary directory (tmp/ in the lake) because of the memory limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mysql_global_status_duckdb_temp_spill_bytes{service_name=~\"$service_name\"}",
+          "legendFormat": "temporary storage",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 35,
+      "type": "row",
+      "title": "Executor (threads that run DuckDB calls)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 36,
       "type": "timeseries",
       "title": "Executor threads",
       "description": "Busy executor threads against duckdb_executor_threads, and tasks waiting. A queue that stays above 0: raise duckdb_executor_threads.",
@@ -1897,7 +2123,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 64,
+        "y": 73,
         "w": 12,
         "h": 8
       },
@@ -1964,7 +2190,7 @@
       }
     },
     {
-      "id": 33,
+      "id": 37,
       "type": "timeseries",
       "title": "Executor tasks",
       "description": "DuckDB calls run by the executor.",
@@ -1974,7 +2200,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 64,
+        "y": 73,
         "w": 12,
         "h": 8
       },
@@ -2023,20 +2249,20 @@
       }
     },
     {
-      "id": 34,
+      "id": 38,
       "type": "row",
       "title": "Configuration",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 72,
+        "y": 81,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 35,
+      "id": 39,
       "type": "stat",
       "title": "Memory limit",
       "description": "duckdb_memory_limit (global value).",
@@ -2046,7 +2272,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 73,
+        "y": 82,
         "w": 3,
         "h": 3
       },
@@ -2096,7 +2322,7 @@
       }
     },
     {
-      "id": 36,
+      "id": 40,
       "type": "stat",
       "title": "DuckDB threads",
       "description": "duckdb_threads (global value).",
@@ -2106,7 +2332,7 @@
       },
       "gridPos": {
         "x": 3,
-        "y": 73,
+        "y": 82,
         "w": 3,
         "h": 3
       },
@@ -2156,7 +2382,7 @@
       }
     },
     {
-      "id": 37,
+      "id": 41,
       "type": "stat",
       "title": "Executor threads",
       "description": "duckdb_executor_threads (global value).",
@@ -2166,7 +2392,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 73,
+        "y": 82,
         "w": 3,
         "h": 3
       },
@@ -2216,7 +2442,7 @@
       }
     },
     {
-      "id": 38,
+      "id": 42,
       "type": "stat",
       "title": "Batch max trx",
       "description": "duckdb_apply_batch_max_trx (global value).",
@@ -2226,7 +2452,7 @@
       },
       "gridPos": {
         "x": 9,
-        "y": 73,
+        "y": 82,
         "w": 3,
         "h": 3
       },
@@ -2276,7 +2502,7 @@
       }
     },
     {
-      "id": 39,
+      "id": 43,
       "type": "stat",
       "title": "Batch max rows",
       "description": "duckdb_apply_batch_max_rows (global value).",
@@ -2286,7 +2512,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 73,
+        "y": 82,
         "w": 3,
         "h": 3
       },
@@ -2336,7 +2562,7 @@
       }
     },
     {
-      "id": 40,
+      "id": 44,
       "type": "stat",
       "title": "Batch max delay",
       "description": "duckdb_apply_batch_max_delay_ms (global value).",
@@ -2346,7 +2572,7 @@
       },
       "gridPos": {
         "x": 15,
-        "y": 73,
+        "y": 82,
         "w": 3,
         "h": 3
       },
@@ -2396,7 +2622,7 @@
       }
     },
     {
-      "id": 41,
+      "id": 45,
       "type": "stat",
       "title": "Offload min rows",
       "description": "duckdb_offload_min_rows (global value).",
@@ -2406,7 +2632,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 73,
+        "y": 82,
         "w": 3,
         "h": 3
       },
@@ -2456,7 +2682,7 @@
       }
     },
     {
-      "id": 42,
+      "id": 46,
       "type": "stat",
       "title": "Wait timeout",
       "description": "duckdb_offload_wait_timeout_ms (global value).",
@@ -2466,7 +2692,7 @@
       },
       "gridPos": {
         "x": 21,
-        "y": 73,
+        "y": 82,
         "w": 3,
         "h": 3
       },

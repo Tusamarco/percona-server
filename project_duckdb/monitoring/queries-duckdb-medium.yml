@@ -8,55 +8,13 @@
 # resolution, about every 10 s). Copy to the MySQL host:
 #   /usr/local/percona/pmm/collectors/custom-queries/mysql/medium-resolution/
 # Metric names: <query name>_<column>, for example
-#   mysql_duckdb_applier_lag_bytes.
+#   mysql_duckdb_tables_copy.
 # The numeric duckdb_* status variables need nothing here: PMM already
 # collects them as mysql_global_status_duckdb_* (and the variables as
-# mysql_global_variables_duckdb_*). See README.md.
-
-# Applier state as a label (idle, reading, waiting, committing, refreshing,
-# error). The value is always 1.
-mysql_duckdb_applier_state:
-  query: "SELECT LOWER(SUBSTRING_INDEX(SUBSTRING_INDEX(VARIABLE_VALUE, ':', 1), ' ', 1)) AS state, 1 AS info FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_apply_reader_state'"
-  metrics:
-    - state:
-        usage: "LABEL"
-        description: "First word of duckdb_apply_reader_state"
-    - info:
-        usage: "GAUGE"
-        description: "Always 1; the state is the label"
-
-# How far the applier is behind the binary log. The binary log end comes
-# from performance_schema.log_status (BACKUP_ADMIN, in PMM's standard
-# grants). lag_files: binary log files not read yet; lag_bytes: bytes not
-# read in the current file (when lag_files > 0, only the part of the current
-# file). The applied position moves when a batch is committed.
-mysql_duckdb_applier:
-  query: "SELECT CAST(SUBSTRING_INDEX(r.f, '.', -1) AS UNSIGNED) AS reader_file_number, CAST(r.p AS UNSIGNED) AS reader_position, CAST(SUBSTRING_INDEX(a.f, '.', -1) AS UNSIGNED) AS applied_file_number, CAST(a.p AS UNSIGNED) AS applied_position, CAST(SUBSTRING_INDEX(l.f, '.', -1) AS UNSIGNED) AS binlog_file_number, CAST(l.p AS UNSIGNED) AS binlog_position, CAST(SUBSTRING_INDEX(l.f, '.', -1) AS SIGNED) - CAST(SUBSTRING_INDEX(r.f, '.', -1) AS SIGNED) AS lag_files, IF(l.f = r.f, CAST(l.p AS SIGNED) - CAST(r.p AS SIGNED), CAST(l.p AS SIGNED)) AS lag_bytes FROM (SELECT MAX(IF(VARIABLE_NAME = 'duckdb_apply_reader_file', VARIABLE_VALUE, NULL)) AS f, MAX(IF(VARIABLE_NAME = 'duckdb_apply_reader_position', VARIABLE_VALUE, NULL)) AS p FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('duckdb_apply_reader_file', 'duckdb_apply_reader_position')) r, (SELECT MAX(IF(VARIABLE_NAME = 'duckdb_applied_file', VARIABLE_VALUE, NULL)) AS f, MAX(IF(VARIABLE_NAME = 'duckdb_applied_position', VARIABLE_VALUE, NULL)) AS p FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('duckdb_applied_file', 'duckdb_applied_position')) a, (SELECT LOCAL->>'$.binary_log_file' AS f, LOCAL->>'$.binary_log_position' AS p FROM performance_schema.log_status) l WHERE r.f <> '' AND l.f IS NOT NULL"
-  metrics:
-    - reader_file_number:
-        usage: "GAUGE"
-        description: "Sequence number of the binary log file the applier reads"
-    - reader_position:
-        usage: "GAUGE"
-        description: "Position read by the applier"
-    - applied_file_number:
-        usage: "GAUGE"
-        description: "Sequence number of the binary log file of the applied position"
-    - applied_position:
-        usage: "GAUGE"
-        description: "Applied (committed in DuckDB) position"
-    - binlog_file_number:
-        usage: "GAUGE"
-        description: "Sequence number of the current binary log file"
-    - binlog_position:
-        usage: "GAUGE"
-        description: "End of the current binary log"
-    - lag_files:
-        usage: "GAUGE"
-        description: "Binary log files the applier has not read yet"
-    - lag_bytes:
-        usage: "GAUGE"
-        description: "Bytes of the current binary log the applier has not read yet"
+# mysql_global_variables_duckdb_*), including the applier lag in seconds and
+# bytes, the applier state code and DuckDB's memory (2026-11-20). These
+# queries read only INFORMATION_SCHEMA and performance_schema tables that
+# take no server-wide lock. See README.md.
 
 # One series per DuckDB copy, with its state (LOADED, STALE, REFRESHING,
 # REFRESH_PENDING) and history flag; the refresh rows while it refreshes.
@@ -89,30 +47,33 @@ mysql_duckdb_tables:
 
 # Loads and waits in progress, from the Performance Schema stages
 # stage/duckdb/% (needs the instruments and the events_stages_current
-# consumer enabled, README.md). No rows when nothing runs.
+# consumer enabled, README.md), aggregated by stage: one series per stage,
+# never one per connection. No rows when nothing runs.
 mysql_duckdb_stages:
-  query: "SELECT CAST(t.PROCESSLIST_ID AS CHAR) AS connection_id, SUBSTRING_INDEX(s.EVENT_NAME, '/', -1) AS stage, COALESCE(s.WORK_COMPLETED, 0) AS work_completed, COALESCE(s.WORK_ESTIMATED, 0) AS work_estimated FROM performance_schema.events_stages_current s JOIN performance_schema.threads t USING (THREAD_ID) WHERE s.EVENT_NAME LIKE 'stage/duckdb/%'"
+  query: "SELECT SUBSTRING_INDEX(s.EVENT_NAME, '/', -1) AS stage, COUNT(*) AS running, COALESCE(SUM(s.WORK_COMPLETED), 0) AS work_completed, COALESCE(SUM(s.WORK_ESTIMATED), 0) AS work_estimated FROM performance_schema.events_stages_current s WHERE s.EVENT_NAME LIKE 'stage/duckdb/%' GROUP BY s.EVENT_NAME"
   metrics:
-    - connection_id:
-        usage: "LABEL"
-        description: "Connection that loads or waits"
     - stage:
         usage: "LABEL"
         description: "copy load, waiting for copy refresh, waiting for applier"
+    - running:
+        usage: "GAUGE"
+        description: "Connections in this stage"
     - work_completed:
         usage: "GAUGE"
-        description: "Rows done"
+        description: "Rows done (all connections in this stage)"
     - work_estimated:
         usage: "GAUGE"
-        description: "Rows expected"
+        description: "Rows expected (all connections in this stage)"
 
-# The reason of the last refused query, as a label (first 120 characters).
+# The last refusal as a reason code (the text before the first ':' or space:
+# unsupported_function, decimal_overflow, duckdb_prepare ...), never its
+# arguments (function or column names): a small, fixed set of series.
 mysql_duckdb_last_refusal:
-  query: "SELECT LEFT(VARIABLE_VALUE, 120) AS reason, 1 AS info FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_offload_last_refusal' AND VARIABLE_VALUE <> ''"
+  query: "SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(VARIABLE_VALUE, ':', 1), ' ', 1) AS reason, 1 AS info FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_offload_last_refusal' AND VARIABLE_VALUE <> ''"
   metrics:
     - reason:
         usage: "LABEL"
-        description: "duckdb_offload_last_refusal"
+        description: "Reason code of duckdb_offload_last_refusal"
     - info:
         usage: "GAUGE"
         description: "Always 1; the reason is the label"
