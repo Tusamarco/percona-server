@@ -503,7 +503,7 @@ not a read). Last update: 2026-11-17 (function review, TPC-H 19/22,
 | Window functions (ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, aggregates OVER, frames) | missing | refused `window` |
 | TABLESAMPLE | missing | |
 | VALUES / TABLE statements, JSON_TABLE | missing | |
-| A grouped string shown in a join | partial | exact cases: the table's primary key in GROUP BY, CHAR under a binary collation (2026-11-17); VARCHAR / non-binary: data check planned (next step 2) |
+| A grouped string shown in a join | done | the table's primary key in GROUP BY, CHAR under a binary collation (2026-11-17); otherwise each result group is checked in the query to hold one stored value, the statement runs first and an ambiguous group is a refusal (2026-11-22, MTR `offload_join_distinct`) |
 
 ### Predicates
 
@@ -590,7 +590,14 @@ reference instance; the SQL coverage tracker is updated).
    on binary collations, grouped CHAR values in joins, EXTRACT and the
    function review: DWL-06 "Function review against DuckDB"). TPC-H 19 of
    22.
-2. **Grouped string values in joins, exact by a data check** (decided
+2. **Grouped string values in joins, exact by a data check**: done
+   2026-11-22, as a check inside the query instead of the table check
+   below: each group is verified to hold one stored value
+   (`CASE WHEN count(DISTINCT col) > 1 THEN error(marker) ELSE
+   any_value(col) END`), the statement runs first during optimization (as
+   the DECIMAL path) and the marker is a refusal. Same snapshot as the
+   result, no cache, and only the result's groups count. TPC-H Q16 / Q22
+   to check again. Original plan (decided
    2026-11-17): before offloading a query that shows a grouped string of a
    PAD SPACE or non-binary collation in a join without the table's primary
    key, ask DuckDB whether the column has two different values that compare
@@ -754,7 +761,7 @@ reporting and BI queries. Each one today sends the query to InnoDB.
 
 | Priority | Gap | Why | Effort |
 |---|---|---|---|
-| High | Grouped strings in joins, VARCHAR and non-binary collations | TPC-H Q16, Q22; `GROUP BY c.name` in joins is common | medium (next step 2) |
+| Done | Grouped strings in joins, VARCHAR and non-binary collations | 2026-11-22: checked per group in the query | done |
 | High | Window functions | In most modern analytic queries | large (ordering and peers must follow MySQL collations) |
 | High | CAST / CONVERT | Everywhere in ORMs and BI tools | medium (MySQL conversion rules, truncation) |
 | High | DATE_FORMAT, NOW() / CURRENT_DATE in expressions, TIMESTAMPDIFF | Reports format dates and filter relative to now | medium (locale-dependent formats) |
@@ -790,7 +797,7 @@ Decided during development (kept for the record):
 - After `duckdb_enable=FALSE` and back, the applier resumes from the applied position; after a binary log gap, `duckdb_apply_gap_action` decides.
 - Batch defaults: 1000 transactions, 100,000 rows, 1000 ms; `duckdb_apply_workers` deferred.
 - Tables with foreign keys: allowed when cascades are binlogged (`innodb_native_foreign_keys=OFF`, 2026-11-17).
-- A grouped string value shown in a join without the table's primary key (2026-11-17): CHAR under binary collations is exact (done); VARCHAR and non-binary collations: offload after a data check showing no ambiguous values (next step 2).
+- A grouped string value shown in a join without the table's primary key: CHAR under binary collations is exact (2026-11-17); VARCHAR and non-binary collations are checked per group in the query, which runs first; an ambiguous group is a refusal (2026-11-22).
 - DECIMAL results declared above 38 digits (2026-11-17): computed as DECIMAL(38, scale); statements that could overflow run first; `duckdb_decimal_overflow` = FALLBACK (default, InnoDB answers), ROUND (fewer decimals with a warning), ERROR.
 
 Open:

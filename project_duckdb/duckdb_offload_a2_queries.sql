@@ -48,3 +48,4 @@ SELECT d.ci, COUNT(*) FROM p6 JOIN dim d ON d.grp = p6.grp GROUP BY d.grp, d.ci 
 SELECT COUNT(*) FROM dim WHERE ci = 'm' OR ci = 'T';
 SELECT ci, COUNT(*) FROM p6 GROUP BY ci ORDER BY ci;
 SELECT COUNT(*) FROM p6 WHERE ci = 'm';
+SELECT d.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY d.c ORDER BY d.c;

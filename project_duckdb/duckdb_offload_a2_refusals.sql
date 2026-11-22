@@ -20,5 +20,5 @@ SELECT DISTINCT c FROM cw ORDER BY c;
 SELECT c FROM cw WHERE id < 10 UNION SELECT c FROM cwd ORDER BY 1;
 SELECT UPPER(c), COUNT(*) FROM cw GROUP BY UPPER(c) ORDER BY 1;
 SELECT COUNT(*) FROM cw WHERE UPPER(c) = 'APPLE';
-SELECT d.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY d.c ORDER BY d.c;
+SELECT cw.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY cw.c ORDER BY cw.c;
 SELECT cw.c, MIN(d.c) FROM cw JOIN cwd d ON d.c = cw.c WHERE cw.id < 50 GROUP BY cw.id, cw.c ORDER BY cw.id;

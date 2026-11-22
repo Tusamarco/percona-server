@@ -1,0 +1,40 @@
+CREATE TABLE wo (id BIGINT UNSIGNED PRIMARY KEY, date_created_gmt DATETIME, status VARCHAR(20) COLLATE utf8mb4_bin,
+total DECIMAL(10,2)) SECONDARY_ENGINE = duckdb;
+CREATE TABLE wa (id BIGINT UNSIGNED PRIMARY KEY, order_id BIGINT UNSIGNED, address_type VARCHAR(20) COLLATE utf8mb4_bin,
+KEY (order_id)) SECONDARY_ENGINE = duckdb;
+INSERT INTO wo VALUES (1, '2024-01-01 10:00:00', 'done', 10.50), (2, '2024-01-02 10:00:00', 'new', 20.00),
+(3, '2024-02-03 10:00:00', 'done', 10.50), (4, '2024-02-04 11:00:00', NULL, NULL), (5, '2025-03-01 09:00:00', 'new', 7.25);
+INSERT INTO wa VALUES (1, 1, 'billing'), (2, 1, 'shipping'), (3, 2, 'billing'), (4, 3, 'billing'), (5, 3, 'shipping'),
+(6, 4, 'billing'), (7, 5, 'billing'), (8, 5, 'shipping');
+CREATE TABLE wc (id INT PRIMARY KEY, name VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb;
+INSERT INTO wc VALUES (0, 'gold'), (1, 'silver'), (2, 'Bronze');
+ALTER TABLE wo SECONDARY_LOAD;
+ALTER TABLE wa SECONDARY_LOAD;
+ALTER TABLE wc SECONDARY_LOAD;
+# SELECT YEAR(o.date_created_gmt) AS yr, MONTH(o.date_created_gmt) AS mon, DAYOFWEEK(o.date_created_gmt) AS dow, COUNT(DISTINCT o.id) AS orders FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY yr, mon, dow ORDER BY yr, mon, dow
+# SELECT YEAR(o.date_created_gmt) AS yr, COUNT(DISTINCT a.order_id), COUNT(DISTINCT o.status), COUNT(*) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY yr ORDER BY yr
+# SELECT YEAR(o.date_created_gmt) AS yr, SUM(DISTINCT o.total), AVG(DISTINCT o.total), MIN(o.total), MAX(o.date_created_gmt), COUNT(DISTINCT o.id) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY yr ORDER BY yr
+# A grouped VARCHAR shown in a join (2026-11-22): checked per group in the query
+# SELECT a.address_type, COUNT(DISTINCT o.id) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY a.address_type ORDER BY a.address_type
+# SELECT o.status, COUNT(DISTINCT o.id) AS n FROM wo o LEFT JOIN wa a ON a.order_id = o.id AND a.address_type = 'shipping' WHERE a.id IS NULL GROUP BY o.status ORDER BY o.status
+# SELECT o.status, a.address_type, COUNT(*), SUM(o.total) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY o.status, a.address_type ORDER BY o.status, a.address_type
+# SELECT c.name, COUNT(*) FROM wo o JOIN wc c ON c.id = MONTH(o.date_created_gmt) % 3 GROUP BY c.name ORDER BY c.name
+# A group holding 'done' and 'done ' (PAD SPACE), or 'Done' and 'done' (_ci): refused
+INSERT INTO wo VALUES (6, '2025-04-01 08:00:00', 'done ', 1.00);
+INSERT INTO wa VALUES (9, 6, 'billing');
+INSERT INTO wc VALUES (3, 'GOLD');
+# SELECT o.status, COUNT(*) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY o.status ORDER BY o.status
+SET SESSION use_secondary_engine = FORCED;
+SELECT o.status, COUNT(*) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY o.status ORDER BY o.status;
+Got one of the listed errors
+# SELECT c.name, COUNT(*) FROM wo o JOIN wc c ON c.id = MONTH(o.date_created_gmt) % 4 GROUP BY c.name ORDER BY c.name
+SET SESSION use_secondary_engine = FORCED;
+SELECT c.name, COUNT(*) FROM wo o JOIN wc c ON c.id = MONTH(o.date_created_gmt) % 4 GROUP BY c.name ORDER BY c.name;
+Got one of the listed errors
+# ... but not when the query's groups do not mix them
+# SELECT o.status, COUNT(*) FROM wo o JOIN wa a ON a.order_id = o.id WHERE o.id < 6 GROUP BY o.status ORDER BY o.status
+SHOW GLOBAL STATUS LIKE 'duckdb_offload_last_refusal';
+Variable_name	Value
+duckdb_offload_last_refusal	grouped_string_value_in_join: a group holds values that are equal under the collation but stored differently ('a' and 'a ', or 'A' and 'a'); InnoDB shows one of them by its join order
+# SELECT YEAR(o.date_created_gmt) AS yr, COUNT(DISTINCT o.id) AS n FROM wo o LEFT JOIN wa a ON a.order_id = o.id AND a.address_type = 'shipping' WHERE a.id IS NULL GROUP BY yr ORDER BY yr
+DROP TABLE wo, wa, wc;

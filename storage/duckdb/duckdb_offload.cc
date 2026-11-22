@@ -152,6 +152,9 @@ std::atomic<unsigned long long> g_decimal_reruns{0};
 // fetch, plus a first run during optimization), in microseconds.
 std::atomic<unsigned long long> g_offload_time_us{0};
 
+// The error a grouped string check raises in DuckDB (grouped_value).
+constexpr char kGroupedAmbiguous[] = "duckdb_offload_grouped_value_ambiguous";
+
 unsigned long long micros_since(std::chrono::steady_clock::time_point t) {
   return static_cast<unsigned long long>(
       std::chrono::duration_cast<std::chrono::microseconds>(
@@ -382,6 +385,9 @@ class Generator {
   // DuckDB as DECIMAL(38, scale), exact while the values fit (OffloadContext
   // runs such statements first, duckdb_decimal_overflow).
   bool decimal_wide() const { return m_decimal_wide; }
+  /** A grouped string is shown with an in-query check (grouped_value):
+      the statement runs first, during optimization. */
+  bool grouped_check() const { return m_grouped_check; }
   // duckdb_decimal_overflow=ROUND, after an overflow: DECIMAL results keep
   // at most this many decimals (-1: all).
   void set_decimal_scale_cap(int cap) { m_scale_cap = cap; }
@@ -401,6 +407,7 @@ class Generator {
     return "DECIMAL(38," + std::to_string(s) + ")";
   }
   bool m_decimal_wide{false};
+  bool m_grouped_check{false};
   int m_scale_cap{-1};
   int m_max_scale{0};
   bool refuse_collation(const Item *item) {
@@ -494,6 +501,7 @@ class Generator {
                      const std::string &col, std::string *out);
 
   THD *m_thd;
+  Item_field *source_column(Item_field *f);
   std::string *m_reason;
   bool m_full{false};
   std::map<const TABLE *, TableInfo> m_info;
@@ -1086,7 +1094,54 @@ bool Generator::grouped_value(const Field *field, const TableInfo &ti,
     *out = "arg_min(" + col + ", " + ti.pk + ")";
     return false;
   }
-  return refuse("grouped_string_value_in_join");
+  // A join: InnoDB shows the value of the first row of the group in its
+  // join order, which we cannot reproduce. When the group holds a single
+  // stored value (no 'done' next to 'done ' or 'Done'), there is no choice
+  // and any row's value is InnoDB's. We check that per group, in the query
+  // itself (same snapshot as the result): otherwise the marker error
+  // stops it. Such statements run first, during optimization; the marker
+  // becomes a refusal and InnoDB answers (2026-11-22, next step 2).
+  m_grouped_check = true;
+  *out = "CASE WHEN count(DISTINCT " + col + ") > 1 THEN error('" +
+         kGroupedAmbiguous + "') ELSE any_value(" + col + ") END";
+  return false;
+}
+
+// With a join, GROUP BY and a DISTINCT aggregate the server's plan
+// materializes the join into a temporary table first, and create_tmp_table()
+// replaces the aggregate's column arguments with columns of that table
+// (sum_item->set_arg(Item_field(<temporary>.col)); not recorded for later
+// rollback in a regular statement). We translate the statement, not that
+// plan: a temporary column made from a table column keeps that column's
+// database, table and name (Field::new_field), and we find the column again
+// among the tables of this block and the enclosing ones. Ambiguous (the same
+// table twice in the query) or not a plain column: nullptr, and the query
+// is refused as before.
+Item_field *Generator::source_column(Item_field *f) {
+  const Field *tf = f->field;
+  if (tf == nullptr || tf->table == nullptr ||
+      tf->table->s->tmp_table == NO_TMP_TABLE || tf->orig_table_name == nullptr ||
+      tf->orig_db_name == nullptr || tf->field_name == nullptr)
+    return nullptr;
+  Field *found = nullptr;
+  for (const Block *b = m_block; b != nullptr; b = b->parent) {
+    for (const TABLE *t : b->tables) {
+      const Table_ref *tr = t->pos_in_table_list;
+      if (tr == nullptr || tr->db == nullptr || tr->table_name == nullptr ||
+          strcmp(tr->db, tf->orig_db_name) != 0 ||
+          strcmp(tr->table_name, tf->orig_table_name) != 0)
+        continue;
+      for (Field **fp = t->field; *fp != nullptr; fp++) {
+        if (my_strcasecmp(system_charset_info, (*fp)->field_name,
+                          tf->field_name) != 0)
+          continue;
+        if (found != nullptr) return nullptr;  // the table twice: ambiguous
+        found = *fp;
+      }
+    }
+  }
+  if (found == nullptr) return nullptr;
+  return new (m_thd->mem_root) Item_field(found);
 }
 
 bool Generator::aggregate(Item_sum *s, std::string *out) {
@@ -1978,6 +2033,12 @@ bool Generator::expr(Item *item, std::string *out) {
       while (owner != nullptr && f->field != nullptr &&
              owner->tables.count(f->field->table) == 0)
         owner = owner->parent;
+      if (f->field != nullptr && owner == nullptr) {
+        // A column of a temporary table of the server's plan, made from a
+        // column of this statement: that column.
+        if (Item_field *src = source_column(f); src != nullptr)
+          return expr(src, out);
+      }
       if (f->field == nullptr || owner == nullptr)
         return refuse(std::string("outer_or_other_table_column:") +
                       (f->table_name != nullptr ? f->table_name : "") + "." +
@@ -3375,6 +3436,7 @@ bool optimize(THD *thd, LEX *lex) {
   ctx->restore_optimizer_switch();  // the server's optimization is done
   std::string reason;
   bool wide = false;  // DECIMAL values declared above 38 digits
+  bool grouped_check = false;  // grouped strings checked in the query
   int max_scale = 0;
   auto build = [&](int scale_cap) {
     Generator gen(thd, &reason);
@@ -3384,6 +3446,7 @@ bool optimize(THD *thd, LEX *lex) {
     gen.generate(lex, &ctx->sql, &ctx->kinds);
     wide = gen.decimal_wide();
     max_scale = gen.decimal_max_scale();
+    grouped_check = gen.grouped_check();
   };
   if (wrote_in_transaction(thd)) {
     reason = "written_in_transaction";
@@ -3471,11 +3534,22 @@ bool optimize(THD *thd, LEX *lex) {
   // FALLBACK and ROUND the statement runs here first; ERROR streams as
   // usual and an overflow is the statement's error.
   const DecimalOverflow mode = decimal_overflow(thd);
-  if (reason.empty() && wide && mode != DecimalOverflow::ERROR &&
+  auto ambiguous = [](const std::string &err) {
+    return err.find(kGroupedAmbiguous) != std::string::npos;
+  };
+  const char *const kAmbiguousReason =
+      "grouped_string_value_in_join: a group holds values that are equal "
+      "under the collation but stored differently ('a' and 'a ', or 'A' and "
+      "'a'); InnoDB shows one of them by its join order";
+  if (reason.empty() && (grouped_check || (wide && mode != DecimalOverflow::ERROR)) &&
       !lex->is_explain()) {
     std::string err;
     if (run_first(&err)) {
-      if (!is_decimal_overflow(run_error, err)) {
+      if (ambiguous(err)) {
+        reason = kAmbiguousReason;
+      } else if (!wide || mode == DecimalOverflow::ERROR) {
+        reason = "duckdb_execution: " + err.substr(0, 200);
+      } else if (!is_decimal_overflow(run_error, err)) {
         reason = "duckdb_execution: " + err.substr(0, 200);
       } else if (mode == DecimalOverflow::FALLBACK) {
         reason = "decimal_overflow: a DECIMAL value exceeds DuckDB's 38 "
@@ -3503,6 +3577,8 @@ bool optimize(THD *thd, LEX *lex) {
                 "exceeds DuckDB's 38 digits with %d decimals "
                 "(duckdb_decimal_overflow=ROUND)",
                 cap, max_scale);
+          } else if (ambiguous(err)) {
+            reason = kAmbiguousReason;
           } else if (!is_decimal_overflow(run_error, err)) {
             reason = "duckdb_execution: " + err.substr(0, 200);
           }

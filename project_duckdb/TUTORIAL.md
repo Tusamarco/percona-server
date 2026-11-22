@@ -1125,7 +1125,7 @@ Common reasons:
 |---|---|
 | `unsupported_function:<name>`, `unsupported_aggregate:<name>` | Not translated yet: InnoDB answers. |
 | `collation:<column> (...)` | An operation on a string whose collation DuckDB cannot reproduce exactly (e.g. LIKE on `_ci`). |
-| `grouped_string_value_in_join` | A grouped `_ci` or PAD SPACE VARCHAR string shown in a join without the table's primary key in GROUP BY (InnoDB's value depends on its join order). CHAR under a binary collation is offloaded. |
+| `grouped_string_value_in_join` | A grouped `_ci` or PAD SPACE string shown in a join, where a group of the result holds values equal under the collation but stored differently (`'a'` and `'a '`, `'A'` and `'a'`): InnoDB's value depends on its join order. Groups with one stored value are offloaded (checked in the query, 2026-11-22). |
 | `arithmetic_on_unsigned` | Unsigned arithmetic that could leave 0..2^64-1 (MySQL error 1690). |
 | `column_type_in_function:<name>` | A TIME, ENUM, SET, YEAR or BIT column inside a function the plugin does not translate for that type. |
 | `applier_behind` | The copy is not yet current for this connection's last commit (5 s wait expired). |
@@ -1297,7 +1297,8 @@ the table. To read while MySQL runs, query through MySQL, or copy the whole
 - Write to DuckDB directly: all writes go to InnoDB.
 - Offload everything: window functions, UPPER / LOWER, DATE_FORMAT, CAST,
   LIKE and string functions on non-binary collations, functions on
-  TIMESTAMP columns, a grouped VARCHAR in a join, GROUP_CONCAT, JSON
+  TIMESTAMP columns, a grouped string in a join whose groups mix 'a' and
+  'a ' (or 'A' and 'a'), GROUP_CONCAT, JSON
   functions, recursive CTEs, LATERAL. They run on InnoDB.
 - Column types JSON, spatial, VECTOR: the table cannot be loaded.
 - Tables without a primary key, with zero dates; with

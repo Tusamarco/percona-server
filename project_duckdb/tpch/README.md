@@ -50,7 +50,7 @@ on InnoDB.
 | Q13 | identical, offloaded (since 2026-11-17, LIKE on binary collations) | |
 | Q14 | identical, offloaded (since 2026-11-17) | |
 | Q15 | identical, offloaded (view) | |
-| Q16 | refused `grouped_string_value_in_join` (LIKE done) | grouped VARCHAR (`p_type`) in a join |
+| Q16 | to check again: grouped strings in joins are checked per group since 2026-11-22 (was refused `grouped_string_value_in_join`) | grouped VARCHAR (`p_type`) in a join |
 | Q17 | identical, offloaded | |
 | Q18 | identical, offloaded | |
 | Q19 | identical, offloaded | |

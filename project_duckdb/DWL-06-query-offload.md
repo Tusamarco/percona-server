@@ -582,7 +582,14 @@ A2, queries (implemented 2026-11-14):
   weight collations: when GROUP BY contains all primary key columns of the
   column's table every row of the group has the same value (any_value);
   otherwise on a single table the row with the smallest primary key
-  (arg_min); in a join refused (`grouped_string_value_in_join`).
+  (arg_min); in a join (2026-11-22) any value, checked per group in the
+  query: `CASE WHEN count(DISTINCT col) > 1 THEN error(marker) ELSE
+  any_value(col) END`; such statements run first during optimization and
+  the marker becomes the refusal `grouped_string_value_in_join` (a group
+  with values equal under the collation but stored differently, whose
+  shown value InnoDB picks by its join order). With duckdb_decimal_overflow
+  = ERROR and a DECIMAL overflow in such a statement, the overflow is a
+  refusal (InnoDB answers) rather than the statement's error.
 - Derived tables and set operations carry `__w_<column>` next to the value
   (set operations: every operand, for the result's weight-collation
   columns), so the outer query groups and orders on them (UNION ALL of
@@ -799,6 +806,21 @@ return DOUBLE and `sum` returns NULL.
 - Literals of more than 38 digits are refused (DuckDB reads them as DOUBLE
   or HUGEINT).
 - Tests: MTR `decimal_overflow`; TPC-H Q11 now offloaded (8 of 22).
+
+### Join with GROUP BY and a DISTINCT aggregate (2026-11-22)
+
+- Reported on a WooCommerce schema: `SELECT YEAR(o.d), ..., COUNT(DISTINCT
+  o.id) FROM orders o JOIN addresses a ON ... GROUP BY ...` was refused as
+  `outer_or_other_table_column`. For a join with GROUP BY and a DISTINCT
+  aggregate the server's plan materializes the join into a temporary table,
+  and `create_tmp_table()` replaces the aggregate's column arguments with
+  columns of that table (`set_arg`, not recorded for rollback in a regular
+  statement). The generator maps such a column back to the statement's
+  column through what the temporary column keeps (`orig_db_name`,
+  `orig_table_name`, the column name; `Field::new_field`). The same table
+  twice in the query (ambiguous) or a DISTINCT over an expression stays
+  refused.
+- Tests: MTR `offload_join_distinct`.
 
 ### FLOAT and DOUBLE (2026-11-18)
 

@@ -581,9 +581,12 @@ otherwise it runs on InnoDB:
   columns of the copy). Not offloaded on non-`_bin` strings: LIKE, SELECT
   DISTINCT, UNION DISTINCT / INTERSECT / EXCEPT, IN subqueries, functions
   over them in comparisons or GROUP BY (UPPER(c) = ...). A grouped string
-  column shown in a join needs the table's primary key in GROUP BY (as
-  `GROUP BY s.id, s.name`): otherwise the value InnoDB shows depends on its
-  join order and the query runs on InnoDB (a CHAR column under a binary
+  column shown in a join (`_ci` or PAD SPACE) is offloaded when each group
+  of the result holds a single stored value (checked in the query, the
+  statement runs first); a group with `'done'` and `'done '`, or `'Done'`
+  and `'done'`, makes the query run on InnoDB, whose value depends on its
+  join order (with the table's primary key in GROUP BY, as `GROUP BY s.id,
+  s.name`, it is always offloaded) (a CHAR column under a binary
   collation is exact and offloaded: its equal values are identical); MIN/MAX of such strings in a
   join likewise. SELECT DISTINCT of `utf8mb4_bin`/`utf8mb3_bin` columns is
   refused;
@@ -1117,7 +1120,8 @@ Counters restart at 0 when the server starts.
   to 6d, weight strings, the types of section 6, the reviewed date, number
   and string functions); everything else runs on InnoDB: window functions,
   UPPER / LOWER, DATE_FORMAT, CAST, GROUP_CONCAT, LIKE and string functions
-  on non-binary collations, a grouped VARCHAR in a join (TPC-H Q16, Q22).
+  on non-binary collations, a grouped string in a join whose groups mix
+  values equal under the collation ('a' / 'a ' / 'A').
 - Not supported: `binlog_encryption=ON`, `duckdb_encryption`, XA transactions
   on loaded tables (the applier stops), partial JSON updates, the types listed
   in section 3.

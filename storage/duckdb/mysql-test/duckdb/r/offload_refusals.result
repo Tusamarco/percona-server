@@ -114,9 +114,13 @@ Got one of the listed errors
 SET SESSION use_secondary_engine = FORCED;
 SELECT COUNT(*) FROM cw WHERE UPPER(c) = 'APPLE';
 Got one of the listed errors
+# A grouped _ci string in a join (2026-11-22): checked per group in the query.
+# d.c has one stored value per group: offloaded, as InnoDB
 # SELECT d.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY d.c ORDER BY d.c
+# cw.c groups hold 'apple', 'Apple', 'ápple' ...: refused
+# SELECT cw.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY cw.c ORDER BY cw.c
 SET SESSION use_secondary_engine = FORCED;
-SELECT d.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY d.c ORDER BY d.c;
+SELECT cw.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY cw.c ORDER BY cw.c;
 Got one of the listed errors
 # SELECT cw.c, MIN(d.c) FROM cw JOIN cwd d ON d.c = cw.c WHERE cw.id < 50 GROUP BY cw.id, cw.c ORDER BY cw.id
 SET SESSION use_secondary_engine = FORCED;

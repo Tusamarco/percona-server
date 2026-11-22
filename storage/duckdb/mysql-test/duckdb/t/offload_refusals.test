@@ -78,7 +78,12 @@
 --source ../include/duckdb_refused.inc
 --let $query= SELECT COUNT(*) FROM cw WHERE UPPER(c) = 'APPLE'
 --source ../include/duckdb_refused.inc
+--echo # A grouped _ci string in a join (2026-11-22): checked per group in the query.
+--echo # d.c has one stored value per group: offloaded, as InnoDB
 --let $query= SELECT d.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY d.c ORDER BY d.c
+--source ../include/duckdb_compare.inc
+--echo # cw.c groups hold 'apple', 'Apple', 'ápple' ...: refused
+--let $query= SELECT cw.c, COUNT(*) FROM cw JOIN cwd d ON d.c = cw.c GROUP BY cw.c ORDER BY cw.c
 --source ../include/duckdb_refused.inc
 --let $query= SELECT cw.c, MIN(d.c) FROM cw JOIN cwd d ON d.c = cw.c WHERE cw.id < 50 GROUP BY cw.id, cw.c ORDER BY cw.id
 --source ../include/duckdb_refused.inc

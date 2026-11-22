@@ -1,0 +1,70 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# A join with GROUP BY and a DISTINCT aggregate (reported 2026-11-22 on a
+# WooCommerce schema): the server plans "join into a temporary table, then
+# aggregate" and points the aggregate's column at the temporary table
+# (Item_sum::get_tmp_table_item); it was refused as
+# outer_or_other_table_column. Results as InnoDB.
+--source ../include/have_duckdb.inc
+CREATE TABLE wo (id BIGINT UNSIGNED PRIMARY KEY, date_created_gmt DATETIME, status VARCHAR(20) COLLATE utf8mb4_bin,
+  total DECIMAL(10,2)) SECONDARY_ENGINE = duckdb;
+CREATE TABLE wa (id BIGINT UNSIGNED PRIMARY KEY, order_id BIGINT UNSIGNED, address_type VARCHAR(20) COLLATE utf8mb4_bin,
+  KEY (order_id)) SECONDARY_ENGINE = duckdb;
+INSERT INTO wo VALUES (1, '2024-01-01 10:00:00', 'done', 10.50), (2, '2024-01-02 10:00:00', 'new', 20.00),
+  (3, '2024-02-03 10:00:00', 'done', 10.50), (4, '2024-02-04 11:00:00', NULL, NULL), (5, '2025-03-01 09:00:00', 'new', 7.25);
+INSERT INTO wa VALUES (1, 1, 'billing'), (2, 1, 'shipping'), (3, 2, 'billing'), (4, 3, 'billing'), (5, 3, 'shipping'),
+  (6, 4, 'billing'), (7, 5, 'billing'), (8, 5, 'shipping');
+CREATE TABLE wc (id INT PRIMARY KEY, name VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb;
+INSERT INTO wc VALUES (0, 'gold'), (1, 'silver'), (2, 'Bronze');
+ALTER TABLE wo SECONDARY_LOAD;
+ALTER TABLE wa SECONDARY_LOAD;
+ALTER TABLE wc SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+--let $query= SELECT YEAR(o.date_created_gmt) AS yr, MONTH(o.date_created_gmt) AS mon, DAYOFWEEK(o.date_created_gmt) AS dow, COUNT(DISTINCT o.id) AS orders FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY yr, mon, dow ORDER BY yr, mon, dow
+--source ../include/duckdb_compare.inc
+--let $query= SELECT YEAR(o.date_created_gmt) AS yr, COUNT(DISTINCT a.order_id), COUNT(DISTINCT o.status), COUNT(*) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY yr ORDER BY yr
+--source ../include/duckdb_compare.inc
+--let $query= SELECT YEAR(o.date_created_gmt) AS yr, SUM(DISTINCT o.total), AVG(DISTINCT o.total), MIN(o.total), MAX(o.date_created_gmt), COUNT(DISTINCT o.id) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY yr ORDER BY yr
+--source ../include/duckdb_compare.inc
+--echo # A grouped VARCHAR shown in a join (2026-11-22): checked per group in the query
+--let $query= SELECT a.address_type, COUNT(DISTINCT o.id) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY a.address_type ORDER BY a.address_type
+--source ../include/duckdb_compare.inc
+--let $query= SELECT o.status, COUNT(DISTINCT o.id) AS n FROM wo o LEFT JOIN wa a ON a.order_id = o.id AND a.address_type = 'shipping' WHERE a.id IS NULL GROUP BY o.status ORDER BY o.status
+--source ../include/duckdb_compare.inc
+--let $query= SELECT o.status, a.address_type, COUNT(*), SUM(o.total) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY o.status, a.address_type ORDER BY o.status, a.address_type
+--source ../include/duckdb_compare.inc
+--let $query= SELECT c.name, COUNT(*) FROM wo o JOIN wc c ON c.id = MONTH(o.date_created_gmt) % 3 GROUP BY c.name ORDER BY c.name
+--source ../include/duckdb_compare.inc
+
+--echo # A group holding 'done' and 'done ' (PAD SPACE), or 'Done' and 'done' (_ci): refused
+INSERT INTO wo VALUES (6, '2025-04-01 08:00:00', 'done ', 1.00);
+INSERT INTO wa VALUES (9, 6, 'billing');
+INSERT INTO wc VALUES (3, 'GOLD');
+--source ../include/wait_applier.inc
+--let $query= SELECT o.status, COUNT(*) FROM wo o JOIN wa a ON a.order_id = o.id GROUP BY o.status ORDER BY o.status
+--source ../include/duckdb_refused.inc
+--let $query= SELECT c.name, COUNT(*) FROM wo o JOIN wc c ON c.id = MONTH(o.date_created_gmt) % 4 GROUP BY c.name ORDER BY c.name
+--source ../include/duckdb_refused.inc
+--echo # ... but not when the query's groups do not mix them
+--let $query= SELECT o.status, COUNT(*) FROM wo o JOIN wa a ON a.order_id = o.id WHERE o.id < 6 GROUP BY o.status ORDER BY o.status
+--source ../include/duckdb_compare.inc
+SHOW GLOBAL STATUS LIKE 'duckdb_offload_last_refusal';
+--let $query= SELECT YEAR(o.date_created_gmt) AS yr, COUNT(DISTINCT o.id) AS n FROM wo o LEFT JOIN wa a ON a.order_id = o.id AND a.address_type = 'shipping' WHERE a.id IS NULL GROUP BY yr ORDER BY yr
+--source ../include/duckdb_compare.inc
+
+DROP TABLE wo, wa, wc;
+--source ../include/cleanup.inc
