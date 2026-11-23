@@ -1,0 +1,81 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# JSON and GEOMETRY columns (2026-11-23): a table with them can be loaded.
+# JSON is stored as the text MySQL prints (DuckDB JSON type), GEOMETRY as
+# SRID + WKB (BLOB); the binary log's binary JSON is turned into the same
+# text by the applier. Selecting the columns, IS [NOT] NULL and COUNT run in
+# DuckDB as InnoDB; comparisons, functions, grouping, ordering, DISTINCT,
+# other aggregates and set operations on them are refused.
+--source ../include/have_duckdb.inc
+SET NAMES utf8mb4;
+CREATE TABLE jg (id INT PRIMARY KEY, name VARCHAR(20) COLLATE utf8mb4_bin, j JSON, g GEOMETRY, k INT)
+  SECONDARY_ENGINE = duckdb;
+INSERT INTO jg VALUES
+  (1, 'object', '{"b": 1, "a": [1, 2.50, "x"], "n": null}', ST_GeomFromText('POINT(1 2)'), 1),
+  (2, 'array', '[1, "two", {"three": 3}]', ST_GeomFromText('LINESTRING(0 0, 1 1, 2 0)'), 1),
+  (3, 'scalar', '"just a string"', ST_GeomFromText('POINT(45.5 9.25)', 4326), 2),
+  (4, 'nulls', 'null', NULL, 2),
+  (5, 'sqlnull', NULL, ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))'), 3),
+  (6, 'unicode', '{"città": "Milano", "emoji": "\\u263a", "q": "a\\"b"}', ST_GeomFromText('POINT(-1 -2)'), 3);
+ALTER TABLE jg SECONDARY_LOAD;
+CREATE TABLE jk (k INT PRIMARY KEY, label VARCHAR(10) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO jk VALUES (1, 'one'), (2, 'two'), (3, 'three');
+ALTER TABLE jk SECONDARY_LOAD;
+--echo # Changes through the binary log (binary JSON turned into text)
+INSERT INTO jg VALUES (7, 'later', '{"deep": {"x": [true, false, 1.0e10, -0.5]}, "dt": "2024-01-01"}',
+  ST_GeomFromText('MULTIPOINT((1 1), (2 2))'), 1);
+UPDATE jg SET j = JSON_SET(j, '$.b', 42, '$.new', JSON_ARRAY(1, 2)) WHERE id = 1;
+UPDATE jg SET g = ST_GeomFromText('POINT(9 9)') WHERE id = 2;
+UPDATE jg SET j = NULL WHERE id = 3;
+UPDATE jg SET j = '[]' WHERE id = 5;
+DELETE FROM jg WHERE id = 4;
+--source ../include/wait_applier.inc
+SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES WHERE TABLE_NAME = 'jg';
+
+--echo # Offloaded, as InnoDB
+--let $query= SELECT id, name, j, g FROM jg ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*), COUNT(j), COUNT(g) FROM jg
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM jg WHERE j IS NULL OR g IS NULL ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT jk.label, COUNT(jg.j), COUNT(*) FROM jg JOIN jk ON jk.k = jg.k GROUP BY jk.label ORDER BY jk.label
+--source ../include/duckdb_compare.inc
+--let $query= SELECT x.id, x.j FROM (SELECT id, j FROM jg WHERE k = 1) x ORDER BY x.id
+--source ../include/duckdb_compare.inc
+
+--echo # Refused (JSON / spatial rules)
+--let $query= SELECT id FROM jg WHERE j = CAST('[]' AS JSON)
+--source ../include/duckdb_refused.inc
+--let $query= SELECT id, j->'$.b' FROM jg ORDER BY id
+--source ../include/duckdb_refused.inc
+--let $query= SELECT id, JSON_EXTRACT(j, '$.a[1]') FROM jg ORDER BY id
+--source ../include/duckdb_refused.inc
+--let $query= SELECT id FROM jg ORDER BY j
+--source ../include/duckdb_refused.inc
+--let $query= SELECT j, COUNT(*) FROM jg GROUP BY j
+--source ../include/duckdb_refused.inc
+--let $query= SELECT DISTINCT g FROM jg
+--source ../include/duckdb_refused.inc
+--let $query= SELECT ST_AsText(g) FROM jg ORDER BY id
+--source ../include/duckdb_refused.inc
+--let $query= SELECT COUNT(DISTINCT j) FROM jg
+--source ../include/duckdb_refused.inc
+--let $query= SELECT j FROM jg WHERE id = 1 UNION SELECT j FROM jg WHERE id = 2
+--source ../include/duckdb_refused.inc
+
+DROP TABLE jg, jk;
+--source ../include/cleanup.inc

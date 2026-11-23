@@ -71,6 +71,16 @@ struct TableInfo {
   std::vector<unsigned int> primary_key;  // column indexes
 };
 
+/**
+  Turns MySQL's binary JSON (the binary log's form of a JSON column) into the
+  text MySQL prints for it (Field_json::val_str: the same text the load
+  stores). Set by the plugin (duckdb_json.cc, server code); without it a
+  JSON column cannot be decoded. true on error, with *err.
+*/
+using JsonToText = bool (*)(const char *data, size_t len, std::string *text,
+                            std::string *err);
+void set_json_to_text(JsonToText fn);
+
 /** Binlog types that carry signedness information (numeric columns). */
 bool type_has_signedness(unsigned int type);
 

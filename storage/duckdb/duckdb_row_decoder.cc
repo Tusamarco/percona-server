@@ -39,6 +39,13 @@
 
 namespace duckdb_se {
 
+namespace {
+// The binary JSON converter (set_json_to_text).
+JsonToText g_json_to_text = nullptr;
+}  // namespace
+
+void set_json_to_text(JsonToText fn) { g_json_to_text = fn; }
+
 // CHAR metadata keeps the real type in the high byte and the maximum length in
 // the low byte; lengths above 255 borrow two bits of the type byte.
 void decode_string_metadata(unsigned int metadata, unsigned int *real_type,
@@ -290,6 +297,38 @@ bool decode_value(const ColumnInfo &c, const unsigned char **pos,
       size = prefix + len;
       break;
     }
+    // GEOMETRY: SRID + WKB, as a BLOB (2026-11-23).
+    case MYSQL_TYPE_GEOMETRY: {
+      const unsigned int prefix = c.metadata;
+      if (prefix < 1 || prefix > 4)
+        return fail(err, "column " + c.name + ": invalid GEOMETRY metadata");
+      if (need(p, end, prefix, err)) return true;
+      const uint32_t len = read_length(p, prefix);
+      if (need(p + prefix, end, len, err)) return true;
+      v->kind = Value::Kind::BLOB;
+      v->s.assign(reinterpret_cast<const char *>(p + prefix), len);
+      size = prefix + len;
+      break;
+    }
+    // JSON: MySQL's binary JSON, turned into the text MySQL prints
+    // (set_json_to_text; 2026-11-23).
+    case MYSQL_TYPE_JSON: {
+      const unsigned int prefix = c.metadata;
+      if (prefix < 1 || prefix > 4)
+        return fail(err, "column " + c.name + ": invalid JSON metadata");
+      if (need(p, end, prefix, err)) return true;
+      const uint32_t len = read_length(p, prefix);
+      if (need(p + prefix, end, len, err)) return true;
+      if (g_json_to_text == nullptr)
+        return fail(err, "column " + c.name + ": JSON cannot be decoded here");
+      std::string e;
+      v->kind = Value::Kind::TEXT;
+      if (g_json_to_text(reinterpret_cast<const char *>(p + prefix), len, &v->s,
+                         &e))
+        return fail(err, "column " + c.name + ": " + e);
+      size = prefix + len;
+      break;
+    }
     // DATE columns appear in the binlog as MYSQL_TYPE_DATE (Field::binlog_type
     // is type()); the value is the same 3-byte packed date as NEWDATE.
     case MYSQL_TYPE_DATE:
@@ -421,6 +460,8 @@ bool read_column_metadata(unsigned int type, const unsigned char **pos,
     case MYSQL_TYPE_FLOAT:
     case MYSQL_TYPE_DOUBLE:
     case MYSQL_TYPE_BLOB:
+    case MYSQL_TYPE_GEOMETRY:  // length prefix size, as BLOB
+    case MYSQL_TYPE_JSON:      // length prefix size, as BLOB
     case MYSQL_TYPE_DATETIME2:
     case MYSQL_TYPE_TIMESTAMP2:
     case MYSQL_TYPE_TIME2:

@@ -574,6 +574,24 @@ log, in order.
   privileges, and the security context service can add only SUPER and
   EXECUTE.
 
+### JSON and spatial columns (2026-11-23)
+
+- GEOMETRY rows: length prefix and bytes, as a BLOB.
+- JSON rows: MySQL's binary JSON, turned into the text MySQL prints with the
+  server's own code (`json_binary::parse_binary`, `Json_wrapper::to_string`
+  with quoting, as `Field_json::val_str`), so the applier writes the text
+  the load wrote (`duckdb_json.cc`, kept out of the row decoder, which the
+  unit tests link without the server: `set_json_to_text`).
+- `Json_wrapper::to_string` reads `current_thd` (`max_allowed_packet`): the
+  reader thread now has an internal THD (`create_internal_thd()`, as the
+  server's background threads), installed again when an internal session
+  (refresh after DDL) leaves the thread without one. The first version
+  crashed the reader there (MTR `json_geometry`).
+- A partial JSON update (`PARTIAL_UPDATE_ROWS_EVENT`, written when a session
+  sets `binlog_row_value_options = PARTIAL_JSON`) used to stop the whole
+  applier; now that table's copy becomes stale, as after a failed refresh,
+  and the applier goes on.
+
 ### Status variables
 
 Implemented: `duckdb_apply_reader_state`, `duckdb_apply_reader_file`,

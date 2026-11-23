@@ -638,6 +638,21 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
       weighted.push_back(*f);
     if (!index_column_type(**f).empty()) indexed.push_back(*f);
   }
+  // JSON columns: partial JSON updates in the binary log (only the changed
+  // part of a value) make the copy stale; the global setting is the
+  // default of new sessions (a session can still set it).
+  for (Field *f : fields) {
+    if (f->real_type() != MYSQL_TYPE_JSON) continue;
+    if ((global_system_variables.binlog_row_value_options &
+         PARTIAL_JSON_UPDATES) != 0)
+      push_warning_printf(
+          thd, Sql_condition::SL_WARNING, ER_SECONDARY_ENGINE_PLUGIN,
+          ER_THD(thd, ER_SECONDARY_ENGINE_PLUGIN),
+          "binlog_row_value_options = PARTIAL_JSON: a partial JSON update "
+          "of this table will make its DuckDB copy stale; keep "
+          "binlog_row_value_options empty");
+    break;
+  }
   if (retain_history) columns += ", \"__archived_at\" TIMESTAMP";
   for (Field *f : weighted)
     columns +=

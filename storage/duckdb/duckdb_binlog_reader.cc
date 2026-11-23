@@ -36,7 +36,10 @@
 #include "my_dir.h"             // my_stat
 #include "sql/binlog_reader.h"  // Binlog_file_reader
 #include "sql/mysqld.h"  // opt_bin_log, binlog_expire_logs_seconds
+#include "sql/current_thd.h"
+#include "sql/sql_thd_internal_api.h"  // create_internal_thd
 #include "storage/duckdb/duckdb_ddl.h"
+#include "storage/duckdb/duckdb_json.h"  // set_json_thd
 #include "storage/duckdb/duckdb_load.h"  // refresh and rename after DDL
 #include "storage/duckdb/duckdb_log.h"
 #include "storage/duckdb/duckdb_session.h"
@@ -307,6 +310,11 @@ void *BinlogReader::thread_main(void *) {
     DUCKDB_LOG_WARNING(
         "binlog reader: cannot attach to the session service; DDL on loaded "
         "tables will mark them stale instead of refreshing them");
+  // A THD of its own for this thread, as the server's background threads
+  // have: turning the binary log's JSON into text uses the server's code,
+  // which reads current_thd (duckdb_json.cc).
+  THD *json_thd = create_internal_thd();
+  set_json_thd(json_thd);
   // An exception must not leave the thread: std::terminate would stop mysqld.
   // An open large transaction holds apply_mutex: we roll it back before
   // waiting in error state, or every unload would wait until the stop.
@@ -324,6 +332,11 @@ void *BinlogReader::thread_main(void *) {
   try {
     reader.m_con.reset();
   } catch (...) {
+  }
+  set_json_thd(nullptr);
+  if (json_thd != nullptr) {
+    if (current_thd != json_thd) json_thd->store_globals();
+    destroy_internal_thd(json_thd);
   }
   // my_thread_end(), after detaching from the service.
   session_thread_end(reader.m_session_attached);
@@ -985,8 +998,15 @@ bool BinlogReader::handle_rows(const char *buf,
     return false;
 
   if (ev.type() == bev::PARTIAL_UPDATE_ROWS_EVENT) {
-    *err = info.db + "." + info.table + ": partial JSON updates not supported";
-    return true;
+    // Only the changed part of a JSON value (binlog_row_value_options =
+    // PARTIAL_JSON in the writing session): the copy cannot rebuild the
+    // value. That copy becomes stale (as after a failed refresh); the
+    // applier goes on with the other tables.
+    ddl_failed(TableName{info.db, info.table},
+               "partial JSON update in the binary log "
+               "(binlog_row_value_options = PARTIAL_JSON); keep "
+               "binlog_row_value_options empty for tables with a DuckDB copy");
+    return false;
   }
   const TableKey key{info.db, info.table};
   auto changes_it = m_trx.changes.find(key);

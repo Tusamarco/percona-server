@@ -468,6 +468,75 @@ POC tests (MTR suite `duckdb`):
 
 Exit criterion: the five features work end to end in MTR, and a reference analytical workload shows a measured speedup versus InnoDB.
 
+## Data type mapping
+
+Recorded 2026-11-23 (the same tables are in HOWTO section 3, "Data types
+and collations"; keep both current with the coverage tracker below).
+
+How each MySQL column is stored in the DuckDB copy (the lake), and what that
+means for queries. The rule behind every row: a query that runs in DuckDB
+returns exactly what InnoDB returns; what cannot be translated exactly is
+refused and runs on InnoDB (with `use_secondary_engine = FORCED`: an error
+with the reason).
+
+| MySQL type | DuckDB type in the lake | Notes |
+|---|---|---|
+| `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`, `BIGINT` | `TINYINT`, `SMALLINT`, `INTEGER`, `INTEGER`, `BIGINT`; `UTINYINT` ... `UBIGINT` when `UNSIGNED` | Unsigned `+` and `*` run in DuckDB only when they cannot leave 0..2^64-1; unsigned `-` is refused (MySQL error 1690). |
+| `DECIMAL(p,s)`, p ≤ 38 | `DECIMAL(p,s)` | Exact. Results MySQL declares above 38 digits: `duckdb_decimal_overflow` (HOWTO section 6). |
+| `DECIMAL(p,s)`, p > 38 | not supported | The table cannot be loaded. |
+| `FLOAT`, `DOUBLE` | `FLOAT`, `DOUBLE` | FLOAT values are sent as FLOAT (MySQL's shortest digits). SUM / AVG: last digits can differ (`duckdb_offload_float_aggregates`). |
+| `DATE` | `DATE` | Zero dates (`0000-00-00`, month or day 0) cannot be loaded. |
+| `DATETIME(n)` | `TIMESTAMP` (microseconds) | Zero dates cannot be loaded. |
+| `TIMESTAMP(n)` | `TIMESTAMP`, in UTC | MySQL stores UTC too; constants are converted in the session time zone as MySQL does. Functions on TIMESTAMP columns are refused (session time zone). Zero timestamps cannot be loaded. |
+| `TIME(n)` | `BIGINT`, signed microseconds | Keeps MySQL's full range, -838:59:59 to 838:59:59 (DuckDB's TIME covers only one day). Compared, grouped and ordered as MySQL; most functions refused (HOWTO section 6). |
+| `YEAR` | `USMALLINT` (the year number) | A YEAR column is shown `0000` as MySQL does. |
+| `BIT(n)` | `UBIGINT` (the value) | Sent to the client as bytes, as MySQL. |
+| `ENUM` | `VARCHAR` (the value) + hidden `__n_<col>` `USMALLINT` (the element position) | `ORDER BY e` and `e = 2` / `e + 0` use the position, comparisons and MIN/MAX the string, as MySQL. |
+| `SET` | `VARCHAR` (the value) + hidden `__n_<col>` `UBIGINT` (the bitmask) | As ENUM, with the bitmask. |
+| `CHAR`, `VARCHAR`, `TINYTEXT` ... `LONGTEXT` | `VARCHAR` (UTF-8) + hidden `__w_<col>` `BLOB` for some collations (below) | Any character set is converted to UTF-8 at load. |
+| `BINARY`, `VARBINARY`, `TINYBLOB` ... `LONGBLOB` | `BLOB` | The bytes as they are. |
+| `JSON` | `JSON` (DuckDB's JSON type: text, validated) | The text MySQL prints for the value, the same from the load and from the binary log (the applier turns MySQL's binary JSON into it with the server's code). Selecting the column, `IS [NOT] NULL` and `COUNT(j)` run in DuckDB; comparisons, `->` / `->>`, JSON functions, GROUP BY, ORDER BY, DISTINCT, other aggregates and set operations on it are refused. Partial JSON updates (`binlog_row_value_options = PARTIAL_JSON`) make the copy stale: keep that variable empty. |
+| Spatial types (`GEOMETRY`, `POINT`, `POLYGON` ...) | `BLOB` (SRID + WKB, MySQL's bytes) | Selecting the column, `IS [NOT] NULL` and `COUNT(g)` run in DuckDB; spatial functions and comparisons are refused. |
+| `VECTOR` | not supported | The table cannot be loaded. |
+
+Hidden columns (`__w_`, `__n_`, and `__archived_at` in history copies) are
+in the lake only: MySQL users see the table's own columns; they are visible
+when reading the lake directly (HOWTO section 10).
+
+How string comparisons follow the MySQL collation in DuckDB:
+
+| MySQL collation | In DuckDB | Behaviour |
+|---|---|---|
+| binary strings (`BINARY`, `VARBINARY`, `BLOB`), NO PAD binary (`utf8mb4_0900_bin`) | the bytes | Exact. |
+| PAD SPACE binary (`utf8mb4_bin`, `utf8mb3_bin`) | the value without trailing spaces (`rtrim`), a padded key to sort | `'a' = 'a '` as MySQL. |
+| `latin1_bin`, `ascii_bin` | the hidden weight column; for expressions (no weight column) the value, as the bytes and their order match | Exact. |
+| every other collation: `_ci`, `_ai_ci`, `_as_cs`, `utf8mb4_general_ci`, `utf8mb4_unicode_ci`, `latin1_swedish_ci` and other non-UTF-8 ones | the hidden weight column `__w_<col>`: MySQL's own sort weight of each value, computed at load and by the applier | Comparisons, GROUP BY, ORDER BY, joins and DISTINCT counts exactly as InnoDB, including accents and non-ASCII text. Not supported on such columns: LIKE and most string functions (refused); an expression has no weight column, so comparing or grouping it is refused. |
+
+A value shown from a group (`GROUP BY name` under `_ci`) can be any of the
+values the collation calls equal (`'José'`, `'jose'`): MySQL shows the
+first row's. DuckDB checks each group of the result and the query is
+refused when a group holds more than one stored spelling (HOWTO section 6).
+
+Compared with MariaDB's DuckDB storage engine (reviewed 2026-11-23,
+mariadb.com/docs/server/server-usage/storage-engines/duckdb-storage-engine):
+there the table lives only in DuckDB, so the mapping aims at storing the
+data; here a query in DuckDB must give InnoDB's result, so several choices
+differ:
+
+| Type / collation | MariaDB DuckDB engine | Here | Why |
+|---|---|---|---|
+| `DECIMAL(p > 38)` | `DOUBLE` (or `DECIMAL(38,s)` with an option) | not loadable; results above 38 digits handled exactly (`duckdb_decimal_overflow`) | DOUBLE loses precision silently |
+| `TIMESTAMP` | `TIMESTAMPTZ` (server and DuckDB time zones must match) | `TIMESTAMP` in UTC; constants converted in the session time zone | no shifted values |
+| `TIME` | DuckDB `TIME` | `BIGINT` microseconds | DuckDB TIME covers one day, MySQL TIME ±838 hours |
+| `ENUM`, `SET` | `VARCHAR` | `VARCHAR` + hidden position / bitmask | ORDER BY and numeric use follow the position |
+| `BIT` | `BLOB` | `UBIGINT` | numeric comparisons and `b + 0` |
+| `YEAR` | `INTEGER` | `USMALLINT` | same; shown `0000` as MySQL |
+| `_ci`, `_ai_ci`, `general_ci`, `unicode_ci` | DuckDB `NOCASE[.NOACCENT]` ("results can differ from InnoDB") | MySQL's weights in a hidden column | identical results, also for non-ASCII text |
+| `_bin` | byte comparison | PAD SPACE as MySQL (rtrim) | `'a' = 'a '` in MySQL |
+| non-UTF-8 character sets | rejected | converted to UTF-8, weights where needed | latin1 schemas (HammerDB) |
+| `JSON` | `VARCHAR` | DuckDB `JSON` type (stored as text, validated); MySQL's printed text, from the load and from the binary log; only selecting, IS NULL and COUNT translated (2026-11-23) | the text InnoDB returns; JSON comparison rules differ |
+| spatial types | `BLOB` | `BLOB` (SRID + WKB); only selecting, IS NULL and COUNT translated (2026-11-23) | the bytes InnoDB returns |
+
 ## SQL coverage tracker
 
 What an offloaded query can contain, against the SQL standard (SQL:2016
@@ -555,7 +624,8 @@ not a read). Last update: 2026-11-17 (function review, TPC-H 19/22,
 | DATE, DATETIME, TIMESTAMP, YEAR, TIME | done | YEAR, TIME 2026-11-16 |
 | BIT, ENUM, SET | done | 2026-11-16 |
 | DECIMAL above 38 digits | missing | table not loadable |
-| JSON, spatial, VECTOR | missing | table not loadable |
+| JSON, spatial | partial | loadable (2026-11-23): selecting, IS NULL, COUNT; JSON / spatial functions and comparisons refused (MTR `json_geometry`) |
+| VECTOR | missing | table not loadable |
 
 ### Tables and consistency
 
@@ -700,12 +770,25 @@ archived rows)
 
 **T4. Loadability** (a table that cannot be loaded has no offload and no
 history)
-- [ ] JSON columns loaded as text, JSON functions refused (small); also
-      decide spatial and VECTOR (VECTOR: exact distance first).
+- [x] JSON columns loaded (DuckDB JSON type, MySQL's text; binary JSON of
+      the binary log turned into text by the server's code), spatial as
+      BLOB; functions and comparisons refused (2026-11-23, MTR
+      `json_geometry`). Still open: VECTOR (exact distance first),
+      translating `->>` / `JSON_EXTRACT` with simple paths.
 - [ ] Zero dates (`0000-00-00`): stored as NULL plus a hidden flag, as the
       `__n_` / `__w_` columns.
 - [ ] Tables without a primary key: design first (no row identity in the
       binary log).
+- [ ] From MariaDB's DuckDB engine mapping (reviewed 2026-11-23, HOWTO
+      "Data types and collations"): spatial columns as `BLOB` (WKB), spatial
+      functions refused (done 2026-11-23); `DECIMAL(p > 38)` as `DECIMAL(38, s)` with a value
+      check at load and in the applier (a value that does not fit: load
+      refused / copy stale), not MariaDB's `DOUBLE` default (precision
+      lost). Not taken: their collation mapping (`NOCASE`), TIME as DuckDB
+      `TIME`, ENUM / SET as plain `VARCHAR`, BIT as `BLOB` (results would
+      differ from InnoDB).
+- [ ] Generated columns: check load and applier (virtual columns in the
+      binary log row image) and document.
 
 **T5. Concurrency** (with the HammerDB run, next step 4)
 - [ ] More concurrent offloaded statements than `duckdb_executor_threads`:

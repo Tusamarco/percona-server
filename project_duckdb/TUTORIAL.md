@@ -1101,8 +1101,7 @@ does not start); `duckdb_encryption=ON`; a lake moved with
 ### 12.2 SECONDARY_LOAD is refused
 
 The error names the reason. Typical: a server setting from section 10
-missing; no primary key; a column type not supported (JSON, spatial,
-VECTOR); a cascading foreign key with `innodb_native_foreign_keys = ON`;
+missing; no primary key; a column type not supported (VECTOR); a cascading foreign key with `innodb_native_foreign_keys = ON`;
 DECIMAL with more than 38 digits; zero dates; a
 history table whose structure differs from its stale copy (`SHOW WARNINGS`
 lists every difference; `duckdb_history_check_only` checks without
@@ -1301,7 +1300,10 @@ the table. To read while MySQL runs, query through MySQL, or copy the whole
   TIMESTAMP columns, a grouped string in a join whose groups mix 'a' and
   'a ' (or 'A' and 'a'), GROUP_CONCAT, JSON
   functions, recursive CTEs, LATERAL. They run on InnoDB.
-- Column types JSON, spatial, VECTOR: the table cannot be loaded.
+- Column type VECTOR, DECIMAL above 38 digits: the table cannot be loaded.
+  JSON and spatial columns load (2026-11-23), but only selecting them,
+  `IS NULL` and `COUNT` run in DuckDB; JSON / spatial functions and
+  comparisons run on InnoDB.
 - Tables without a primary key, with zero dates; with
   `innodb_native_foreign_keys = ON`, children of cascading foreign keys
   (with the default OFF every foreign key works).

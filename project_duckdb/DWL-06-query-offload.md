@@ -822,6 +822,20 @@ return DOUBLE and `sum` returns NULL.
   refused.
 - Tests: MTR `offload_join_distinct`.
 
+### JSON and spatial columns (2026-11-23)
+
+- New special column kind `OPAQUE` (JSON, GEOMETRY): the column as a result
+  (JSON sent as its text with the JSON type of the metadata, GEOMETRY as
+  its bytes), `IS [NOT] NULL` and `COUNT(col)` are translated; any other
+  function or comparison (`json_or_geometry_in_function`), aggregate
+  (`json_or_geometry_in_aggregate`), GROUP BY, ORDER BY, DISTINCT and set
+  operations are refused: JSON comparison and spatial semantics are not
+  DuckDB's. Expressions of JSON / GEOMETRY type are refused
+  (`unsupported_result_type`).
+- Tests: MTR `json_geometry` (load and binary log paths, objects, arrays,
+  scalars, JSON null and SQL NULL, unicode and escapes, points, lines,
+  polygons with SRID; joins and derived tables; nine refusals).
+
 ### EXISTS and NOT EXISTS on the same column (2026-11-23, TPC-H Q21)
 
 - `EXISTS (... l2 ... l2.k = l1.k) AND NOT EXISTS (... l3 ... l3.k = l1.k)`

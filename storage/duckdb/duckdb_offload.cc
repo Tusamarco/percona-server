@@ -258,7 +258,12 @@ bool is_string(const Item *item) {
 // (signed microseconds; MySQL's string and number forms differ), ENUM and
 // SET (value plus hidden index), YEAR and BIT (numbers that MySQL shows as
 // '0000' or as bytes in string contexts).
-enum class SpecialColumn { NONE, NUMBER, OTHER };
+// JSON and GEOMETRY (2026-11-23, OPAQUE): stored as MySQL prints them (JSON
+// text, SRID + WKB bytes), so selecting the column, IS [NOT] NULL and COUNT
+// give MySQL's result; comparisons, functions, grouping, ordering, DISTINCT
+// and other aggregates follow JSON / spatial rules DuckDB does not share:
+// refused.
+enum class SpecialColumn { NONE, NUMBER, OTHER, OPAQUE };
 SpecialColumn special_column(const Item *item) {
   if (item->type() != Item::FIELD_ITEM) return SpecialColumn::NONE;
   const Field *f = down_cast<const Item_field *>(item)->field;
@@ -271,6 +276,9 @@ SpecialColumn special_column(const Item *item) {
     case MYSQL_TYPE_ENUM:
     case MYSQL_TYPE_SET:
       return SpecialColumn::OTHER;
+    case MYSQL_TYPE_JSON:
+    case MYSQL_TYPE_GEOMETRY:
+      return SpecialColumn::OPAQUE;
     default:
       return SpecialColumn::NONE;
   }
@@ -1205,6 +1213,10 @@ bool Generator::aggregate(Item_sum *s, std::string *out) {
   const Item_sum::Sumfunctype f = s->sum_func();
   if (s->argument_count() != 1) return refuse("aggregate_arguments");
   Item *arg = s->get_arg(0)->real_item();
+  if (special_column(arg) == SpecialColumn::OPAQUE &&
+      f != Item_sum::COUNT_FUNC)
+    return refuse(std::string("json_or_geometry_in_aggregate:") +
+                  s->func_name());
   m_block->agg_depth++;
   struct Leave {
     int &d;
@@ -1313,6 +1325,15 @@ bool Generator::aggregate(Item_sum *s, std::string *out) {
 // (LIKE, CASE, IF, IFNULL, COALESCE, string and date functions) they are
 // refused, except YEAR and BIT where the function's result is an integer.
 bool Generator::special_args(Item_func *fn) {
+  // JSON / GEOMETRY: only IS [NOT] NULL.
+  if (fn->functype() != Item_func::ISNULL_FUNC &&
+      fn->functype() != Item_func::ISNOTNULL_FUNC) {
+    Item **a = fn->arguments();
+    for (unsigned i = 0; i < fn->argument_count(); i++)
+      if (special_column(a[i]->real_item()) == SpecialColumn::OPAQUE)
+        return refuse(std::string("json_or_geometry_in_function:") +
+                      fn->func_name());
+  }
   switch (fn->functype()) {
     case Item_func::EQ_FUNC:
     case Item_func::NE_FUNC:
@@ -2236,9 +2257,22 @@ bool Generator::output_kind(Item *item, Kind *kind, std::string *cast) {
       return false;
     }
     case MYSQL_TYPE_JSON:
+      // A JSON column: the text MySQL prints, as stored (sent with the
+      // JSON type of the metadata). JSON expressions are not translated.
+      if (item->real_item()->type() != Item::FIELD_ITEM)
+        return refuse("unsupported_result_type");
+      *kind = Kind::STRING;
+      *cast = "VARCHAR";
+      return false;
+    case MYSQL_TYPE_GEOMETRY:
+      // A GEOMETRY column: SRID + WKB, MySQL's bytes.
+      if (item->real_item()->type() != Item::FIELD_ITEM)
+        return refuse("unsupported_result_type");
+      *kind = Kind::BLOB;
+      *cast = "BLOB";
+      return false;
     case MYSQL_TYPE_ENUM:
     case MYSQL_TYPE_SET:
-    case MYSQL_TYPE_GEOMETRY:
     case MYSQL_TYPE_VECTOR:
       return refuse("unsupported_result_type");
     default:
@@ -2500,6 +2534,9 @@ bool Generator::multi_eq(Item_multi_eq *eq, table_map avoid,
       break;
     }
   Item *first = fields[anchor];
+  for (Item *f : fields)
+    if (special_column(f) == SpecialColumn::OPAQUE)
+      return refuse("json_or_geometry_in_function:=");
   const bool str = is_string(first);
   if (str && str_mode(first) == StrMode::REFUSE)
     return refuse_collation(first);
@@ -2642,6 +2679,8 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
   std::string group;
   for (ORDER *o = qb->group_list.first; o != nullptr; o = o->next) {
     Item *g = (*o->item)->real_item();
+    if (special_column(g) == SpecialColumn::OPAQUE)
+      return refuse("json_or_geometry_in_group_by");
     if (g->type() == Item::FIELD_ITEM)
       m_block->grouped.insert(down_cast<Item_field *>(g)->field);
     std::string e;
@@ -2685,6 +2724,10 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
   std::string select;
   size_t col = 0;
   for (Item *item : qb->visible_fields()) {
+    if (special_column(item->real_item()) == SpecialColumn::OPAQUE &&
+        (distinct || targets != nullptr))
+      return refuse(distinct ? "json_or_geometry_in_distinct"
+                             : "json_or_geometry_in_set_operation");
     if (distinct && is_string(item) && str_mode(item) != StrMode::RAW)
       return str_mode(item) == StrMode::PAD
                  ? refuse("distinct_padded_string")
@@ -2753,6 +2796,8 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
   std::string order;
   for (ORDER *o = qb->order_list.first; o != nullptr; o = o->next) {
     std::string s;
+    if (special_column((*o->item)->real_item()) == SpecialColumn::OPAQUE)
+      return refuse("json_or_geometry_in_order_by");
     // MySQL sorts ENUM / SET on the index, not the string.
     const bool by_index =
         special_column((*o->item)->real_item()) == SpecialColumn::OTHER &&

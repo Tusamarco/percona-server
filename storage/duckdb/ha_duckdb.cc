@@ -48,6 +48,7 @@
 #include "storage/duckdb/duckdb_load.h"
 #include "storage/duckdb/duckdb_log.h"
 #include "storage/duckdb/duckdb_offload.h"
+#include "storage/duckdb/duckdb_json.h"
 #include "storage/duckdb/duckdb_progress.h"
 #include "duckdb_plugin_version.h"  // DUCKDB_PLUGIN_COMMIT (generated)
 #include "storage/duckdb/duckdb_registry.h"
@@ -1062,6 +1063,7 @@ int duckdb_init_impl(MYSQL_PLUGIN p) {
   Executor::register_psi();
   BinlogReader::register_psi();
   register_progress_stages();
+  install_json_decoder();
   auto fail = [] {
     release_privilege();
     unregister_offload_observer(plugin_handle);

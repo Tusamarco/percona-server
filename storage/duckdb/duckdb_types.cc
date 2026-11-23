@@ -182,6 +182,15 @@ std::string duckdb_column_type(const Field &field, std::string *err) {
       // Binary strings keep their bytes; text in any character set is stored
       // as UTF-8. Collation semantics are enforced at query time (DWL#6).
       return field.charset() == &my_charset_bin ? "BLOB" : "VARCHAR";
+    case MYSQL_TYPE_GEOMETRY:
+      // MySQL's own bytes: 4-byte SRID + WKB, as SELECT returns them. No
+      // spatial operation is translated (2026-11-23).
+      return "BLOB";
+    case MYSQL_TYPE_JSON:
+      // The text MySQL prints for the value (Field_json::val_str), kept as
+      // it is by DuckDB's JSON type (stored as VARCHAR, validated on
+      // insert). JSON comparisons and functions are not translated.
+      return "JSON";
     case MYSQL_TYPE_NEWDATE:
       return "DATE";
     case MYSQL_TYPE_DATETIME2:
@@ -224,6 +233,10 @@ duckdb_type chunk_type(const Field &field) {
     case MYSQL_TYPE_BLOB:
       return field.charset() == &my_charset_bin ? DUCKDB_TYPE_BLOB
                                                 : DUCKDB_TYPE_VARCHAR;
+    case MYSQL_TYPE_GEOMETRY:
+      return DUCKDB_TYPE_BLOB;
+    case MYSQL_TYPE_JSON:
+      return DUCKDB_TYPE_VARCHAR;  // into the JSON column as it is
     default:
       // DECIMAL goes as text and the appender casts it to DECIMAL(p,s).
       return DUCKDB_TYPE_VARCHAR;
@@ -282,6 +295,27 @@ bool store_field(duckdb_vector vec, idx_t row, Field &field,
     case MYSQL_TYPE_NEWDECIMAL: {
       String buf;
       const String *s = field.val_str(&buf);
+      duckdb_vector_assign_string_element_len(vec, row, s->ptr(), s->length());
+      return false;
+    }
+    case MYSQL_TYPE_GEOMETRY: {
+      // SRID + WKB, the bytes as stored (Field_blob::val_str).
+      String buf;
+      const String *s = field.val_str(&buf);
+      duckdb_vector_assign_string_element_len(vec, row, s->ptr(), s->length());
+      return false;
+    }
+    case MYSQL_TYPE_JSON: {
+      // The text MySQL prints (utf8mb4). The applier turns the binary JSON
+      // of the binary log into the same text (duckdb_json.cc).
+      // (A damaged binary value raises the server's error in the load's
+      // session and gives an empty text; the load then fails on it.)
+      String buf;
+      const String *s = field.val_str(&buf);
+      if (s == nullptr || s->length() == 0) {
+        *err = column_error(field, "invalid JSON value");
+        return true;
+      }
       duckdb_vector_assign_string_element_len(vec, row, s->ptr(), s->length());
       return false;
     }

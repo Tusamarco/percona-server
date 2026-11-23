@@ -224,7 +224,9 @@ load_table(TABLE &t)
 | BIT(n) | UBIGINT: the value (2026-11-16) |
 | TIME(n) | BIGINT: signed microseconds (2026-11-16) |
 | ENUM, SET | VARCHAR value (UTF-8, weight column if needed) + hidden `__n_<col>`: ENUM index USMALLINT, SET bitmask UBIGINT (2026-11-16) |
-| other types (JSON, spatial, VECTOR) | refused in the POC |
+| JSON | DuckDB `JSON` (2026-11-23): the text `Field_json::val_str` prints |
+| spatial types | `BLOB` (2026-11-23): SRID + WKB, `Field_blob::val_str` |
+| VECTOR, DECIMAL above 38 digits | refused |
 
 #### YEAR, BIT, TIME, ENUM, SET (done 2026-11-16)
 
@@ -233,7 +235,10 @@ Nothing structural prevented them: each layer (load type mapping in
 types and expressions in `duckdb_offload.cc`) lacked the cases. The binlog
 values are documented and `binlog_row_metadata=FULL` (already required)
 carries the ENUM/SET value lists (`Optional_metadata_fields::m_enum_str_value`
-/ `m_set_str_value`). JSON, spatial and VECTOR stay refused.
+/ `m_set_str_value`). JSON and spatial columns load since 2026-11-23 (JSON
+as DuckDB's JSON type with MySQL's text, spatial as SRID + WKB bytes); a
+warning at load when `binlog_row_value_options` includes `PARTIAL_JSON`.
+VECTOR stays refused.
 
 | MySQL | DuckDB | Notes |
 |---|---|---|
