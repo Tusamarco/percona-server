@@ -49,6 +49,7 @@
 #include "storage/duckdb/duckdb_log.h"
 #include "storage/duckdb/duckdb_offload.h"
 #include "storage/duckdb/duckdb_progress.h"
+#include "duckdb_plugin_version.h"  // DUCKDB_PLUGIN_COMMIT (generated)
 #include "storage/duckdb/duckdb_registry.h"
 #include "storage/duckdb/duckdb_session.h"
 
@@ -56,6 +57,11 @@
 static SERVICE_TYPE(registry) *reg_srv = nullptr;
 SERVICE_TYPE(log_builtins) *log_bi = nullptr;
 SERVICE_TYPE(log_builtins_string) *log_bs = nullptr;
+
+// The plugin version (also the 0x0001 of the plugin descriptors, shown as
+// PLUGIN_VERSION 0.1 in INFORMATION_SCHEMA.PLUGINS); the commit comes from
+// the generated duckdb_plugin_version.h.
+#define DUCKDB_PLUGIN_VERSION_TEXT "0.1"
 
 namespace duckdb_se {
 
@@ -732,6 +738,17 @@ int show_number(SHOW_VAR *var, char *buff, unsigned long long value) {
   return 0;
 }
 
+// The plugin version, the git commit it was built from ("-dirty": with
+// uncommitted changes) and the DuckDB library version.
+std::string plugin_version_text() {
+  return std::string(DUCKDB_PLUGIN_VERSION_TEXT) + " (commit " +
+         DUCKDB_PLUGIN_COMMIT + ", DuckDB " + duckdb_library_version() + ")";
+}
+
+int show_version(THD *, SHOW_VAR *var, char *buff) {
+  return show_text(var, buff, plugin_version_text());
+}
+
 int show_reader_state(THD *, SHOW_VAR *var, char *buff) {
   return show_text(var, buff, safe_status().state);
 }
@@ -895,6 +912,8 @@ int show_executor_tasks(THD *, SHOW_VAR *var, char *buff) {
 }
 
 SHOW_VAR duckdb_status_variables[] = {
+    {"duckdb_version", reinterpret_cast<char *>(&show_version), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"duckdb_enabled", reinterpret_cast<char *>(&status_enabled), SHOW_BOOL,
      SHOW_SCOPE_GLOBAL},
     {"duckdb_lake_path", status_lake_path, SHOW_CHAR, SHOW_SCOPE_GLOBAL},
@@ -1038,6 +1057,8 @@ void release_privilege() {
 
 int duckdb_init_impl(MYSQL_PLUGIN p) {
   if (init_logging_service_for_plugin(&reg_srv, &log_bi, &log_bs)) return 1;
+  DUCKDB_LOG_INFO("DuckDB secondary engine plugin %s",
+                  plugin_version_text().c_str());
   Executor::register_psi();
   BinlogReader::register_psi();
   register_progress_stages();
@@ -1347,7 +1368,8 @@ mysql_declare_plugin(duckdb){
     &duckdb_storage_engine,
     "duckdb",
     "Marco Tusa",
-    "DuckDB secondary engine",
+    "DuckDB secondary engine " DUCKDB_PLUGIN_VERSION_TEXT
+    " (commit " DUCKDB_PLUGIN_COMMIT ")",
     PLUGIN_LICENSE_GPL,
     duckdb_se::duckdb_init,
     nullptr,

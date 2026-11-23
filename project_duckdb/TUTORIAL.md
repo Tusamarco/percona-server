@@ -1054,6 +1054,7 @@ SHOW GLOBAL STATUS LIKE 'duckdb_applied%';
 | `duckdb_offload_waits` / `duckdb_offload_wait_timeouts` | Waits for the connection's last commit (`duckdb_offload_wait_applied`), and those that reached `duckdb_offload_wait_timeout_ms` (the query ran on InnoDB). | timeouts near 0; growing: the applier is behind |
 | `duckdb_offload_decimal_reruns` | Runs again with fewer decimals (`duckdb_decimal_overflow = ROUND`). | |
 | `duckdb_offload_time_us` | Total time in DuckDB of the queries it ran, in microseconds. Divide by `duckdb_offload_queries` for the average. | grows with offloaded queries |
+| `duckdb_version` | Plugin version, git commit of the build (`-dirty`: uncommitted changes) and DuckDB version. Check it after a rebuild. | `0.1 (commit ..., DuckDB v2.0.0)` |
 | `duckdb_apply_lag_seconds` | How far DuckDB is behind: age of the oldest commit not yet applied. | 0, or below 1-2 s under load |
 | `duckdb_apply_lag_bytes` | The same in binary log bytes, across files. | near 0 |
 | `duckdb_apply_reader_state_code` | Applier state as a number (0 idle ... 5 error, 6 stopped). | 0 to 3; 5 is an alert |

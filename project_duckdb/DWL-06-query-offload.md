@@ -822,6 +822,49 @@ return DOUBLE and `sum` returns NULL.
   refused.
 - Tests: MTR `offload_join_distinct`.
 
+### EXISTS and NOT EXISTS on the same column (2026-11-23, TPC-H Q21)
+
+- `EXISTS (... l2 ... l2.k = l1.k) AND NOT EXISTS (... l3 ... l3.k = l1.k)`
+  was refused as `outer_or_other_table_column:l2.l_orderkey`. MySQL
+  propagates `l1.k = l2.k = l3.k`, turns the NOT EXISTS into a LEFT JOIN
+  with a derived table (`derived_1_3`) and writes its ON with the "best"
+  equal field, `l2.k`: a column of the EXISTS nest, which we print in
+  WHERE, so not visible in FROM.
+- In a FROM join condition, and in an anti-join's condition, a column of
+  another semi-join nest is replaced by an equal outer column
+  (`outer_equal()`): the multiple equality the column belongs to holds for
+  every row that passes WHERE (the semi-join's condition is part of it), so
+  `l1.k` stands for `l2.k`. The members come from the column's own multiple
+  equality and the one across nests MySQL keeps for hash join to undo the
+  same substitution (`item_equal_all_join_nests`). Never a column of the
+  same nest (`l3.k = l3.k`); none available: refused
+  (`condition_across_semijoins`).
+- An anti-join's condition is split in AND parts; a pair of a multiple
+  equality that ties in another nest's column is left out when the
+  equality also holds an outer column (each nest prints its own pair with
+  it).
+- Tests: MTR `offload_exists_pair` (Q21's shape with every case of its
+  logic, without GROUP BY, NOT EXISTS before EXISTS, EXISTS + EXISTS). TPC-H
+  22 of 22.
+
+### Grouped string expressions (2026-11-22)
+
+- `GROUP BY <string expression>` under a PAD SPACE collation (TPC-H Q22:
+  `GROUP BY SUBSTR(c_phone, 1, 2)` under `latin1_bin`) was refused
+  (`group_by_expression`). It is grouped on `rtrim()` of the expression,
+  and where the same expression is shown after grouping (select list,
+  ORDER BY, HAVING) it gets the per-group check of grouped strings
+  (`count(DISTINCT e) > 1` raises the marker; the statement runs first).
+- `latin1` and `ascii` binary PAD SPACE collations (handled with weights for
+  columns) key an expression on the value itself (`string_key`): equality
+  is the bytes without trailing spaces and their order is the code point
+  order, the order of the UTF-8 text in the lake. Other weight collations
+  (`_ci`, `utf8mb4_0900_*`): an expression has no weight column, still
+  refused.
+- Tests: MTR `offload_group_expr` (Q22's shape with real rows, LEFT() under
+  `utf8mb4_bin` and `latin1_bin`, ORDER BY, HAVING, a join; 'ab' / 'ab '
+  in one group refused). TPC-H 21 of 22.
+
 ### FLOAT and DOUBLE (2026-11-18)
 
 - SUM and AVG of FLOAT / DOUBLE: DuckDB adds in parallel in no fixed order;

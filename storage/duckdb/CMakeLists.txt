@@ -55,6 +55,21 @@ MYSQL_ADD_PLUGIN(duckdb
 # state), which declare their server-only parts under MYSQL_SERVER, as the
 # MOCK engine does.
 TARGET_COMPILE_DEFINITIONS(duckdb PRIVATE MYSQL_SERVER)
+
+# The git commit the plugin is built from (duckdb_plugin_version.h), checked
+# at every build: shown in INFORMATION_SCHEMA.PLUGINS, the duckdb_version
+# status variable and the error log. The header changes only with the
+# commit, so an unchanged tree recompiles nothing.
+SET(DUCKDB_VERSION_HEADER ${CMAKE_CURRENT_BINARY_DIR}/duckdb_plugin_version.h)
+ADD_CUSTOM_TARGET(duckdb_plugin_version ALL
+  COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+          -DOUTPUT=${DUCKDB_VERSION_HEADER}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/duckdb_version.cmake
+  BYPRODUCTS ${DUCKDB_VERSION_HEADER}
+  COMMENT "DuckDB plugin: git commit"
+  VERBATIM)
+ADD_DEPENDENCIES(duckdb duckdb_plugin_version)
+TARGET_INCLUDE_DIRECTORIES(duckdb PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 IF(LINUX)
   # We hide only the symbols of the DuckDB libraries. The server's service
   # library (libmysqlservices.a) must stay visible: mysqld binds the plugin

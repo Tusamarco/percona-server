@@ -1,0 +1,54 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# EXISTS and NOT EXISTS correlated on the same column (TPC-H Q21,
+# 2026-11-23): MySQL propagates l1.k = l2.k = l3.k, turns the NOT EXISTS into
+# a LEFT JOIN with a derived table and writes its ON with l2.k, a column of
+# the EXISTS nest we print in WHERE. An equal outer column (l1.k) stands for
+# it. Results as InnoDB.
+--source ../include/have_duckdb.inc
+CREATE TABLE li (ok INT, ln INT, sk INT, rd DATE, cd DATE, PRIMARY KEY (ok, ln)) SECONDARY_ENGINE = duckdb;
+CREATE TABLE su (sk INT PRIMARY KEY, name VARCHAR(20) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+CREATE TABLE od (ok INT PRIMARY KEY, st CHAR(1) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO su VALUES (1, 'S1'), (2, 'S2'), (3, 'S3'), (4, 'S4');
+INSERT INTO od VALUES (10, 'F'), (11, 'F'), (12, 'O'), (13, 'F'), (14, 'F');
+# order 10: suppliers 1 (late), 2 (on time): 1 is the only late one -> counted
+# order 11: suppliers 1 (late), 3 (late): two late -> not counted
+# order 13: supplier 2 alone (late): no other supplier -> not counted
+# order 14: suppliers 4 (late), 2 (on time), 3 (on time) -> 4 counted
+INSERT INTO li VALUES (10, 1, 1, '2024-01-10', '2024-01-05'), (10, 2, 2, '2024-01-03', '2024-01-05'),
+  (11, 1, 1, '2024-02-10', '2024-02-05'), (11, 2, 3, '2024-02-11', '2024-02-05'),
+  (12, 1, 1, '2024-03-10', '2024-03-05'), (12, 2, 2, '2024-03-01', '2024-03-05'),
+  (13, 1, 2, '2024-04-10', '2024-04-05'),
+  (14, 1, 4, '2024-05-10', '2024-05-05'), (14, 2, 2, '2024-05-01', '2024-05-05'), (14, 3, 3, '2024-05-02', '2024-05-05');
+ALTER TABLE li SECONDARY_LOAD;
+ALTER TABLE su SECONDARY_LOAD;
+ALTER TABLE od SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+--echo # Q21's shape
+--let $query= SELECT su.name, COUNT(*) AS numwait FROM su, li l1, od WHERE su.sk = l1.sk AND od.ok = l1.ok AND od.st = 'F' AND l1.rd > l1.cd AND EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.sk <> l1.sk AND l3.rd > l3.cd) GROUP BY su.name ORDER BY numwait DESC, su.name
+--source ../include/duckdb_compare.inc
+--echo # Without GROUP BY, and the rows themselves
+--let $query= SELECT l1.ok, l1.sk FROM li l1 WHERE EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.sk <> l1.sk AND l3.rd > l3.cd) ORDER BY l1.ok, l1.sk
+--source ../include/duckdb_compare.inc
+--echo # NOT EXISTS first, EXISTS second; and EXISTS + EXISTS
+--let $query= SELECT l1.ok, l1.ln FROM li l1 WHERE NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.ln > l1.ln) AND EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.ln < l1.ln) ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+--let $query= SELECT l1.ok, COUNT(*) FROM li l1 WHERE EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND EXISTS (SELECT * FROM od WHERE od.ok = l1.ok AND od.st = 'F') GROUP BY l1.ok ORDER BY 1
+--source ../include/duckdb_compare.inc
+
+DROP TABLE li, su, od;
+--source ../include/cleanup.inc

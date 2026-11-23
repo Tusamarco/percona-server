@@ -64,10 +64,9 @@ Got one of the listed errors
 SET SESSION use_secondary_engine = FORCED;
 SELECT id, DATE_ADD(ts, INTERVAL '1:30' HOUR_MINUTE) FROM fx ORDER BY id;
 Got one of the listed errors
+# An expression under latin1_bin (2026-11-22): compared and ordered on its value
 # SELECT id FROM fx WHERE SUBSTR(sl, 1, 2) > 'h' ORDER BY id
-SET SESSION use_secondary_engine = FORCED;
-SELECT id FROM fx WHERE SUBSTR(sl, 1, 2) > 'h' ORDER BY id;
-Got one of the listed errors
+# SELECT id, SUBSTR(sl, 1, 3) AS p FROM fx ORDER BY p, id
 # SELECT LEFT(s, 1) AS c, COUNT(*) FROM fx GROUP BY c ORDER BY c
 SET SESSION use_secondary_engine = FORCED;
 SELECT LEFT(s, 1) AS c, COUNT(*) FROM fx GROUP BY c ORDER BY c;

@@ -444,6 +444,11 @@ class Generator {
   struct Conj {
     std::string sql;
     table_map tables;
+    // A pair of a multiple equality (equality propagation): implied by the
+    // other pairs, so it may be left out where one of its columns is not
+    // visible (another semi-join's table).
+    bool implied{false};
+    Item_multi_eq *eq{nullptr};  // the multiple equality of an implied pair
   };
   bool table_ref(Table_ref *tr, std::string *out);
   bool from_list(mem_root_deque<Table_ref *> &list, bool under_outer,
@@ -489,6 +494,9 @@ class Generator {
     // aggregate shown as the value of the row with the smallest primary
     // key, the row InnoDB meets first (single table only).
     std::vector<const Field *> group_pad;
+    // Grouped string expressions under PAD SPACE (grouped on rtrim()):
+    // shown with the per-group check (grouped_expression()).
+    std::vector<Item *> group_pad_exprs;
     std::set<const Field *> grouped;  // GROUP BY columns
     struct Semi {
       Table_ref *nest;
@@ -502,6 +510,12 @@ class Generator {
 
   THD *m_thd;
   Item_field *source_column(Item_field *f);
+  // While an anti-join's condition is printed: the tables of the other
+  // semi-join nests (not visible there) and of this nest.
+  table_map m_anti_others{0};
+  table_map m_anti_mine{0};
+  Item_field *outer_equal(Item_field *f);
+  bool grouped_expression(Item *item, std::string *out);
   std::string *m_reason;
   bool m_full{false};
   std::map<const TABLE *, TableInfo> m_info;
@@ -1048,6 +1062,19 @@ bool Generator::string_key(Item *item, const CHARSET_INFO *cs, bool ordering,
       return false;
     }
     case StrMode::WEIGHT: {
+      // An expression (no weight column) under a binary PAD SPACE collation
+      // of latin1 or ascii: equality is the bytes without trailing spaces,
+      // and the order of the bytes is the order of the code points, which
+      // is the order of the UTF-8 text in the lake (2026-11-22, TPC-H Q22).
+      if (item->real_item()->type() != Item::FIELD_ITEM &&
+          (cs->state & MY_CS_BINSORT) != 0 && cs->pad_attribute != NO_PAD &&
+          (strcmp(cs->csname, "latin1") == 0 ||
+           strcmp(cs->csname, "ascii") == 0)) {
+        std::string e;
+        if (expr(item, &e)) return true;
+        *out = ordering ? pad_sort_key(e, max_bytes) : pad_equal_key(e);
+        return false;
+      }
       if (weight_expr(item, cs, out)) return true;
       if (ordering && cs->pad_attribute != NO_PAD) {
         const size_t chars = max_bytes / std::max<uint>(cs->mbmaxlen, 1) + 1;
@@ -1142,6 +1169,31 @@ Item_field *Generator::source_column(Item_field *f) {
   }
   if (found == nullptr) return nullptr;
   return new (m_thd->mem_root) Item_field(found);
+}
+
+// TPC-H Q21: EXISTS (... l2 ... l2.k = l1.k) AND NOT EXISTS (... l3 ...
+// l3.k = l1.k). The optimizer propagates l1.k = l2.k = l3.k and rewrites the
+// anti-join's condition with the "best" equal field: l3.k = l2.k, a column
+// of the other nest, not visible in our NOT EXISTS. That multiple equality
+// holds for every row that passes WHERE (the semi-join's condition is part
+// of it), so an equal column of the outer tables can stand for it. The
+// Item_field keeps its multiple equalities (the one of its nest, and the
+// one across nests MySQL keeps for hash join to undo this same
+// substitution). Never a column of this nest (l3.k = l3.k) or of another
+// nest; nullptr when there is no outer one.
+Item_field *Generator::outer_equal(Item_field *f) {
+  const table_map hidden = m_anti_others | m_anti_mine;
+  for (Item_multi_eq *eq : {f->multi_equality(), f->item_equal_all_join_nests}) {
+    if (eq == nullptr) continue;
+    for (Item_field &m : eq->get_fields()) {
+      if (m.field == nullptr || (m.used_tables() & hidden) != 0) continue;
+      const Block *owner = m_block;
+      while (owner != nullptr && owner->tables.count(m.field->table) == 0)
+        owner = owner->parent;
+      if (owner != nullptr && comparable(f, &m)) return &m;
+    }
+  }
+  return nullptr;
 }
 
 bool Generator::aggregate(Item_sum *s, std::string *out) {
@@ -2014,8 +2066,32 @@ bool Generator::function(Item_func *fn, std::string *out) {
   return refuse("unsupported_function:" + name);
 }
 
+// A grouped PAD SPACE string expression shown after grouping: the group
+// holds values equal under the collation ('13' and '13 '); MySQL shows the
+// first row's. As for a grouped column in a join (grouped_value()), we
+// check per group that only one stored value is present: the statement
+// runs first and a group with two becomes a refusal.
+bool Generator::grouped_expression(Item *item, std::string *out) {
+  m_block->agg_depth++;
+  struct Leave {
+    int &d;
+    ~Leave() { d--; }
+  } leave{m_block->agg_depth};
+  std::string e;
+  if (expr(item, &e)) return true;
+  m_grouped_check = true;
+  *out = "CASE WHEN count(DISTINCT " + e + ") > 1 THEN error('" +
+         kGroupedAmbiguous + "') ELSE any_value(" + e + ") END";
+  return false;
+}
+
 bool Generator::expr(Item *item, std::string *out) {
   item = item->real_item();
+  if (m_block->post_group && m_block->agg_depth == 0 &&
+      item->type() != Item::FIELD_ITEM) {
+    for (Item *g : m_block->group_pad_exprs)
+      if (item == g || item->eq(g)) return grouped_expression(item, out);
+  }
   switch (item->type()) {
     case Item::SUBQUERY_ITEM:
       return subquery(down_cast<Item_subselect *>(item), out);
@@ -2027,6 +2103,15 @@ bool Generator::expr(Item *item, std::string *out) {
     }
     case Item::FIELD_ITEM: {
       auto *f = down_cast<Item_field *>(item);
+      // In an anti-join's condition, a column of another semi-join nest
+      // (MySQL's best-equal-field substitution, TPC-H Q21): an equal outer
+      // column instead (outer_equal()).
+      if (m_anti_others != 0 && f->field != nullptr &&
+          (f->used_tables() & m_anti_others) != 0) {
+        Item_field *sub = outer_equal(f);
+        if (sub == nullptr) return refuse("condition_across_semijoins");
+        return expr(sub, out);
+      }
       // A column of this block or, in a subquery, of an enclosing block (a
       // correlated reference: aliases are unique in the statement).
       const Block *owner = m_block;
@@ -2296,6 +2381,12 @@ bool Generator::table_ref(Table_ref *tr, std::string *out) {
 bool Generator::from_list(mem_root_deque<Table_ref *> &list, bool under_outer,
                           bool in_semi, std::string *out) {
   std::string from;
+  // The tables of this list's semi- and anti-join nests (printed as EXISTS
+  // / NOT EXISTS in WHERE, not visible in FROM).
+  table_map semi_all = 0;
+  if (!in_semi)
+    for (Table_ref *e : list)
+      if (e->is_sj_or_aj_nest()) semi_all |= e->nested_join->used_tables;
   for (auto it = list.rbegin(); it != list.rend(); ++it) {
     Table_ref *e = *it;
     if (e->is_sj_or_aj_nest()) {
@@ -2321,7 +2412,24 @@ bool Generator::from_list(mem_root_deque<Table_ref *> &list, bool under_outer,
       return true;
     }
     std::string on;
-    if (e->join_cond() != nullptr && expr(e->join_cond(), &on)) return true;
+    if (e->join_cond() != nullptr) {
+      // A join condition may name a column of a semi-join nest of this
+      // block (TPC-H Q21: MySQL turns NOT EXISTS into LEFT JOIN derived ON
+      // derived.k = l2.k, l2 in the EXISTS we print in WHERE, not visible
+      // here): an equal outer column stands for it (outer_equal()).
+      const table_map saved_others = m_anti_others;
+      const table_map saved_mine = m_anti_mine;
+      if (semi_all != 0) {
+        m_anti_others = semi_all;
+        m_anti_mine = e->nested_join != nullptr
+                          ? e->nested_join->used_tables
+                          : (e->table != nullptr ? e->map() : 0);
+      }
+      const bool failed = expr(e->join_cond(), &on);
+      m_anti_others = saved_others;
+      m_anti_mine = saved_mine;
+      if (failed) return true;
+    }
     if (from.empty()) {
       if (e->outer_join || !on.empty())
         return refuse("join_condition_on_first_table");
@@ -2410,7 +2518,8 @@ bool Generator::multi_eq(Item_multi_eq *eq, table_map avoid,
     std::string a;
     if (print(fields[i], &a)) return true;
     out->push_back({"(" + f0 + " = " + a + ")",
-                    t0 | (fields[i]->used_tables() & ~PSEUDO_TABLE_BITS)});
+                    t0 | (fields[i]->used_tables() & ~PSEUDO_TABLE_BITS),
+                    true, eq});
   }
   if (Item *c = eq->const_arg(); c != nullptr) {
     std::string cs;
@@ -2485,12 +2594,41 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
   for (size_t i = 0; i < m_block->semi.size(); i++) {
     const Block::Semi &s = m_block->semi[i];
     std::vector<std::string> conds = semi_conds[i];
-    if (s.anti) {
-      // An anti-join keeps its condition, as a LEFT JOIN's ON.
-      std::string c;
-      if (s.nest->join_cond() != nullptr && expr(s.nest->join_cond(), &c))
-        return true;
-      if (!c.empty()) conds.push_back(c);
+    if (s.anti && s.nest->join_cond() != nullptr) {
+      // An anti-join keeps its condition, as a LEFT JOIN's ON, split in AND
+      // parts. MySQL's equality propagation may put a column of another
+      // semi-join nest into it (TPC-H Q21: l1.k = l2.k = l3.k, l2 in the
+      // EXISTS, l3 in this NOT EXISTS), and that table is not visible in
+      // this subquery. We anchor each multiple equality on a visible column
+      // (outer or ours); a pair that still ties in another nest's column
+      // only repeats an equality that nest's own EXISTS enforces, and is
+      // left out. Any other condition on another nest's table: refused.
+      table_map others = 0;
+      for (size_t j = 0; j < m_block->semi.size(); j++)
+        if (j != i) others |= m_block->semi[j].nest->nested_join->used_tables;
+      const table_map mine = s.nest->nested_join->used_tables;
+      std::vector<Conj> parts;
+      m_anti_others = others;
+      m_anti_mine = mine;
+      const bool failed = conjuncts(s.nest->join_cond(), others, &parts);
+      m_anti_others = 0;
+      m_anti_mine = 0;
+      if (failed) return true;
+      for (const Conj &c : parts) {
+        if ((c.tables & others) != 0) {
+          // Left out only when the equality also holds an outer column:
+          // then this nest's pair with it is printed here, and the other
+          // nest's pair with it in that nest's EXISTS.
+          bool outer_member = false;
+          if (c.implied && c.eq != nullptr)
+            for (Item_field &f : c.eq->get_fields())
+              outer_member = outer_member ||
+                             (f.used_tables() & (others | mine)) == 0;
+          if (outer_member) continue;
+          return refuse("condition_across_semijoins");
+        }
+        conds.push_back(c.sql);
+      }
     }
     std::string body = "SELECT 1 FROM " + s.from;
     for (size_t j = 0; j < conds.size(); j++)
@@ -2511,9 +2649,24 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
                          str_mode(g) == StrMode::WEIGHT)) {
       // Grouped on the equality key (rtrim / weight); the value shown is
       // decided by grouped_value().
-      if (g->type() != Item::FIELD_ITEM)
-        return refuse(std::string("group_by_expression (") +
-                      g->collation.collation->m_coll_name + ")");
+      if (g->type() != Item::FIELD_ITEM) {
+        // An expression (Q22: SUBSTR(c_phone, 1, 2)) has no weight column:
+        // only PAD SPACE, grouped on rtrim() (2026-11-22).
+        // Also a binary PAD SPACE collation of latin1 / ascii (weights for
+        // columns; string_key() keys an expression on rtrim()).
+        const CHARSET_INFO *gcs = g->collation.collation;
+        const bool binary_pad = (gcs->state & MY_CS_BINSORT) != 0 &&
+                                gcs->pad_attribute != NO_PAD &&
+                                (strcmp(gcs->csname, "latin1") == 0 ||
+                                 strcmp(gcs->csname, "ascii") == 0);
+        if (str_mode(g) != StrMode::PAD && !binary_pad)
+          return refuse(std::string("group_by_expression (") +
+                        gcs->m_coll_name + ")");
+        if (string_key(g, gcs, false, g->max_length, &e)) return true;
+        m_block->group_pad_exprs.push_back(g);
+        group += (group.empty() ? "" : ", ") + e;
+        continue;
+      }
       m_block->group_pad.push_back(down_cast<Item_field *>(g)->field);
       if (string_key(g, g->collation.collation, false, g->max_length, &e))
         return true;

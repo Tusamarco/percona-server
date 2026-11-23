@@ -29,7 +29,7 @@ reason.
 
 ## Results (2026-11-17, debug build)
 
-**7 of 22 offloaded with results identical to InnoDB** (8 after the DECIMAL change of the same day, Q11; 12 after LIKE on binary collations: Q2, Q13, Q14, Q20; 16 after grouped CHAR in joins: Q4, Q5, Q10, Q12; 19 after EXTRACT: Q7, Q8, Q9). None gave a wrong
+**22 of 22 offloaded with results identical to InnoDB on 2026-11-23** (Q16 after the per-group check of grouped strings, Q22 after grouped string expressions, Q21 after the equal outer column in join conditions). History: **7 of 22 offloaded with results identical to InnoDB** (8 after the DECIMAL change of the same day, Q11; 12 after LIKE on binary collations: Q2, Q13, Q14, Q20; 16 after grouped CHAR in joins: Q4, Q5, Q10, Q12; 19 after EXTRACT: Q7, Q8, Q9). None gave a wrong
 result: the other 15 were refused, and with `use_secondary_engine = ON` run
 on InnoDB.
 
@@ -50,13 +50,13 @@ on InnoDB.
 | Q13 | identical, offloaded (since 2026-11-17, LIKE on binary collations) | |
 | Q14 | identical, offloaded (since 2026-11-17) | |
 | Q15 | identical, offloaded (view) | |
-| Q16 | to check again: grouped strings in joins are checked per group since 2026-11-22 (was refused `grouped_string_value_in_join`) | grouped VARCHAR (`p_type`) in a join |
+| Q16 | identical, offloaded (since 2026-11-22, grouped strings in joins checked per group) | |
 | Q17 | identical, offloaded | |
 | Q18 | identical, offloaded | |
 | Q19 | identical, offloaded | |
 | Q20 | identical, offloaded (since 2026-11-17, LIKE on binary collations) | |
-| Q21 | refused `outer_or_other_table_column:l2.l_orderkey` | EXISTS and NOT EXISTS on the same table: an equality MySQL propagated across the two nests |
-| Q22 | refused `group_by_expression (latin1_bin)` (SUBSTR done) | grouping by a string expression under PAD SPACE: data check (next step) |
+| Q21 | identical, offloaded (since 2026-11-23: in a join condition, a column of the EXISTS nest replaced by an equal outer column) | |
+| Q22 | identical, offloaded (since 2026-11-22, grouped string expressions under PAD SPACE checked per group; real rows in MTR `offload_group_expr`, the quick check's data gives Q22 no rows) | |
 
 ## What a HammerDB run needs
 

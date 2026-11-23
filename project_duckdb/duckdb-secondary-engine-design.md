@@ -497,13 +497,14 @@ not a read). Last update: 2026-11-17 (function review, TPC-H 19/22,
 | Derived tables, views, non-recursive CTEs | done | 6c-1 |
 | Recursive CTEs | missing | |
 | UNION / INTERSECT / EXCEPT, DISTINCT and ALL, nested | partial | DISTINCT forms need binary or `_0900_bin` strings; a YEAR column refused |
-| Subqueries: scalar, IN, NOT IN, EXISTS, NOT EXISTS, ANY / ALL, correlated | partial | 6c-3; IN on `_bin` / `_ci` strings; a correlated scalar subquery without aggregate; equalities propagated between EXISTS and NOT EXISTS nests (TPC-H Q21) |
+| Subqueries: scalar, IN, NOT IN, EXISTS, NOT EXISTS, ANY / ALL, correlated | partial | 6c-3; IN on `_bin` / `_ci` strings; a correlated scalar subquery without aggregate; equalities propagated between EXISTS and NOT EXISTS nests (TPC-H Q21): done 2026-11-23 |
 | Row value constructors `(a, b) IN (...)`, `(a, b) = (...)` | missing | |
 | GROUP BY ROLLUP, CUBE, GROUPING SETS, GROUPING() | missing | refused `rollup` |
 | Window functions (ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, aggregates OVER, frames) | missing | refused `window` |
 | TABLESAMPLE | missing | |
 | VALUES / TABLE statements, JSON_TABLE | missing | |
 | A grouped string shown in a join | done | the table's primary key in GROUP BY, CHAR under a binary collation (2026-11-17); otherwise each result group is checked in the query to hold one stored value, the statement runs first and an ambiguous group is a refusal (2026-11-22, MTR `offload_join_distinct`) |
+| GROUP BY a string expression | partial | under PAD SPACE (binary or `utf8mb4_bin`, latin1 / ascii binary): grouped on rtrim(), shown value checked per group (2026-11-22, TPC-H Q22, MTR `offload_group_expr`); under `_ci` / weight collations refused (no weight column for an expression) |
 
 ### Predicates
 
@@ -608,7 +609,7 @@ reference instance; the SQL coverage tracker is updated).
    in one case), and string expressions grouped under PAD SPACE (TPC-H
    Q22, `GROUP BY substr(...)`). About 1-2 days. An opt-in "any value" mode
    (`duckdb_grouped_value = EXACT | ANY`) stays a possible later option.
-3. **TPC-H Q21**: equalities propagated between EXISTS and NOT EXISTS
+3. **TPC-H Q21**: done 2026-11-23 (22 of 22). Equalities propagated between EXISTS and NOT EXISTS
    nests. SUBSTR is done (review). Expected with 1-3: 22 of 22.
 4. **HammerDB TPROC-H on the release build**, scale factor 1 then 10: build
    with HammerDB (`autocommit = 1` in its MySQL OLAP script, otherwise MySQL

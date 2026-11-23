@@ -34,7 +34,6 @@ SELECT id, CONCAT(f) FROM fx ORDER BY id
 -- interval units with several parts
 SELECT id, DATE_ADD(ts, INTERVAL '1:30' HOUR_MINUTE) FROM fx ORDER BY id
 -- ordering by an expression of a latin1 binary collation needs weights
-SELECT id FROM fx WHERE SUBSTR(sl, 1, 2) > 'h' ORDER BY id
 -- grouping by a string expression under PAD SPACE: the value shown is
 -- ambiguous ('a' or 'a ')
 SELECT LEFT(s, 1) AS c, COUNT(*) FROM fx GROUP BY c ORDER BY c

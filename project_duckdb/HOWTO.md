@@ -1102,6 +1102,7 @@ all), `innodb_flush_log_at_trx_commit=1` (recommended), `binlog_encryption=OFF`,
 | `duckdb_offload_waits` / `duckdb_offload_wait_timeouts` | Waits for the connection's last commit, and those that timed out (the query ran on InnoDB). |
 | `duckdb_offload_decimal_reruns` | Runs again with fewer decimals under `duckdb_decimal_overflow = ROUND`. |
 | `duckdb_offload_time_us` | Total time in DuckDB of the queries counted in `duckdb_offload_queries` (microseconds); divided by them, the average offloaded query time. |
+| `duckdb_version` | Plugin version, the git commit it was built from (`-dirty`: with uncommitted changes) and the DuckDB library version; also in `INFORMATION_SCHEMA.PLUGINS.PLUGIN_DESCRIPTION` and the error log at startup. |
 | `duckdb_apply_lag_seconds` | Age of the oldest transaction committed in MySQL and not yet in DuckDB (0 when everything is applied). |
 | `duckdb_apply_lag_bytes` | Binary log between the applied position and its end, across files. |
 | `duckdb_apply_reader_state_code` | The applier state as a number: 0 idle, 1 reading, 2 waiting to commit, 3 committing, 4 refreshing, 5 error, 6 stopped (for alerts). |

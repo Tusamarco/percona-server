@@ -98,8 +98,11 @@ SET NAMES utf8mb4;
 --source ../include/duckdb_refused.inc
 --let $query= SELECT id, DATE_ADD(ts, INTERVAL '1:30' HOUR_MINUTE) FROM fx ORDER BY id
 --source ../include/duckdb_refused.inc
+--echo # An expression under latin1_bin (2026-11-22): compared and ordered on its value
 --let $query= SELECT id FROM fx WHERE SUBSTR(sl, 1, 2) > 'h' ORDER BY id
---source ../include/duckdb_refused.inc
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, SUBSTR(sl, 1, 3) AS p FROM fx ORDER BY p, id
+--source ../include/duckdb_compare.inc
 --let $query= SELECT LEFT(s, 1) AS c, COUNT(*) FROM fx GROUP BY c ORDER BY c
 --source ../include/duckdb_refused.inc
 
