@@ -24,6 +24,7 @@
 #include "storage/duckdb/duckdb_offload.h"
 
 #include <chrono>
+#include <cmath>
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
@@ -252,6 +253,19 @@ constexpr const char *kDuckDBMultipleRows =
 
 bool is_string(const Item *item) {
   return item->result_type() == STRING_RESULT && !item->is_temporal();
+}
+
+// Constant while the statement runs: a constant of the statement, or a
+// prepared statement parameter, a stored program variable, a user variable
+// (T1): their value is printed at each execution (value_literal()).
+bool is_constant(const Item *item) {
+  if (item->const_item()) return true;
+  const Item *r = const_cast<Item *>(item)->real_item();
+  if (r->type() == Item::PARAM_ITEM || r->type() == Item::ROUTINE_FIELD_ITEM)
+    return true;
+  return r->type() == Item::FUNC_ITEM &&
+         down_cast<const Item_func *>(r)->functype() ==
+             Item_func::GUSERVAR_FUNC;
 }
 
 // Columns whose lake value is not what MySQL uses in every context: TIME
@@ -518,6 +532,7 @@ class Generator {
 
   THD *m_thd;
   Item_field *source_column(Item_field *f);
+  bool value_literal(Item *item, std::string *out);
   // While an anti-join's condition is printed: the tables of the other
   // semi-join nests (not visible there) and of this nest.
   table_map m_anti_others{0};
@@ -578,6 +593,85 @@ bool Generator::time_literal(Item *item, std::string *out) {
   return false;
 }
 
+// The value of an item that is constant while the statement runs but is not
+// a literal (T1, 2026-11-23): a prepared statement's parameter (?), a stored
+// program's variable or parameter, a user variable (@x). The SQL is
+// generated again at every EXECUTE / CALL, so each run prints its own
+// values. Typed by the value's kind, as MySQL compares it: integers as
+// integers, DECIMAL exactly (more than 38 digits refused), DOUBLE as DOUBLE,
+// strings converted to UTF-8 (their collation is the item's, as for a
+// string literal).
+bool Generator::value_literal(Item *item, std::string *out) {
+  switch (item->result_type()) {
+    case INT_RESULT: {
+      const longlong v = item->val_int();
+      if (item->null_value) {
+        *out = "NULL";
+        return false;
+      }
+      char buf[32];
+      if (item->unsigned_flag)
+        snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(v));
+      else
+        snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(v));
+      *out = buf;
+      return false;
+    }
+    case REAL_RESULT: {
+      const double d = item->val_real();
+      if (item->null_value) {
+        *out = "NULL";
+        return false;
+      }
+      if (!std::isfinite(d)) return refuse("value_not_finite");
+      char buf[64];
+      snprintf(buf, sizeof(buf), "%.17g", d);
+      *out = std::string("CAST(") + buf + " AS DOUBLE)";
+      return false;
+    }
+    case DECIMAL_RESULT: {
+      my_decimal dec;
+      const my_decimal *d = item->val_decimal(&dec);
+      if (item->null_value || d == nullptr) {
+        *out = "NULL";
+        return false;
+      }
+      if (my_decimal_length_to_precision(d->intg + d->frac, d->frac, false) >
+          38)
+        return refuse("decimal_value_over_38_digits");
+      String text;
+      if (my_decimal2string(E_DEC_FATAL_ERROR, d, &text) != E_DEC_OK)
+        return refuse("decimal_value");
+      *out = std::string(text.ptr(), text.length());
+      return false;
+    }
+    case STRING_RESULT: {
+      String buf;
+      String *v = item->val_str(&buf);
+      if (item->null_value || v == nullptr) {
+        *out = "NULL";
+        return false;
+      }
+      String utf8;
+      unsigned errors = 0;
+      utf8.copy(v->ptr(), v->length(), v->charset(), &my_charset_utf8mb4_bin,
+                &errors);
+      if (errors != 0) return refuse("value_charset");
+      std::string text = "'";
+      for (size_t i = 0; i < utf8.length(); i++) {
+        const char c = utf8.ptr()[i];
+        if (c == '\'') text += '\'';
+        if (c == '\0') return refuse("value_nul");
+        text += c;
+      }
+      *out = text + "'";
+      return false;
+    }
+    default:
+      return refuse("unsupported_value_type");
+  }
+}
+
 bool Generator::literal(Item *item, std::string *out) {
   if (item->is_null()) {
     *out = "NULL";
@@ -627,6 +721,9 @@ bool Generator::literal(Item *item, std::string *out) {
       *out = text + "'";
       return false;
     }
+    case Item::PARAM_ITEM:
+    case Item::ROUTINE_FIELD_ITEM:
+      return value_literal(item, out);
     default:
       return refuse(std::string("unsupported_literal:") +
                     std::to_string(static_cast<int>(item->type())));
@@ -649,7 +746,7 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
   size_t max_bytes = 0;
   for (unsigned i = from; i < to; i++) {
     Item *a = args[i]->real_item();
-    if (a->const_item()) {
+    if (is_constant(a)) {
       if (is_string(a))
         max_bytes = std::max<size_t>(max_bytes, a->max_length);
       else if (!a->is_temporal() && !a->is_null())
@@ -686,7 +783,7 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
     bool all_enum = true;
     for (unsigned i = from; i < to; i++) {
       Item *a = args[i]->real_item();
-      if (a->const_item()) {
+      if (is_constant(a)) {
         all_enum = all_enum && !is_string(a);
         continue;
       }
@@ -697,7 +794,7 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
       for (unsigned i = from; i < to; i++) {
         Item *a = args[i]->real_item();
         std::string s;
-        if (a->const_item()) {
+        if (is_constant(a)) {
           if (a->is_null()) {
             s = "NULL";
           } else {
@@ -725,7 +822,7 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
   if (strings) {
     cs = fn->compare_collation();
     for (unsigned i = from; i < to && cs == nullptr; i++)
-      if (is_string(args[i]->real_item()) && !args[i]->real_item()->const_item())
+      if (is_string(args[i]->real_item()) && !is_constant(args[i]->real_item()))
         cs = args[i]->real_item()->collation.collation;
     if (cs == nullptr || str_mode_cs(cs) == StrMode::REFUSE)
       return refuse(std::string("collation:comparison (") +
@@ -738,11 +835,11 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
   for (unsigned i = from; i < to && !failed; i++) {
     Item *a = args[i]->real_item();
     std::string s;
-    if (time && a->const_item()) {
+    if (time && is_constant(a)) {
       failed = a->is_null() ? literal(a, &s) : time_literal(a, &s);
-    } else if (m_temporal != MYSQL_TYPE_NULL && a->const_item()) {
+    } else if (m_temporal != MYSQL_TYPE_NULL && is_constant(a)) {
       failed = a->is_null() ? literal(a, &s) : typed_literal(a, m_temporal, &s);
-    } else if (numbers && a->const_item() && is_string(a)) {
+    } else if (numbers && is_constant(a) && is_string(a)) {
       // A number compared with a string constant: MySQL compares as DOUBLE.
       char buf[64];
       const double v = a->val_real();
@@ -883,7 +980,7 @@ bool Generator::numeric(Item *item, std::string *out) {
   }
   if (a->is_temporal() || a->result_type() == STRING_RESULT)
     return refuse("arithmetic_on_non_number");
-  if (a->result_type() == INT_RESULT && a->unsigned_flag && !a->const_item())
+  if (a->result_type() == INT_RESULT && a->unsigned_flag && !is_constant(a))
     return refuse("arithmetic_on_unsigned");
   std::string e;
   if (expr(a, &e)) return true;
@@ -934,7 +1031,7 @@ bool Generator::unsigned_arith(Item *left, Item *right, char op,
   Item *ops[2] = {left->real_item(), right->real_item()};
   for (int i = 0; i < 2; i++) {
     Item *a = ops[i];
-    if (a->const_item()) {
+    if (is_constant(a)) {
       if (a->type() != Item::INT_ITEM || a->is_null())
         return refuse("arithmetic_on_unsigned");
       const longlong v = a->val_int();
@@ -962,7 +1059,7 @@ bool Generator::unsigned_arith(Item *left, Item *right, char op,
 // TIMESTAMP (UTC in DuckDB) and strings are refused.
 bool Generator::temporal_arg(Item *item, std::string *out) {
   Item *a = item->real_item();
-  if (!is_date_or_datetime(a->data_type()) || a->const_item())
+  if (!is_date_or_datetime(a->data_type()) || is_constant(a))
     return refuse("date_function_argument");
   return expr(a, out);
 }
@@ -1010,7 +1107,7 @@ bool Generator::weight_expr(Item *item, const CHARSET_INFO *cs,
   if (item->type() == Item::CACHE_ITEM &&
       down_cast<Item_cache *>(item)->get_example() != nullptr)
     item = down_cast<Item_cache *>(item)->get_example()->real_item();
-  if (item->const_item()) {
+  if (is_constant(item)) {
     if (item->is_null()) {
       *out = "NULL";
       return false;
@@ -1225,7 +1322,7 @@ bool Generator::aggregate(Item_sum *s, std::string *out) {
   std::string a;
   switch (f) {
     case Item_sum::COUNT_FUNC:
-      if (arg->const_item() && !arg->is_null()) {
+      if (is_constant(arg) && !arg->is_null()) {
         *out = "count(*)";
         return false;
       }
@@ -1374,6 +1471,13 @@ bool Generator::function(Item_func *fn, std::string *out) {
   Item **args = fn->arguments();
   const unsigned n = fn->argument_count();
   const std::string name = fn->func_name();
+  // A user variable (@x): its value, constant in a statement that does not
+  // assign it (@x := ... is not translated).
+  if (fn->functype() == Item_func::GUSERVAR_FUNC) {
+    if (m_temporal != MYSQL_TYPE_NULL && !fn->is_null())
+      return typed_literal(fn, m_temporal, out);
+    return value_literal(fn, out);
+  }
   if (special_args(fn)) return true;
   auto compare = [&](const char *op) {
     std::vector<std::string> ops;
@@ -1431,7 +1535,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
     }
     case Item_func::IN_FUNC: {
       for (unsigned i = 1; i < n; i++)
-        if (!args[i]->const_item()) return refuse("in_list_not_constant");
+        if (!is_constant(args[i])) return refuse("in_list_not_constant");
       std::vector<std::string> ops;
       if (operands(fn, false, 0, n, &ops)) return true;
       std::string list;
@@ -1465,7 +1569,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
     }
     case Item_func::LIKE_FUNC: {
       Item *a = args[0]->real_item();
-      if (!is_string(a) || a->const_item()) return refuse("like_argument");
+      if (!is_string(a) || is_constant(a)) return refuse("like_argument");
       if (a->collation.collation == &my_charset_bin)
         return refuse("like_on_binary_string");
       // LIKE compares characters, not weights, and never pads ('a ' LIKE
@@ -1480,7 +1584,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
       if (!binary_like && str_mode(a) != StrMode::RAW &&
           str_mode(a) != StrMode::PAD)
         return refuse_collation(a);
-      if (!args[1]->const_item() || !is_string(args[1]->real_item()))
+      if (!is_constant(args[1]) || !is_string(args[1]->real_item()))
         return refuse("like_pattern_not_constant");
       // Trailing spaces are significant in LIKE, PAD SPACE or not.
       std::string s, p;
@@ -1489,7 +1593,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
       // (none under NO_BACKSLASH_ESCAPES), Item_func_like::eval_escape_clause.
       // DuckDB's LIKE has no default escape: we always name it.
       auto *like = down_cast<Item_func_like *>(fn);
-      if (n > 2 && !args[2]->const_item())
+      if (n > 2 && !is_constant(args[2]))
         return refuse("like_escape_not_constant");
       if (!like->escape_is_evaluated()) return refuse("like_escape");
       const int esc = like->escape();
@@ -1563,7 +1667,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
         *out = "round(" + a + ")";
         return false;
       }
-      if (!args[1]->const_item() || args[1]->result_type() != INT_RESULT)
+      if (!is_constant(args[1]) || args[1]->result_type() != INT_RESULT)
         return refuse("round_digits_not_constant");
       *out = "round(" + a + ", " + std::to_string(args[1]->val_int()) + ")";
       return false;
@@ -1810,7 +1914,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
   if (name == "to_days") {
     // Day number from year 0 (DATEDIFF is TO_DAYS(a) - TO_DAYS(b)); of a
     // constant: MySQL's own value.
-    if (args[0]->const_item()) {
+    if (is_constant(args[0])) {
       const longlong v = fn->val_int();
       *out = fn->null_value ? "NULL" : "CAST(" + std::to_string(v) + " AS BIGINT)";
       return false;
@@ -1848,7 +1952,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
     // Exact numbers only, constant digits.
     if (args[0]->result_type() == REAL_RESULT)
       return refuse("truncate_of_double");
-    if (!args[1]->const_item() || args[1]->result_type() != INT_RESULT)
+    if (!is_constant(args[1]) || args[1]->result_type() != INT_RESULT)
       return refuse("truncate_digits_not_constant");
     std::string a;
     if (numeric(args[0], &a)) return true;
@@ -1979,7 +2083,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
         e = "CAST(" + e + " AS VARCHAR)";
       } else if (a->data_type() == MYSQL_TYPE_DATE ||
                  (a->data_type() == MYSQL_TYPE_DATETIME && a->decimals == 0)) {
-        if (a->const_item()) return refuse("concat_argument");
+        if (is_constant(a)) return refuse("concat_argument");
         if (expr(a, &e)) return true;
         e = "CAST(" + e + " AS VARCHAR)";
       } else {
@@ -2004,7 +2108,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
     std::string a, r;
     if (text_arg(0, &a)) return true;
     if (n == 2) {
-      if (!args[1]->const_item() || args[1]->is_null())
+      if (!is_constant(args[1]) || args[1]->is_null())
         return refuse("trim_string");
       String buf;
       String *rs = args[1]->val_str(&buf);
@@ -2048,7 +2152,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
     // argument binary (a constant takes the column's collation).
     for (unsigned i = 0; i < 2; i++) {
       Item *a = args[i]->real_item();
-      if (!a->const_item() && (a->collation.collation->state & MY_CS_BINSORT) == 0)
+      if (!is_constant(a) && (a->collation.collation->state & MY_CS_BINSORT) == 0)
         return refuse_collation(a);
     }
     // The parser builds LOCATE(substr, str) with str first, as INSTR.
@@ -2177,6 +2281,8 @@ bool Generator::expr(Item *item, std::string *out) {
       *out = col;
       return false;
     }
+    case Item::PARAM_ITEM:
+    case Item::ROUTINE_FIELD_ITEM:
     case Item::INT_ITEM:
     case Item::DECIMAL_ITEM:
     case Item::REAL_ITEM:
@@ -2821,11 +2927,11 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
   // EXISTS strategy) is not the query's: it would cut an IN list to one
   // value.
   if (qb->select_limit != nullptr && !qb->m_internal_limit) {
-    if (!qb->select_limit->const_item()) return refuse("limit_not_constant");
+    if (!is_constant(qb->select_limit)) return refuse("limit_not_constant");
     *sql += " LIMIT " + std::to_string(qb->select_limit->val_uint());
   }
   if (qb->offset_limit != nullptr) {
-    if (!qb->offset_limit->const_item()) return refuse("offset_not_constant");
+    if (!is_constant(qb->offset_limit)) return refuse("offset_not_constant");
     *sql += " OFFSET " + std::to_string(qb->offset_limit->val_uint());
   }
   return false;

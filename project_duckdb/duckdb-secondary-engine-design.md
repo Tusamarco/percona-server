@@ -568,6 +568,7 @@ not a read). Last update: 2026-11-17 (function review, TPC-H 19/22,
 | UNION / INTERSECT / EXCEPT, DISTINCT and ALL, nested | partial | DISTINCT forms need binary or `_0900_bin` strings; a YEAR column refused |
 | Subqueries: scalar, IN, NOT IN, EXISTS, NOT EXISTS, ANY / ALL, correlated | partial | 6c-3; IN on `_bin` / `_ci` strings; a correlated scalar subquery without aggregate; equalities propagated between EXISTS and NOT EXISTS nests (TPC-H Q21): done 2026-11-23 |
 | Row value constructors `(a, b) IN (...)`, `(a, b) = (...)` | missing | |
+| Prepared statement parameters (`?`), stored program variables and parameters, user variables (`@x`) | done | their value as a constant at every execution (2026-11-23, T1, MTR `offload_params`); `@x := ...` in the statement refused |
 | GROUP BY ROLLUP, CUBE, GROUPING SETS, GROUPING() | missing | refused `rollup` |
 | Window functions (ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, aggregates OVER, frames) | missing | refused `window` |
 | TABLESAMPLE | missing | |
@@ -743,13 +744,18 @@ coverage tracker updated.
       whole applier only as an operator step.
 
 **T1. Prepared statements and variables** (check 1/2 day, then 1-2 days)
-- [ ] Check server-side prepared statements with parameters (`?`): the
-      translator has no case for `Item::PARAM_ITEM`, most likely refused.
-      Connectors use them (JDBC `useServerPrepStmts`, PDO without emulation).
-- [ ] Check stored procedure variables (`Item_splocal`) and user variables
-      (`@x`): not handled, refused.
-- [ ] If confirmed: translate them as constants at execution (as literals,
-      typed as the parameter / variable).
+- [x] Checked 2026-11-23: a numeric `?` refused (`unsupported_item:20`;
+      a date `?` was already folded into a literal by MySQL), stored program
+      variables and parameters refused (`unsupported_item:21`), user
+      variables refused (`unsupported_function:get_user_var`).
+- [x] Translated 2026-11-23: their value printed as a constant at every
+      EXECUTE / CALL (`value_literal()`: integers, exact DECIMAL up to 38
+      digits, DOUBLE, strings in UTF-8 with the item's collation, NULL;
+      temporal context as for literals), and accepted wherever the
+      translator wants a constant (`is_constant()`: comparisons with weight
+      columns, IN lists, LIKE patterns, LIMIT / OFFSET ...). Assigning a
+      user variable in the statement (`@x := ...`) stays refused. MTR
+      `offload_params`.
 
 **T2. DuckDB errors during execution** (1 day or a redesign: to find out)
 - [ ] Today an error after optimization (out of memory, spill disk full,

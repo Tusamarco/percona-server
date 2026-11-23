@@ -680,6 +680,16 @@ InnoDB; `duckdb_offload_waits` and `duckdb_offload_wait_timeouts` count
 them). With OFF it may not see a commit made
 less than about a second earlier.
 
+### Prepared statements, stored procedures, user variables
+
+Queries with prepared statement parameters (`PREPARE ... ?` / `EXECUTE
+... USING`, and the server-side prepared statements of connectors: JDBC
+`useServerPrepStmts=true`, PDO without emulation), with stored procedure
+parameters and variables, and with user variables (`@x`) run in DuckDB:
+their current value is used as a constant at every execution (since
+2026-11-23). A query that assigns a user variable (`SELECT @x := col ...`)
+runs on InnoDB.
+
 ### When MySQL uses DuckDB: changing the thresholds
 
 With `use_secondary_engine = ON` MySQL plans every query for InnoDB first.

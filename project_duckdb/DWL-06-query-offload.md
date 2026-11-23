@@ -822,6 +822,35 @@ return DOUBLE and `sum` returns NULL.
   refused.
 - Tests: MTR `offload_join_distinct`.
 
+### Parameters and variables (2026-11-23, T1)
+
+- Checked: a numeric prepared statement parameter was refused
+  (`unsupported_item:20`, `Item::PARAM_ITEM`; a date parameter compared with
+  a DATE column already reached us as a literal, folded by MySQL), stored
+  program variables and parameters too (`unsupported_item:21`,
+  `Item_splocal`), user variables as `unsupported_function:get_user_var`.
+  Connectors with server-side prepared statements (JDBC
+  `useServerPrepStmts=true`, PDO without emulation, the binary protocol of
+  most drivers) and reports in stored procedures never reached DuckDB.
+- Each is constant while the statement runs, and the DuckDB SQL is
+  generated again at every EXECUTE / CALL: `value_literal()` prints the
+  current value, typed by its kind as MySQL compares it (integers,
+  unsigned included; DECIMAL exactly, more than 38 digits refused; DOUBLE
+  as `CAST(... AS DOUBLE)`; strings converted to UTF-8, their collation
+  the item's, as for a string literal; NULL). In a temporal context the
+  value goes through the typed literal path, as literals do.
+- `is_constant()` replaces `const_item()` in the translator's constant
+  checks (comparisons through weight columns, padded keys, IN lists, LIKE
+  patterns, function arguments, LIMIT / OFFSET): MySQL does not call these
+  items constant (their value differs between executions), but within one
+  execution they are.
+- `@x := ...` in the statement (the value changes row by row) stays
+  refused (the assignment function is not translated).
+- Tests: MTR `offload_params` (EXECUTE twice with new values; integer,
+  NULL, DECIMAL, DOUBLE, BIGINT UNSIGNED maximum, date, strings on
+  `_ai_ci` and `_bin`, `LIMIT ?`; user variables; a procedure with
+  parameters and a declared variable; the assignment refused).
+
 ### JSON and spatial columns (2026-11-23)
 
 - New special column kind `OPAQUE` (JSON, GEOMETRY): the column as a result
