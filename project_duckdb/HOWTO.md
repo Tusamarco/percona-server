@@ -932,6 +932,47 @@ ALTER TABLE orders_h RENAME COLUMN amount TO total;
 SHOW GLOBAL STATUS LIKE 'duckdb_apply_ddl%';  -- refreshes, renames, deferred, failures
 ```
 
+### The statement after a DDL waits for the refresh
+
+With `duckdb_ddl_wait_refresh = ON` (default), after a DDL on a table with a
+copy the session's **next statement** waits until the applier has brought
+the copy in line (refresh, rename). The DDL itself returns at once: it
+holds the table's metadata lock until the server answers, and the refresh
+needs that lock. Whatever the session runs after the DDL sees the copy in
+DuckDB; scripts need no waiting loop.
+
+```sql
+ALTER TABLE orders ADD COLUMN channel VARCHAR(10) NOT NULL DEFAULT 'web';
+SELECT channel, COUNT(*) FROM orders GROUP BY channel;   -- waits, then runs in DuckDB
+```
+
+While it waits, the session shows the progress (any other session can look):
+
+```sql
+SHOW PROCESSLIST;
+-- State: Waiting for DuckDB copy refresh of shop.orders: 2400000 of about 5000000 rows (48%), 35 s
+SELECT TABLE_NAME, STATE, REFRESH_ROWS_DONE, REFRESH_ROWS_TOTAL
+  FROM INFORMATION_SCHEMA.DUCKDB_TABLES WHERE STATE = 'REFRESHING';
+-- Performance Schema stages, with WORK_COMPLETED / WORK_ESTIMATED
+-- (enable stage/duckdb/% and the events_stages_current consumer):
+SELECT EVENT_NAME, WORK_COMPLETED, WORK_ESTIMATED
+  FROM performance_schema.events_stages_current WHERE EVENT_NAME LIKE 'stage/duckdb/%';
+```
+
+- `duckdb_ddl_wait_refresh_timeout` (seconds, 0 = until done) limits the
+  wait; `KILL QUERY` stops it. The DDL is committed either way: until the
+  refresh is done, queries on the table run on InnoDB (under
+  `duckdb_history_scope = FULL` they wait). The error log records a wait
+  that took 1 s or more, or that stopped.
+- `SET SESSION duckdb_ddl_wait_refresh = OFF` before a series of DDL
+  statements skips the waits (each refresh still happens).
+- A DDL on a table without a copy, and index-only changes, cause no wait
+  worth noting (nothing to refresh).
+- DML needs nothing similar: an offloaded query already waits for the
+  session's last commit (`duckdb_offload_wait_applied`, section 6).
+- `SECONDARY_LOAD` shows its own progress in the same places (stage
+  `stage/duckdb/copy load`).
+
 Notes:
 
 - A refresh reloads the whole table from InnoDB; while it runs the applier
@@ -968,11 +1009,12 @@ One row per copy in the lake (the plugin's registry,
 | Column | Content |
 |---|---|
 | `TABLE_SCHEMA`, `TABLE_NAME` | the MySQL table (after a RENAME TABLE, the new name once the applier has read it) |
-| `STATE` | `LOADED` (kept current by the applier), `STALE` (kept but no longer updated: the history copy of a dropped table, or a refresh after DDL that failed; see the error log), `REFRESH_PENDING` (a refresh waits for a later RENAME) |
+| `STATE` | `LOADED` (kept current by the applier), `REFRESHING` (the applier is reloading it after a DDL), `STALE` (kept but no longer updated: the history copy of a dropped table, or a refresh after DDL that failed; see the error log), `REFRESH_PENDING` (a refresh waits for a later RENAME) |
 | `RETAIN_HISTORY` | `YES` for history tables |
 | `PRIMARY_KEY` | primary key columns, `a, b`; NULL for copies loaded before the key was recorded (the applier fills it) |
 | `WEIGHT_COLUMNS` | columns with a hidden weight column (non-binary collations, section 6); NULL if none or loaded before weights |
 | `LOAD_BINLOG_FILE`, `LOAD_BINLOG_POSITION`, `LOAD_GTID_SET` | binary log position and GTID set at load time: the applier skips what the load already contains |
+| `REFRESH_ROWS_DONE`, `REFRESH_ROWS_TOTAL` | while `REFRESHING`: rows copied so far and InnoDB's estimate of the total; NULL otherwise |
 
 Tables with `SECONDARY_ENGINE=duckdb` that are not loaded have no row; a
 `STALE` row whose table no longer exists is a history copy waiting for a
@@ -1121,6 +1163,8 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | `duckdb_decimal_overflow` | session, global, `SET_VAR` | yes | FALLBACK | FALLBACK, ROUND, ERROR | DECIMAL results MySQL declares above 38 digits are computed as DECIMAL(38, scale) and the statement runs in DuckDB first; if a value does not fit: FALLBACK runs it on InnoDB (FORCED: error), ROUND runs it again with fewer decimals and a warning (when that helps; otherwise as FALLBACK), ERROR fails with DuckDB's error (no first run). |
 | `duckdb_offload_wait_applied` | session, `SET_VAR` | yes | ON | ON, OFF | Before a query runs in DuckDB, wait until the applier has applied this connection's last commit (at most `duckdb_offload_wait_timeout_ms`, otherwise InnoDB). |
 | `duckdb_offload_wait_timeout_ms` | session, `SET_VAR` | yes | 5000 | 0 - 3600000 | How long that wait lasts, in milliseconds. |
+| `duckdb_ddl_wait_refresh` | session, global | yes | ON | ON, OFF | After a DDL on a table with a copy, the session's next statement waits until the applier has refreshed the copy (section 9), showing the progress in SHOW PROCESSLIST and Performance Schema. |
+| `duckdb_ddl_wait_refresh_timeout` | session, global | yes | 0 | 0 - 31536000 | Longest wait of `duckdb_ddl_wait_refresh`, in seconds; 0 = until the refresh is done. |
 | `duckdb_offload_float_aggregates` | session, global, `SET_VAR` | yes | APPROXIMATE | APPROXIMATE, REFUSE | SUM and AVG of FLOAT / DOUBLE: DuckDB adds in parallel in no fixed order, so the last digits can differ from InnoDB and between runs. APPROXIMATE runs them in DuckDB; REFUSE runs such queries on InnoDB (under FULL scope they fail). |
 | `duckdb_history_check_only` | session | yes | OFF | ON, OFF | SECONDARY_LOAD of a history table only checks that it can take over a history copy (adopt, reattach, resync) and always ends with an error giving the result. |
 | `duckdb_unload_history_confirm` | session | yes | OFF | ON, OFF | Allows SECONDARY_UNLOAD of a history table and `duckdb_discard_stale_copy` of a history copy (archived rows are deleted). |

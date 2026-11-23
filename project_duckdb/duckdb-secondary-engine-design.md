@@ -740,8 +740,9 @@ coverage tracker updated.
       REFRESH_ROWS_DONE, REFRESH_ROWS_TOTAL, applied position.
 - [x] FULL scope queries wait without the `duckdb_offload_wait_timeout_ms`
       limit (KILL / max_execution_time stop them): no InnoDB answer exists.
-- [ ] Remove `wait_applier()` from the tutorial; HOWTO keeps waiting for the
-      whole applier only as an operator step.
+- [x] `wait_applier()` removed from the tutorial (section 5.1 explains the
+      automatic waits); HOWTO section 9 documents the DDL wait, its
+      variables and where the progress shows (2026-11-23).
 
 **T1. Prepared statements and variables** (check 1/2 day, then 1-2 days)
 - [x] Checked 2026-11-23: a numeric `?` refused (`unsupported_item:20`;

@@ -465,32 +465,24 @@ SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status
 `duckdb_apply_reader_state` = `idle` means everything in the binary log is
 in DuckDB.
 
-### 5.1 A helper: wait for the applier
+### 5.1 No waiting needed
 
-Most changes reach DuckDB within a second, but a DDL makes the applier
-reload the table (section 9), which takes as long as a SECONDARY_LOAD. The
-tutorial calls this procedure after such steps; it returns when the applier
-is idle again:
+The copy follows InnoDB through the binary log, a little later. You do not
+have to wait for it yourself:
+
+- After your own DML, a query that runs in DuckDB first waits until your
+  last commit is in the copy (`duckdb_offload_wait_applied`, section 10).
+- After a DDL on a table with a copy (ALTER, RENAME, partition changes ...)
+  the applier reloads the copy, which takes as long as a SECONDARY_LOAD.
+  Your **next statement** waits until that is done
+  (`duckdb_ddl_wait_refresh`, section 10); the DDL itself returns at once.
+
+While a statement waits, another session sees what for:
 
 ```sql
-DROP PROCEDURE IF EXISTS wait_applier;
-DELIMITER //
-CREATE PROCEDURE wait_applier()
-BEGIN
-  DECLARE st VARCHAR(200) DEFAULT '';
-  -- performance_schema has no DuckDB copy: read it on InnoDB
-  SET @wait_applier_mode = @@SESSION.use_secondary_engine;
-  SET SESSION use_secondary_engine = OFF;
-  DO SLEEP(1);                       -- let the applier pick up the last commit
-  REPEAT
-    SELECT VARIABLE_VALUE INTO st FROM performance_schema.global_status
-     WHERE VARIABLE_NAME = 'duckdb_apply_reader_state';
-    IF st <> 'idle' THEN DO SLEEP(0.5); END IF;
-  UNTIL st = 'idle' END REPEAT;
-  SET SESSION use_secondary_engine = @wait_applier_mode;
-END //
-DELIMITER ;
-CALL wait_applier();
+SHOW PROCESSLIST;     -- State: Waiting for DuckDB copy refresh of tut.orders: N of about M rows (P%), S s
+SELECT TABLE_NAME, STATE, REFRESH_ROWS_DONE, REFRESH_ROWS_TOTAL
+  FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'tut';
 ```
 
 ---
@@ -564,7 +556,6 @@ rows (with the time of the purge). Setting a GTID tag needs the
 SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
 DELETE FROM readings WHERE read_at < '2024-02-01';
 SET gtid_next = 'AUTOMATIC';
-CALL wait_applier();
 ```
 
 The tag covers exactly one transaction: the statement above, or everything
@@ -644,7 +635,6 @@ SET gtid_next = 'AUTOMATIC';
 
 -- 2. drop the partition, now empty
 ALTER TABLE sales DROP PARTITION p2023;
-CALL wait_applier();              -- the DDL refreshes the copy
 ```
 
 `DELETE ... PARTITION (p)` deletes only that partition, without scanning the
@@ -664,7 +654,6 @@ SET SESSION duckdb_history_scope = LIVE;
 
 ```sql
 ALTER TABLE sales DROP PARTITION p2024;             -- no purge first
-CALL wait_applier();
 
 SET SESSION duckdb_history_scope = FULL;
 SELECT id, sold_at FROM sales ORDER BY id;          -- 1, 2, 5: rows 3 and 4 are lost
@@ -681,7 +670,6 @@ Add the next period before it starts, by splitting the last partition:
 ALTER TABLE sales REORGANIZE PARTITION pmax INTO (
   PARTITION p2025 VALUES LESS THAN ('2026-01-01'),
   PARTITION pmax  VALUES LESS THAN (MAXVALUE));
-CALL wait_applier();
 SELECT id, sold_at FROM sales PARTITION (p2025);              -- row 5 moved there
 
 SET SESSION use_secondary_engine = ON, duckdb_history_scope = FULL;
@@ -697,7 +685,6 @@ SET gtid_next = 'AUTOMATIC:duckdb_avoid_purge';
 DELETE FROM sales PARTITION (p_oldest);
 SET gtid_next = 'AUTOMATIC';
 ALTER TABLE sales DROP PARTITION p_oldest;
-CALL wait_applier();
 ```
 
 Notes:
@@ -718,12 +705,9 @@ Notes:
 
 ```sql
 ALTER TABLE orders ADD COLUMN channel VARCHAR(10) NOT NULL DEFAULT 'web';
-CALL wait_applier();              -- the copy is reloaded with the new column
-RENAME TABLE orders TO orders2;
-CALL wait_applier();
+RENAME TABLE orders TO orders2;       -- waits until the copy has the new column
 SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES WHERE TABLE_SCHEMA = 'tut';
 RENAME TABLE orders2 TO orders;
-CALL wait_applier();
 ```
 
 DDL never blocks: the applier refreshes the copy from InnoDB after column
@@ -938,6 +922,22 @@ before.
 ```sql
 SELECT /*+ SET_VAR(duckdb_offload_wait_timeout_ms = 20000) */ COUNT(*) FROM orders;
 ```
+
+**`duckdb_ddl_wait_refresh`** (session or global, default ON). After a
+DDL on a table with a copy, your next statement waits until the applier
+has reloaded the copy (section 5.1), so it sees the copy in DuckDB. Turn it
+off before a series of DDL statements:
+
+```sql
+SET SESSION duckdb_ddl_wait_refresh = OFF;
+-- several ALTER TABLE ...
+SET SESSION duckdb_ddl_wait_refresh = ON;
+```
+
+**`duckdb_ddl_wait_refresh_timeout`** (session or global, default 0 = no
+limit). The longest wait, in seconds. A timeout or `KILL QUERY` stops only
+the wait: the DDL is committed and the copy is still reloaded; meanwhile
+queries on the table run on InnoDB.
 
 **`duckdb_offload_float_aggregates`** (session, global or `SET_VAR` hint,
 default APPROXIMATE). SUM and AVG of FLOAT and DOUBLE values: DuckDB adds
