@@ -1133,6 +1133,14 @@ at the optimizer trace (section 7). Common reasons: `collation:<column>`,
 `unsupported_function:<name>`, `not_single_table`, `not_loaded:<table>`.
 Below `secondary_engine_cost_threshold` it is not even tried (no refusal).
 
+A DuckDB error while the query starts (out of memory, temporary disk full)
+is a refusal too, with the reason `duckdb_execution: <DuckDB error>`: with
+`use_secondary_engine = ON` InnoDB answers the query (since 2026-11-23).
+DuckDB runs the heavy parts of a query (joins, aggregates, sorts) before
+the first rows, so that covers the usual cases; an error after rows were
+sent still reaches the client. Many `duckdb_execution` refusals: raise
+`duckdb_memory_limit` or check the disk of the lake's `tmp/` directory.
+
 Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 
 ---

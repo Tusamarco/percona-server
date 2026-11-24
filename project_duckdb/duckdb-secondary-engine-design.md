@@ -759,13 +759,21 @@ coverage tracker updated.
       `offload_params`.
 
 **T2. DuckDB errors during execution** (1 day or a redesign: to find out)
-- [ ] Today an error after optimization (out of memory, spill disk full,
-      any runtime error) is the statement's error, also with
-      `use_secondary_engine=ON`, where InnoDB would answer.
-- [ ] Find out what MySQL allows at execution time (going back to the
-      primary engine from the external executor).
-- [ ] Fall back when the error comes before the first row is sent; if MySQL
-      does not allow it, run blocking statements first (as the DECIMAL path).
+- [x] Found 2026-11-23: MySQL retries a statement on InnoDB after an error
+      in the secondary engine (sql_parse.cc,
+      `check_secondary_engine_statement`, not with FORCED), but not once
+      execution started: `Sql_cmd_dml::execute_inner` marks it executed
+      (`set_exec_completed`) before our executor runs.
+- [x] Done 2026-11-23: the statement starts in DuckDB during optimization
+      and its first chunk is fetched there (streaming): DuckDB runs the
+      blocking parts of a plan (hash join builds, aggregates, sorts) before
+      a first chunk, where out of memory or a full temporary disk happen.
+      An error there is a refusal (`duckdb_execution: ...`): InnoDB answers
+      with ON. KILL / timeout and a scalar subquery with several rows keep
+      MySQL's error. The rest is streamed, never materialized. An error
+      after the first chunk (rare) still reaches the client. MTR
+      `offload_exec_errors` (debug injection point
+      `duckdb_offload_fail_first_chunk`).
 
 **T3. FULL scope survival** (a refusal under FULL is an error: InnoDB has no
 archived rows)

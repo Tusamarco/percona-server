@@ -1,0 +1,33 @@
+CREATE TABLE ee (id INT PRIMARY KEY, g INT, v VARCHAR(20) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO ee SELECT a.n * 1000 + b.n, b.n % 13, CONCAT('row', a.n * 1000 + b.n) FROM n a JOIN n b WHERE a.n < 6;
+ALTER TABLE ee SECONDARY_LOAD;
+# Results longer than one DuckDB chunk (2048 rows): first chunk + the rest
+# SELECT id, g, v FROM ee ORDER BY id
+# SELECT g, COUNT(*), MIN(v), MAX(id) FROM ee GROUP BY g ORDER BY g
+# SELECT id FROM ee WHERE id < 0
+# An error at the first chunk (simulated out of memory)
+SET SESSION debug = '+d,duckdb_offload_fail_first_chunk';
+SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
+SELECT g, COUNT(*) FROM ee GROUP BY g ORDER BY g LIMIT 3;
+g	COUNT(*)
+0	462
+1	462
+2	462
+refused	offloaded
+1	0
+SHOW GLOBAL STATUS LIKE 'duckdb_offload_last_refusal';
+Variable_name	Value
+duckdb_offload_last_refusal	duckdb_execution: Out of Memory Error: simulated (duckdb_offload_fail_first_chunk)
+SET SESSION use_secondary_engine = FORCED;
+SELECT g, COUNT(*) FROM ee GROUP BY g ORDER BY g LIMIT 3;
+ERROR HY000: the DuckDB secondary engine cannot run this query: duckdb_execution: Out of Memory Error: simulated (duckdb_offload_fail_first_chunk)
+SET SESSION debug = '-d,duckdb_offload_fail_first_chunk';
+# Without the error: DuckDB again
+SET SESSION use_secondary_engine = DEFAULT, secondary_engine_cost_threshold = DEFAULT;
+# SELECT g, COUNT(*) FROM ee GROUP BY g ORDER BY g LIMIT 3
+# A scalar subquery with more than one row: MySQL's error 1242
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, (SELECT v FROM ee e2 WHERE e2.g = 1) FROM ee WHERE id < 3;
+ERROR 21000: Subquery returns more than 1 row (DuckDB error: Invalid Input Error: More than one row returned by a subquery used as an expression)
+SET SESSION use_secondary_engine = DEFAULT;
+DROP TABLE ee;

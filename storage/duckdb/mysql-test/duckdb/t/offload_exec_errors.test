@@ -1,0 +1,65 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# T2 (2026-11-23): the statement starts in DuckDB during optimization and
+# its first chunk is fetched there, where DuckDB runs the blocking parts of
+# the plan (out of memory, temporary disk full ...). An error there is a
+# refusal: with use_secondary_engine = ON InnoDB answers, with FORCED an
+# error with the reason. The rest of the result is streamed.
+--source include/have_debug.inc
+--source ../include/have_duckdb.inc
+--source ../include/tables_n.inc
+CREATE TABLE ee (id INT PRIMARY KEY, g INT, v VARCHAR(20) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO ee SELECT a.n * 1000 + b.n, b.n % 13, CONCAT('row', a.n * 1000 + b.n) FROM n a JOIN n b WHERE a.n < 6;
+ALTER TABLE ee SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+--echo # Results longer than one DuckDB chunk (2048 rows): first chunk + the rest
+--let $query= SELECT id, g, v FROM ee ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT g, COUNT(*), MIN(v), MAX(id) FROM ee GROUP BY g ORDER BY g
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM ee WHERE id < 0
+--source ../include/duckdb_compare.inc
+
+--echo # An error at the first chunk (simulated out of memory)
+SET SESSION debug = '+d,duckdb_offload_fail_first_chunk';
+SET SESSION use_secondary_engine = ON, secondary_engine_cost_threshold = 0;
+--let $r0= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_refused', Value, 1)
+--let $q0= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_queries', Value, 1)
+SELECT g, COUNT(*) FROM ee GROUP BY g ORDER BY g LIMIT 3;
+--let $r1= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_refused', Value, 1)
+--let $q1= query_get_value(SHOW GLOBAL STATUS LIKE 'duckdb_offload_queries', Value, 1)
+--disable_query_log
+--eval SELECT $r1 - $r0 AS refused, $q1 - $q0 AS offloaded
+--enable_query_log
+SHOW GLOBAL STATUS LIKE 'duckdb_offload_last_refusal';
+SET SESSION use_secondary_engine = FORCED;
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT g, COUNT(*) FROM ee GROUP BY g ORDER BY g LIMIT 3;
+SET SESSION debug = '-d,duckdb_offload_fail_first_chunk';
+--echo # Without the error: DuckDB again
+SET SESSION use_secondary_engine = DEFAULT, secondary_engine_cost_threshold = DEFAULT;
+--let $query= SELECT g, COUNT(*) FROM ee GROUP BY g ORDER BY g LIMIT 3
+--source ../include/duckdb_compare.inc
+
+--echo # A scalar subquery with more than one row: MySQL's error 1242
+SET SESSION use_secondary_engine = FORCED;
+--error ER_SUBQUERY_NO_1_ROW
+SELECT id, (SELECT v FROM ee e2 WHERE e2.g = 1) FROM ee WHERE id < 3;
+SET SESSION use_secondary_engine = DEFAULT;
+
+DROP TABLE ee;
+--source ../include/cleanup.inc

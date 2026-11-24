@@ -822,6 +822,40 @@ return DOUBLE and `sum` returns NULL.
   refused.
 - Tests: MTR `offload_join_distinct`.
 
+### DuckDB errors during execution (2026-11-23, T2)
+
+- MySQL retries a statement on InnoDB when the secondary engine fails during
+  preparation or optimization (`check_secondary_engine_statement`,
+  sql_parse.cc; not with FORCED, not for a killed statement), but not once
+  execution started: `Sql_cmd_dml::execute_inner` calls
+  `set_exec_completed()` after `create_iterators()`, before our executor. An
+  error in `execute_offloaded()` (out of memory, temporary disk full, any
+  runtime error) therefore reached the client even with ON.
+- `optimize()` now starts the statement (`duckdb_execute_prepared_streaming`)
+  and fetches its first chunk. DuckDB executes the blocking parts of a plan
+  (hash join builds, aggregates, sorts, window partitions) before it returns
+  a first chunk, so that is where memory and disk errors happen. An error
+  there is a refusal, `duckdb_execution: <DuckDB error>`, and MySQL runs the
+  statement on InnoDB (ON) or reports the reason (FORCED). A killed
+  statement (KILL QUERY, max_execution_time) and a scalar subquery with more
+  than one row keep MySQL's error (1317 / 3024 / 1242; InnoDB would give the
+  same 1242).
+- `execute_offloaded()` takes over the stream and the first chunk and
+  fetches the rest as before: nothing is materialized (unlike the DECIMAL
+  first run). An error after the first chunk (in a streaming pipeline:
+  rare) still reaches the client: rows may have been sent.
+- Statements run first for the DECIMAL or grouped-string checks already
+  failed during optimization; they are unchanged. EXPLAIN runs nothing.
+- Exception: a statement with DECIMAL values above 38 digits under
+  `duckdb_decimal_overflow = ERROR` does not start early: there an
+  overflow must be the statement's error, also with ON, and any error
+  during optimization makes MySQL run the statement on InnoDB (found by
+  MTR `decimal_overflow`).
+- Tests: MTR `offload_exec_errors` (results longer than a chunk, empty
+  result, an out-of-memory error injected at the first chunk with the debug
+  point `duckdb_offload_fail_first_chunk`: InnoDB answers with ON, the
+  reason with FORCED; error 1242 kept).
+
 ### Parameters and variables (2026-11-23, T1)
 
 - Checked: a numeric prepared statement parameter was refused

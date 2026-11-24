@@ -192,6 +192,9 @@ class OffloadContext : public Secondary_engine_execution_context {
     try {
       con->execute_cleanup(
           [this](duckdb_connection, std::string *) {
+            if (first_chunk != nullptr) duckdb_destroy_data_chunk(&first_chunk);
+            if (have_stream) duckdb_destroy_result(&stream_result);
+            have_stream = false;
             if (stmt != nullptr) duckdb_destroy_prepare(&stmt);
             if (have_pre_result) duckdb_destroy_result(&pre_result);
             have_pre_result = false;
@@ -213,6 +216,13 @@ class OffloadContext : public Secondary_engine_execution_context {
   duckdb_result pre_result;
   unsigned long long pre_run_us{0};  // first runs during optimization
   bool have_pre_result{false};
+  // T2: every other statement starts in DuckDB during optimization and its
+  // first chunk is fetched there (streaming); execute_offloaded() sends it
+  // and fetches the rest.
+  duckdb_result stream_result;
+  bool have_stream{false};
+  duckdb_data_chunk first_chunk{nullptr};
+  bool first_fetched{false};
 
   // Semi-join materialization is turned off while the server optimizes a
   // statement for us: that strategy rewrites WHERE to read its own
@@ -3558,11 +3568,22 @@ bool execute_offloaded(JOIN *join, Query_result *result) {
     return true;
   };
 
+  bool use_first = false;
   if (ctx->have_pre_result) {
     // Already run during optimization: the result is ours now.
     res = ctx->pre_result;
     ctx->have_pre_result = false;
     have_result = true;
+  } else if (ctx->have_stream) {
+    // Started during optimization (T2): the stream and its first chunk are
+    // ours now.
+    res = ctx->stream_result;
+    ctx->have_stream = false;
+    have_result = true;
+    chunk = ctx->first_chunk;
+    ctx->first_chunk = nullptr;
+    use_first = ctx->first_fetched;
+    ctx->first_fetched = false;
   } else if (con->execute(
           [&](duckdb_connection, std::string *e) {
             if (duckdb_execute_prepared_streaming(ctx->stmt, &res) ==
@@ -3580,7 +3601,9 @@ bool execute_offloaded(JOIN *join, Query_result *result) {
 
   String buf;
   for (;;) {
-    if (con->execute(
+    if (use_first) {
+      use_first = false;  // the chunk fetched during optimization
+    } else if (con->execute(
             [&](duckdb_connection, std::string *e) {
               chunk = duckdb_fetch_chunk(res);
               if (chunk == nullptr) {
@@ -3892,6 +3915,65 @@ bool optimize(THD *thd, LEX *lex) {
                    "digits, also with fewer decimals (the overflow is in "
                    "DuckDB's own arithmetic; duckdb_decimal_overflow=ROUND)";
       }
+    }
+  }
+  // T2 (2026-11-23): we start the statement here and fetch its first chunk.
+  // DuckDB runs the blocking parts of a plan (hash join builds, aggregates,
+  // sorts) before it returns a first chunk, which is where out of memory or
+  // a full temporary disk happen. An error here is a refusal: MySQL then runs
+  // the statement on InnoDB (use_secondary_engine = ON). It cannot once our
+  // executor has started (Sql_cmd_dml::execute_inner marks the statement
+  // executed before it), so a later error still reaches the client. The rest
+  // is streamed by execute_offloaded(), never materialized.
+  // Not with duckdb_decimal_overflow = ERROR on a statement with DECIMAL
+  // values above 38 digits: there an overflow must be the statement's error
+  // (also with ON), and any error here would make MySQL run it on InnoDB.
+  if (reason.empty() && !lex->is_explain() && !ctx->have_pre_result &&
+      !(wide && mode == DecimalOverflow::ERROR)) {
+    bool simulate = false;
+    DBUG_EXECUTE_IF("duckdb_offload_fail_first_chunk", simulate = true;);
+    std::string err;
+    const auto started = std::chrono::steady_clock::now();
+    const bool failed = ctx->con->execute(
+        [ctx, simulate](duckdb_connection, std::string *e) {
+          if (duckdb_execute_prepared_streaming(ctx->stmt,
+                                                &ctx->stream_result) ==
+              DuckDBError) {
+            const char *m = duckdb_result_error(&ctx->stream_result);
+            *e = m != nullptr ? m : "execution failed";
+            duckdb_destroy_result(&ctx->stream_result);
+            return true;
+          }
+          ctx->have_stream = true;
+          if (simulate) {
+            *e = "Out of Memory Error: simulated (duckdb_offload_fail_first_chunk)";
+            return true;
+          }
+          ctx->first_chunk = duckdb_fetch_chunk(ctx->stream_result);
+          if (ctx->first_chunk == nullptr) {
+            const char *m = duckdb_result_error(&ctx->stream_result);
+            if (m != nullptr && *m != '\0') {
+              *e = m;
+              return true;
+            }
+          }
+          ctx->first_fetched = true;
+          return false;
+        },
+        &err);
+    ctx->pre_run_us += micros_since(started);
+    if (failed) {
+      // KILL QUERY / max_execution_time, and a scalar subquery with more
+      // than one row: MySQL's own error (InnoDB gives the same; a killed
+      // statement is never retried).
+      if (thd->is_killed() ||
+          err.find("More than one row returned by a subquery") !=
+              std::string::npos ||
+          err.find(kDuckDBMultipleRows) != std::string::npos) {
+        report_duckdb_error(err);
+        return true;
+      }
+      reason = "duckdb_execution: " + err.substr(0, 200);
     }
   }
   if (!reason.empty()) {
