@@ -55,6 +55,43 @@ flowchart LR
   plugin, including the multi-threaded applier, restarts, tagged purges and
   `super_read_only`.
 
+## How it works
+
+**A write** reaches the DuckDB copy through the binary log, after its
+InnoDB commit:
+
+```mermaid
+flowchart LR
+    C[COMMIT] --> BL[binary log +<br/>InnoDB commit]
+    BL -->|after_commit hook| RD[Plugin reader thread<br/>reads the binary log]
+    RD --> DC[Decode rows<br/>UTF-8 text + collation weights]
+    DC --> CL[Collapse per primary key<br/>tagged purges = archive marks]
+    CL --> BT[Batch: deletes, archive marks,<br/>inserts + applied position]
+    BT -->|one DuckLake commit| DL[(DuckDB / DuckLake)]
+    RD -->|DDL on a loaded table| RF[Rename or refresh the copy]
+    RF --> DL
+```
+
+**A query** goes to DuckDB only when it is expensive enough and every part
+of it can be translated exactly; otherwise InnoDB answers:
+
+```mermaid
+flowchart LR
+    Q[SELECT] --> OPT[MySQL optimizer<br/>InnoDB plan and cost]
+    OPT -->|cheap| INNO[(InnoDB)]
+    OPT -->|expensive, loaded tables| TR[Plugin: translate to DuckDB SQL<br/>exactly, or refuse with a reason]
+    TR -->|refused| INNO
+    TR --> FR[Wait for the session's<br/>last commit]
+    FR --> ST[Start in DuckDB,<br/>fetch the first chunk]
+    ST -->|DuckDB error| INNO
+    ST --> EX[Stream the rows back through<br/>MySQL's result path]
+    EX --> CL[Client]
+    INNO --> CL
+```
+
+The function-by-function version of both paths is in the
+[design document](/project_duckdb/duckdb-secondary-engine-design.md#paths-through-the-code).
+
 ## Status
 
 | Area | State |

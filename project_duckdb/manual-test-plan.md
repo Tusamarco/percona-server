@@ -800,7 +800,7 @@ DROP TABLE at1, bt1;                                     -- stale copies kept: d
 ## 21. Query offload, step 6a (DWL#6)
 
 Scratch table `g` (200,000 rows, every result type), the query list
-`duckdb_offload_6a_queries.sql` and the comparison script
+`offload_queries/duckdb_offload_6a_queries.sql` and the comparison script
 `duckdb_offload_compare.sh` (each query with `use_secondary_engine=OFF` and
 `FORCED`; it stops if the server is lost).
 
@@ -825,7 +825,7 @@ ALTER TABLE g SECONDARY_LOAD;
 ```bash
 cd project_duckdb
 MYSQL="mysql -S /opt/mysql_instances/master96/mysql.sock -u dba -p<password> windmills_small" \
-  ./duckdb_offload_compare.sh duckdb_offload_6a_queries.sql
+  ./duckdb_offload_compare.sh offload_queries/duckdb_offload_6a_queries.sql
 # expected: every query "same, offloaded"; last line 19/19 identical and offloaded
 ```
 
@@ -875,13 +875,13 @@ SET SESSION use_secondary_engine = ON;
 Scratch table `p6` (20,000 rows): PAD SPACE strings with trailing spaces, a
 tab and an empty string (`b4` utf8mb4_bin, `b3` utf8mb3_bin), binary
 strings, NULLs in every column, DATE/DATETIME/TIMESTAMP, DECIMAL, DOUBLE,
-UNSIGNED. Query lists `duckdb_offload_6b_queries.sql` (must be identical and
-offloaded) and `duckdb_offload_6b_refusals.sql` (must be refused with a
+UNSIGNED. Query lists `offload_queries/duckdb_offload_6b_queries.sql` (must be identical and
+offloaded) and `offload_queries/duckdb_offload_6b_refusals.sql` (must be refused with a
 reason, and give the InnoDB rows with ON).
 
-`duckdb_offload_setup.sql` drops and re-creates n, g (section 21) and p6
+`offload_queries/duckdb_offload_setup.sql` drops and re-creates n, g (section 21) and p6
 (this section) in the current database: `mysql ... windmills_small <
-duckdb_offload_setup.sql`.
+offload_queries/duckdb_offload_setup.sql`.
 
 ```sql
 -- with FORCED the INSERT ... SELECT below would fail
@@ -928,13 +928,13 @@ SELECT COUNT(*), SUM(b4 = 'a') FROM p6;                -- 20000, 5000 ('a', 'a '
 ```bash
 cd project_duckdb
 export MYSQL="mysql -S /opt/mysql_instances/master96/mysql.sock -u dba -p<password> windmills_small"
-./duckdb_offload_compare.sh duckdb_offload_6b_queries.sql
+./duckdb_offload_compare.sh offload_queries/duckdb_offload_6b_queries.sql
 # expected: 45/45 identical and offloaded
-EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6b_refusals.sql
+EXPECT=refused ./duckdb_offload_compare.sh offload_queries/duckdb_offload_6b_refusals.sql
 # expected: 14/14 refused as expected, each with its reason, e.g.
 #   Q6 refused (exact_division), ON = InnoDB
 #   Q12 refused (string_number_comparison), ON = InnoDB
-./duckdb_offload_compare.sh duckdb_offload_6a_queries.sql
+./duckdb_offload_compare.sh offload_queries/duckdb_offload_6a_queries.sql
 # regression: 19/19 identical and offloaded (table g of section 21)
 ```
 
@@ -963,7 +963,7 @@ of the group is shown). DWL-06, Lessons from step 6b.
 
 ## 23. Query offload, step 6c-1 (DWL#6)
 
-Tables of `duckdb_offload_setup.sql`: g, p6, plus dim (7 rows: groups 0-4,
+Tables of `offload_queries/duckdb_offload_setup.sql`: g, p6, plus dim (7 rows: groups 0-4,
 8, 9; `label` utf8mb4_bin, `ci` utf8mb4_0900_ai_ci), hist (history table,
 100 rows, 30 purged = archived), nl (no secondary engine) and the view v6.
 The setup purges hist with the tag: the account needs TRANSACTION_GTID_TAG.
@@ -971,12 +971,12 @@ The setup purges hist with the tag: the account needs TRANSACTION_GTID_TAG.
 ```bash
 cd project_duckdb
 export MYSQL="mysql -S /opt/mysql_instances/master96/mysql.sock -u dba -p<password> windmills_small"
-$MYSQL < duckdb_offload_setup.sql                    # re-creates all test tables
-./duckdb_offload_compare.sh duckdb_offload_6c_queries.sql                  # 37/37 identical and offloaded
-EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6c_refusals.sql  # 5/5 (set operations moved to 6c-2, NOT IN to 6c-3)
-./duckdb_offload_compare.sh duckdb_offload_6a_queries.sql                  # 19/19
-./duckdb_offload_compare.sh duckdb_offload_6b_queries.sql                  # 45/45
-EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6b_refusals.sql  # 12/12 (two moved to 6c)
+$MYSQL < offload_queries/duckdb_offload_setup.sql                    # re-creates all test tables
+./duckdb_offload_compare.sh offload_queries/duckdb_offload_6c_queries.sql                  # 37/37 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh offload_queries/duckdb_offload_6c_refusals.sql  # 5/5 (set operations moved to 6c-2, NOT IN to 6c-3)
+./duckdb_offload_compare.sh offload_queries/duckdb_offload_6a_queries.sql                  # 19/19
+./duckdb_offload_compare.sh offload_queries/duckdb_offload_6b_queries.sql                  # 45/45
+EXPECT=refused ./duckdb_offload_compare.sh offload_queries/duckdb_offload_6b_refusals.sql  # 12/12 (two moved to 6c)
 ```
 
 ```sql
@@ -1048,12 +1048,12 @@ DELETE FROM dim WHERE grp = 50;
 
 ## 25. Query offload, step 6c-2 (DWL#6)
 
-Same tables (`duckdb_offload_setup.sql`).
+Same tables (`offload_queries/duckdb_offload_setup.sql`).
 
 ```bash
 cd project_duckdb
-./duckdb_offload_compare.sh duckdb_offload_6c2_queries.sql                  # 26/26 identical and offloaded
-EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6c2_refusals.sql  # 6/6 refused as expected
+./duckdb_offload_compare.sh offload_queries/duckdb_offload_6c2_queries.sql                  # 26/26 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh offload_queries/duckdb_offload_6c2_refusals.sql  # 6/6 refused as expected
 # regressions: 6a 19/19, 6b 45/45, 6c 37/37, refusals 12/12 and 5/5
 ```
 
@@ -1075,12 +1075,12 @@ SET SESSION use_secondary_engine = ON;
 
 ## 26. Query offload, step 6c-3 (DWL#6)
 
-Same tables (`duckdb_offload_setup.sql`); dim.region and p6.qty have NULLs.
+Same tables (`offload_queries/duckdb_offload_setup.sql`); dim.region and p6.qty have NULLs.
 
 ```bash
 cd project_duckdb
-./duckdb_offload_compare.sh duckdb_offload_6c3_queries.sql                  # 33/33 identical and offloaded
-EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6c3_refusals.sql  # 5/5 refused as expected
+./duckdb_offload_compare.sh offload_queries/duckdb_offload_6c3_queries.sql                  # 33/33 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh offload_queries/duckdb_offload_6c3_refusals.sql  # 5/5 refused as expected
 # regressions: 6a 19/19, 6b 45/45, 6c 37/37, 6c2 26/26; refusals 12/12, 5/5, 6/6
 ```
 
@@ -1186,9 +1186,9 @@ export MYSQL="mysql -S <socket> -u dba -p<password> perf"
 
 ```bash
 cd project_duckdb
-$MYSQL < duckdb_offload_setup.sql                                         # adds table dv
-./duckdb_offload_compare.sh duckdb_offload_div_queries.sql                # 18/18 identical and offloaded
-EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6b_refusals.sql # 11/11 (qty / 3 moved to the division list)
+$MYSQL < offload_queries/duckdb_offload_setup.sql                                         # adds table dv
+./duckdb_offload_compare.sh offload_queries/duckdb_offload_div_queries.sql                # 18/18 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh offload_queries/duckdb_offload_6b_refusals.sql # 11/11 (qty / 3 moved to the division list)
 # regressions: 6a 19/19, 6b 45/45, 6c 37/37, 6c2 26/26, 6c3 33/33, refusals 5/5, 6/6, 5/5
 ```
 
@@ -1252,9 +1252,9 @@ count follows the new collation.
 
 ```bash
 cd project_duckdb
-$MYSQL < duckdb_offload_setup.sql                                          # adds cw, cwd (weights)
-./duckdb_offload_compare.sh duckdb_offload_a2_queries.sql                  # 32/32 identical and offloaded
-EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_a2_refusals.sql  # 7/7 refused as expected
+$MYSQL < offload_queries/duckdb_offload_setup.sql                                          # adds cw, cwd (weights)
+./duckdb_offload_compare.sh offload_queries/duckdb_offload_a2_queries.sql                  # 32/32 identical and offloaded
+EXPECT=refused ./duckdb_offload_compare.sh offload_queries/duckdb_offload_a2_refusals.sql  # 7/7 refused as expected
 # regressions: 6a 19/19, 6b 45/45, 6c 37/37, 6c2 26/26, 6c3 33/33, div 18/18;
 # refusals 6b 9/9, 6c 4/4 (three _ci cases moved to the A2 list), 6c2 6/6, 6c3 5/5
 ```
@@ -1265,7 +1265,7 @@ SECONDARY_LOAD, or SECONDARY_LOAD for a history table).
 
 ## 34. FULL scope guard (DWL#7, 2026-11-15)
 
-Needs DUCKDB_HISTORY_READER; table hist of duckdb_offload_setup.sql (70 live,
+Needs DUCKDB_HISTORY_READER; table hist of offload_queries/duckdb_offload_setup.sql (70 live,
 30 archived), plus:
 
 ```sql
@@ -1328,13 +1328,13 @@ row; an account without PROCESS sees no rows; `duckdb_enable=OFF`: no rows.
 
 ## 36. YEAR and BIT (2026-11-16)
 
-Table yb of `duckdb_offload_setup.sql` (re-run the setup, or only its
+Table yb of `offload_queries/duckdb_offload_setup.sql` (re-run the setup, or only its
 "YEAR and BIT" block, which needs table n); MTR: `offload_yb`.
 
 ```bash
 MYSQL="mysql -S <socket> -u <user> -p<password> windmills_small" \
-  ./duckdb_offload_compare.sh duckdb_offload_yb_queries.sql        # 33/33
-EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_yb_refusals.sql  # 5/5
+  ./duckdb_offload_compare.sh offload_queries/duckdb_offload_yb_queries.sql        # 33/33
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh offload_queries/duckdb_offload_yb_refusals.sql  # 5/5
 ```
 
 Checks: YEAR 0000 shown as `0000` for the column, `0` for MAX(y); BIT values
@@ -1345,12 +1345,12 @@ positive. Regression: all earlier lists (6b refusals now 9/9 with `u - 1`).
 
 ## 37. TIME (2026-11-16)
 
-Table tt of `duckdb_offload_setup.sql` (its "TIME" block needs table n);
+Table tt of `offload_queries/duckdb_offload_setup.sql` (its "TIME" block needs table n);
 MTR: `offload_time`.
 
 ```bash
-MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_tt_queries.sql                 # 24/24
-EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_tt_refusals.sql  # 7/7
+MYSQL="..." ./duckdb_offload_compare.sh offload_queries/duckdb_offload_tt_queries.sql                 # 24/24
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh offload_queries/duckdb_offload_tt_refusals.sql  # 7/7
 ```
 
 Checks: negative values, more than 24 hours, -838:59:59 / 838:59:59,
@@ -1359,12 +1359,12 @@ every form MySQL accepts; rows changed after the load the same.
 
 ## 38. ENUM and SET (2026-11-16)
 
-Table et of `duckdb_offload_setup.sql` (its "ENUM and SET" block needs
+Table et of `offload_queries/duckdb_offload_setup.sql` (its "ENUM and SET" block needs
 table n); MTR: `offload_enum`.
 
 ```bash
-MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_et_queries.sql                 # 28/28
-EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_et_refusals.sql  # 6/6
+MYSQL="..." ./duckdb_offload_compare.sh offload_queries/duckdb_offload_et_queries.sql                 # 28/28
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh offload_queries/duckdb_offload_et_refusals.sql  # 6/6
 ```
 
 History across a definition change (needs DUCKDB_HISTORY_READER):
@@ -1402,12 +1402,12 @@ MYSQL="mysql ... tpch" ./duckdb_offload_compare.sh tpch/tpch_queries.sql   # 7/2
 
 ## 40. LIKE on binary collations (2026-11-17)
 
-Table lt of `duckdb_offload_setup.sql` ("LIKE on binary collations" block);
+Table lt of `offload_queries/duckdb_offload_setup.sql` ("LIKE on binary collations" block);
 MTR `offload_like`.
 
 ```bash
-MYSQL="mysql --default-character-set=utf8mb4 ... windmills_small" ./duckdb_offload_compare.sh duckdb_offload_like_queries.sql  # 19/19
-EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_like_refusals.sql                                       # 1/1
+MYSQL="mysql --default-character-set=utf8mb4 ... windmills_small" ./duckdb_offload_compare.sh offload_queries/duckdb_offload_like_queries.sql  # 19/19
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh offload_queries/duckdb_offload_like_refusals.sql                                       # 1/1
 ```
 
 Checks: trailing spaces matter (`'abc ' LIKE 'abc'` false), case and
@@ -1425,13 +1425,13 @@ TPC-H: 16 of 22.
 
 ## 42. Functions reviewed against DuckDB (2026-11-17)
 
-Table fx of `duckdb_offload_setup.sql` ("Functions reviewed" block); MTR
+Table fx of `offload_queries/duckdb_offload_setup.sql` ("Functions reviewed" block); MTR
 `offload_functions`. The table of functions and guards: DWL-06, "Function
 review against DuckDB".
 
 ```bash
-MYSQL="mysql --default-character-set=utf8mb4 ... windmills_small" ./duckdb_offload_compare.sh duckdb_offload_fn_queries.sql  # 28/28
-EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh duckdb_offload_fn_refusals.sql                                     # 11/11
+MYSQL="mysql --default-character-set=utf8mb4 ... windmills_small" ./duckdb_offload_compare.sh offload_queries/duckdb_offload_fn_queries.sql  # 28/28
+EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh offload_queries/duckdb_offload_fn_refusals.sql                                     # 11/11
 ```
 
 TPC-H: 19 of 22.
@@ -1467,7 +1467,7 @@ TPC-H: 19 of 22.
 | 2026-11-13 | clang-21, C++23, debug | 25, step 6c-2 (throwaway instance) | pass after a fix | 6c-2 26/26 identical and offloaded, refusals 6/6; regressions 6a 19/19, 6b 45/45, 6c 37/37, refusals 12/12 and 6/6; FOUND_ROWS() 10 and 2 as InnoDB. Fixed: TIMESTAMP UNION ALL DATETIME was offloaded with TIMESTAMP values in UTC (one hour off): the NULL-literal test used is_null() on a column; a FROM-less operand (SELECT 'x') was refused as no_table |
 | 2026-11-13 | clang-21, C++23, debug | 24 (throwaway instance) | pass | reader woken by after_commit: during an 8 s semi-sync wait the binary log had moved (481 -> 798), InnoDB 0, DuckDB 0; both 1 after the commit. SECONDARY_LOAD refused with binlog_order_commits=OFF. Regressions after the change: 6a 19/19, 6b 45/45, 6c 37/37, refusals 12/12 and 8/8, unit tests 38. Seen: a batch of three tables took about 4 s to commit (HDD), so a query right after it can exceed the 5 s freshness wait (applier_behind); re-running the setup reattached the old hist copy (FULL 130 rows): the setup now discards it |
 | 2026-11-13 | clang-21, C++23, debug | 23, step 6c-1 (throwaway instance) | pass after fixes | 6c 37/37 identical and offloaded, 6c refusals 8/8, regressions 6a 19/19, 6b 45/45, 6b refusals 12/12; table without copy: InnoDB with ON, 3889 with FORCED; hist LIVE 49/0, FULL 70/7; optimizer_switch unchanged after offload, refusal and fallback. Fixed during the test: NOT EXISTS crashed the server in the join planner (statement-wide best cost in compare_secondary_engine_cost); EXISTS refused (semi-join materialization rewrote WHERE to <subquery2>); YEAR() column of a derived table refused. Seen: correlated scalar subqueries are rewritten by the server into joins and offloaded |
-| 2026-11-13 | clang-21, C++23, debug | 22, step 6b (reference instance) | pass | setup with duckdb_offload_setup.sql; 45/45 identical and offloaded, 14/14 refused as expected, 6a regression 19/19 |
+| 2026-11-13 | clang-21, C++23, debug | 22, step 6b (reference instance) | pass | setup with offload_queries/duckdb_offload_setup.sql; 45/45 identical and offloaded, 14/14 refused as expected, 6a regression 19/19 |
 | 2026-11-12 | clang-21, C++23, debug | 22, step 6b (throwaway instance) | pass after fixes | 45/45 identical and offloaded, 14/14 refused as expected, 6a 19/19; TIMESTAMP ranges and DST-ambiguous IN lists equal under +05:30, -08:00, SYSTEM. Fixed during the test: a server crash on GROUP BY DAYOFWEEK(dt) (holders typed from the select list instead of JOIN::fields, which the metadata used); YEAR() refused (result type YEAR); integer DIV refused as exact division; SUM of DECIMAL refused above 38 digits; MIN/MAX of utf8mb4_bin ties ('' and ' ') picked a different row; LIKE on a binary column failed in DuckDB's binder; b4 = 1 failed at execution instead of being refused. Accepted: representative of a PAD group under sort-based grouping |
 | 2026-11-07 | clang-21, C++23, debug | 1 | pass | smoke test, 480 files C++23 |
 | 2026-11-09 | clang-21, C++23, debug | 5 (`mill1` load) | pass | before the executor pool, with `thread_stack=8M` |

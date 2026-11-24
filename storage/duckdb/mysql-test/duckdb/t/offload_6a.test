@@ -14,7 +14,7 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 #
 # DWL#6 step 6a: single-table queries, InnoDB and DuckDB results compared
-# (manual-test-plan.md section 21, duckdb_offload_6a_queries.sql).
+# (manual-test-plan.md section 21, project_duckdb/offload_queries/duckdb_offload_6a_queries.sql).
 --source ../include/have_duckdb.inc
 --source ../include/tables_g.inc
 

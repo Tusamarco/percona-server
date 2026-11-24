@@ -517,7 +517,7 @@ computes it (mysys/decimal.cc do_div_mod, Item_func_numhybrid):
   bits is a DuckDB error, never a wrong value.
 - AVG of integers and decimals used DuckDB's `/` (DOUBLE) since 6a: exact
   now (the tests had not hit a difference).
-- Tests: `duckdb_offload_div_queries.sql` (table dv): increments 0, 4, 9,
+- Tests: `offload_queries/duckdb_offload_div_queries.sql` (table dv): increments 0, 4, 9,
   negatives, zero, NULL, nested divisions, ROUND of a division, AVG in
   expressions; the first version rounded where MySQL truncates (increment
   0 and 9) and used F digits where MySQL uses the rounded value (`a / b *
@@ -597,9 +597,9 @@ A2, queries (implemented 2026-11-14):
 - Refused: LIKE on weight collations, functions over them compared or
   grouped (UPPER(c) = ...), SELECT DISTINCT, UNION DISTINCT / INTERSECT /
   EXCEPT, IN subqueries on them, MIN/MAX in joins.
-- Tests: `duckdb_offload_a2_queries.sql` (32: cw with 0900_ai_ci,
+- Tests: `offload_queries/duckdb_offload_a2_queries.sql` (32: cw with 0900_ai_ci,
   general_ci, latin1_swedish_ci, 0900_as_cs; cwd join; dim, p6, g) and
-  `duckdb_offload_a2_refusals.sql` (7); three earlier refusals on `_ci`
+  `offload_queries/duckdb_offload_a2_refusals.sql` (7); three earlier refusals on `_ci`
   columns moved to the A2 list. All passed at the first run.
 
 ### Step 6d-3: performance (in progress)
@@ -722,8 +722,8 @@ Load and applier: DWL-03 (YEAR as USMALLINT, BIT as UBIGINT). Offload:
 - Fixed: an unsigned BIGINT result from 2^63 was sent as a negative number
   (`Item_cache_int::store_value` copies `unsigned_flag` from the item it is
   given; the holder now keeps it set).
-- Tests: `duckdb_offload_yb_queries.sql` (33, identical and offloaded),
-  `duckdb_offload_yb_refusals.sql` (5), MTR `offload_yb`; the 6b refusal
+- Tests: `offload_queries/duckdb_offload_yb_queries.sql` (33, identical and offloaded),
+  `offload_queries/duckdb_offload_yb_refusals.sql` (5), MTR `offload_yb`; the 6b refusal
   `u + 1` (now exact) was replaced by `u - 1`.
 
 ### TIME (2026-11-16)
@@ -976,7 +976,7 @@ return DOUBLE and `sum` returns NULL.
   clause (none under NO_BACKSLASH_ESCAPES); DuckDB's LIKE has no default
   escape, so `LIKE 'a\_b'` matched differently for every collation. We pass
   `Item_func_like::escape()` (MySQL's evaluated escape) as ESCAPE always.
-- Tests: `duckdb_offload_like_queries.sql` (19), `_refusals.sql`, MTR
+- Tests: `offload_queries/duckdb_offload_like_queries.sql` (19), `_refusals.sql`, MTR
   `offload_like`; TPC-H 12 of 22 (Q2, Q13, Q14, Q20).
 
 ### Grouped CHAR values in joins (2026-11-17)
@@ -1002,8 +1002,8 @@ Each MySQL function was compared with DuckDB's on edge values (empty and
 NULL strings, multibyte characters, spaces, latin1; negative, zero and NULL
 numbers; month ends, Feb 29, year 0 and 9999, microseconds) and translated
 only where the results match, with the guards listed. Tests:
-`duckdb_offload_fn_queries.sql` (28, identical and offloaded),
-`duckdb_offload_fn_refusals.sql` (11), MTR `offload_functions`.
+`offload_queries/duckdb_offload_fn_queries.sql` (28, identical and offloaded),
+`offload_queries/duckdb_offload_fn_refusals.sql` (11), MTR `offload_functions`.
 
 | MySQL | Status | DuckDB / guard |
 |---|---|---|

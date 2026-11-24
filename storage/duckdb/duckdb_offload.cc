@@ -1801,7 +1801,7 @@ bool Generator::function(Item_func *fn, std::string *out) {
   }
   // ---- Functions reviewed against DuckDB (2026-11-17) -------------------
   // Each is translated only where DuckDB gives MySQL's result; the guards
-  // below cover the differences found (tests: duckdb_offload_fn_*.sql).
+  // below cover the differences found (tests: project_duckdb/offload_queries/duckdb_offload_fn_*.sql).
   // A string argument: character data (not binary strings); its value is
   // stored as UTF-8 character by character, so character positions match.
   // The arguments of these functions are not the comparison's operands: a

@@ -104,6 +104,187 @@ The library `ha_duckdb.so` contains three plugins:
 - `duckdb_guard`: an audit (event tracking) plugin that enforces the FULL scope rules (see Query offload) and lets the plugin's internal refresh pass `read_only` / `super_read_only`.
 - `DUCKDB_TABLES`: an INFORMATION_SCHEMA plugin, `INFORMATION_SCHEMA.DUCKDB_TABLES`, one row per copy in the lake (state, history flag, primary key, weight columns, load position).
 
+## Paths through the code
+
+Two diagrams, with the functions involved (2026-11-24): how a change
+written to InnoDB reaches the DuckDB copy, and how a query reaches DuckDB
+and comes back. File names are under `storage/duckdb/`.
+
+### A write: from the binary log to the DuckDB copy
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Client session
+    participant M as MySQL (InnoDB + binary log)
+    participant O as after_commit()<br/>duckdb_offload.cc
+    participant R as BinlogReader thread<br/>duckdb_binlog_reader.cc
+    participant D as Row decoder<br/>duckdb_row_decoder.cc
+    participant B as Batch / TableChanges<br/>duckdb_applier.cc, duckdb_changes.cc
+    participant X as Executor thread<br/>Lake::Connection::execute
+    participant L as DuckDB / DuckLake
+
+    S->>M: COMMIT
+    M->>M: ordered_commit: binary log write, InnoDB commit
+    M->>O: Trans_observer after_commit(log file, position)
+    O->>R: notify_committed(file, pos): m_committed, wake up
+    Note over R: loop(): m_position behind m_committed
+    R->>R: read_file(from, end): Binlog_file_reader (the server's)
+    loop every event: handle_event()
+        alt GTID event
+            R->>R: new Trx: GTID, duckdb_avoid_purge tag,<br/>commit timestamps
+        else TABLE_MAP event
+            R->>R: table_info(): loaded tables only, names, charsets,<br/>ENUM / SET elements, primary key (full metadata)
+        else WRITE / UPDATE / DELETE rows
+            R->>R: handle_rows(): skip tables not loaded or<br/>before their load position
+            R->>D: decode_row() / decode_value()
+            D-->>R: Values (text in UTF-8 + collation weight,<br/>ENUM index, JSON text via set_json_to_text)
+            R->>B: TableChanges insert / update / remove<br/>(collapsed per primary key, a tagged purge<br/>becomes an archive mark)
+        else transaction larger than duckdb_apply_batch_max_rows
+            R->>X: write_piece(): applied in pieces inside one<br/>DuckDB transaction
+        else QUERY event with DDL
+            R->>R: parse_ddl() then handle_ddl(): commit_pending() first
+            R->>X: rename_in_lake(), or refresh_copy():<br/>run_internal_statements(ALTER TABLE t SECONDARY_LOAD)<br/>then load_table_into_lake()
+        else TRANSACTION_PAYLOAD (compressed)
+            R->>R: handle_payload(): decompress, handle_event() per event
+        else XID / COMMIT
+            R->>B: end_transaction(): Batch::add(), maybe_commit()
+        end
+    end
+    Note over R,B: commit when duckdb_apply_batch_max_trx / _max_rows /<br/>_max_delay_ms is reached, or a session waits (wait_applied)
+    R->>X: commit_pending(): commit_batch(con, batch)
+    X->>L: apply_mutex, BEGIN TRANSACTION
+    loop every table of the batch: apply_table()
+        X->>L: keys appended to a temp table, then DELETE of the old rows<br/>(live rows only on history tables)
+        X->>L: UPDATE __archived_at = commit time (history: purged rows)
+        X->>L: Appender: new rows, with __w_ weights and __n_ indexes
+    end
+    X->>L: write_position(): lake.__mysql.applied_position (position, GTID)
+    X->>L: COMMIT (one DuckLake snapshot per batch)
+    X-->>R: done
+    R->>R: m_applied = batch end, wake wait_applied() waiters
+```
+
+1. **Wake-up.** The plugin registers a transaction observer. Its
+   `after_commit` hook runs after the InnoDB commit of each transaction,
+   in binary log order (`binlog_order_commits = ON`), and hands the
+   position to the reader with `notify_committed()`. The reader never
+   reads a transaction InnoDB has not committed.
+2. **Reading.** One plugin thread, `BinlogReader::loop()`, reads the
+   binary log files with the server's own `Binlog_file_reader`, from the
+   applied position up to the last committed one. It needs no replication
+   channel and no replica.
+3. **Decoding.** `handle_event()` dispatches each event. `table_info()`
+   keeps the Table_map of loaded tables only: column names, character
+   sets, ENUM / SET elements and the primary key come from
+   `binlog_row_metadata = FULL`. `handle_rows()` decodes each row
+   (`decode_row()`): text becomes UTF-8 and gets MySQL's collation weight
+   when the collation needs one, ENUM / SET get their index, JSON its
+   printed text, TIME microseconds, and so on.
+4. **Collapsing.** `TableChanges` keeps one final state per primary key
+   for the whole batch (insert then update = one insert; insert then
+   delete = nothing). In a transaction tagged `duckdb_avoid_purge`, a
+   delete on a history table becomes an archive mark instead.
+5. **DDL.** A DDL on a loaded table commits the pending batch, then
+   renames or refreshes the copy (an internal `SECONDARY_LOAD` through
+   the session service). A copy that cannot follow is marked stale; the
+   applier goes on.
+6. **Commit.** `commit_batch()` runs on an executor thread (DuckDB never
+   runs on a MySQL session thread). In one DuckDB transaction it applies
+   each table's deletes, archive marks and inserts (Appender), and writes
+   the applied position and GTID in the same commit. After a crash the
+   applier resumes from that position: nothing is applied twice or lost.
+7. **Freshness.** `wait_applied()` lets a session wait for its own last
+   commit (read your own writes) and asks the reader to commit at once.
+
+### A query: from the client to DuckDB and back
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant P as MySQL parser / dispatch<br/>sql_parse.cc
+    participant G as duckdb_guard (audit)<br/>duckdb_guard.cc
+    participant Q as MySQL optimizer<br/>Sql_cmd_dml
+    participant H as Offload hooks<br/>duckdb_offload.cc
+    participant T as Generator (SQL translation)<br/>duckdb_offload.cc
+    participant R as BinlogReader
+    participant X as Executor thread
+    participant L as DuckDB / DuckLake
+
+    C->>P: COM_QUERY / COM_STMT_EXECUTE
+    P->>G: PARSE PREPARSE event
+    G->>R: wait_for_ddl_refresh(): after a DDL on a copy,<br/>wait for its refresh (progress in PROCESSLIST)
+    P->>Q: parse, mysql_execute_command, Sql_cmd_dml::execute
+    Q->>G: TABLE_ACCESS READ event (open tables)
+    G->>Q: history table under FULL scope:<br/>set_execute_only_in_secondary_engine
+    Q->>Q: prepare and optimize for InnoDB (cost estimate)
+    Q->>H: pre_prepare(): cost above secondary_engine_cost_threshold,<br/>or big_table_scan() (duckdb_offload_min_rows)
+    alt not expensive enough
+        H-->>Q: false: InnoDB runs it (not counted)
+    else candidate
+        Q->>H: prepare(): OffloadContext, no semi-join<br/>materialization, no constant tables
+        Q->>Q: prepare and optimize again for the secondary engine
+        Q->>H: optimize()
+        H->>H: wrote_in_transaction()? (own uncommitted rows)
+        H->>T: Generator::generate(): block_sql(), from_list(),<br/>conjuncts() / multi_eq(), expr(), function(),<br/>aggregate(), string_key() (collations), value_literal()
+        T-->>H: DuckDB SQL, or refuse("reason")
+        H->>R: wait_for_applier(): the session's last commit<br/>(duckdb_offload_wait_applied)
+        H->>X: Lake::connect(), duckdb_prepare(): a bind error is a refusal
+        alt DECIMAL above 38 digits or grouped-string check
+            H->>X: run_first(): duckdb_execute_prepared (materialized)
+        else every other statement
+            H->>X: duckdb_execute_prepared_streaming + first chunk
+            X->>L: execute: joins, aggregates, sorts
+        end
+        alt refused or error before the first chunk
+            H-->>Q: note_refusal(), error 3877
+            Q->>Q: check_secondary_engine_statement():<br/>ON: retry as PRIMARY_ONLY (InnoDB), FORCED: error with the reason
+        else ready
+            H->>Q: override_executor_func = execute_offloaded
+            Q->>Q: set_exec_completed (no retry from here)
+            Q->>H: execute_offloaded()
+            H->>H: make_holder() per column, typed like the result metadata
+            loop every chunk (first one already fetched)
+                H->>X: duckdb_fetch_chunk()
+                X->>L: next 2048 rows
+                H->>H: store_cell() per value
+                H->>C: Query_result::send_data() row by row
+            end
+            H->>H: duckdb_offload_queries, duckdb_offload_time_us
+        end
+    end
+```
+
+1. **Before parsing.** The `duckdb_guard` audit plugin sees every
+   statement. If the session's previous statement was a DDL on a table with
+   a copy, it waits here for the copy's refresh (`duckdb_ddl_wait_refresh`).
+2. **Opening tables.** A history table read under
+   `duckdb_history_scope = FULL` is marked "secondary engine only": InnoDB
+   has no archived rows, so that query must run in DuckDB or fail.
+3. **Choosing.** MySQL first plans the query for InnoDB. Our
+   `pre_prepare()` hook says whether DuckDB should be tried: the InnoDB cost
+   is above `secondary_engine_cost_threshold`, or the plan scans a large
+   loaded table (`duckdb_offload_min_rows`). Otherwise InnoDB runs it.
+4. **Translating.** MySQL prepares and optimizes the query again for the
+   secondary engine; our `optimize()` hook translates the resolved query
+   (not its text) into DuckDB SQL. Every construct is translated exactly
+   (collation weights, MySQL's NULL ordering, exact DECIMAL division,
+   parameters and variables as their values ...) or refused with a reason.
+5. **Freshness.** The query waits until the applier has applied the
+   session's last commit, so it reads its own writes.
+6. **Starting in DuckDB.** DuckDB prepares the SQL (a bind error is a
+   refusal) and starts it: the first chunk is fetched here, where DuckDB
+   runs joins, aggregates and sorts. Any refusal or error up to this point
+   lets MySQL run the query on InnoDB (`use_secondary_engine = ON`) or
+   report the reason (`FORCED`).
+7. **Execution.** Once MySQL marks the statement executed, our
+   `execute_offloaded()` replaces MySQL's executor: it fetches the chunks
+   on an executor thread and sends each row through MySQL's own result
+   path, typed exactly like the result metadata the client already
+   received. The client cannot tell which engine answered, except by the
+   time it took.
+
 ## User interface
 
 ```

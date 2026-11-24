@@ -22,8 +22,8 @@
 # the reason (error 3877) and ON gives the InnoDB rows.
 #
 # usage: MYSQL="mysql -S /path/mysql.sock -u dba -pSECRET windmills_small" \
-#        ./duckdb_offload_compare.sh duckdb_offload_6a_queries.sql
-#        EXPECT=refused ./duckdb_offload_compare.sh duckdb_offload_6b_refusals.sql
+#        ./duckdb_offload_compare.sh offload_queries/duckdb_offload_6a_queries.sql
+#        EXPECT=refused ./duckdb_offload_compare.sh offload_queries/duckdb_offload_6b_refusals.sql
 : "${MYSQL:?set MYSQL to the mysql command with connection options and database}"
 M="$MYSQL --force"
 st() { $M -NBe "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = '$1'"; }

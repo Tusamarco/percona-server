@@ -32,7 +32,7 @@ default 15-minute limit: add `--testcase-timeout=45`.
 | `include/wait_applier.inc` | waits until the applier is idle at the binary log end (a debug build's DuckLake commit can exceed the freshness wait) |
 | `include/duckdb_compare.inc` | `$query` with OFF and FORCED: results compared (`--diff_files`), the FORCED run must have run in DuckDB |
 | `include/duckdb_refused.inc` | `$query` refused with FORCED (reason recorded), ON gives the InnoDB rows |
-| `include/tables_*.inc` | test tables (as `project_duckdb/duckdb_offload_setup.sql`) |
+| `include/tables_*.inc` | test tables (as `project_duckdb/offload_queries/duckdb_offload_setup.sql`) |
 | `include/cleanup.inc` | drops the test tables, discards stale history copies |
 
 ## Tests
@@ -50,14 +50,14 @@ default 15-minute limit: add `--testcase-timeout=45`.
 | `foreign_keys` | tables with foreign keys: ON DELETE / ON UPDATE CASCADE, SET NULL, RESTRICT; tagged purge archives cascaded history rows |
 | `transactions` | autocommit=0 and BEGIN: no secondary engine, FORCED gives the reason (was a debug assertion) |
 | `offload_rules` | cost threshold, duckdb_offload_min_rows, read your own writes, transaction that wrote, EXPLAIN notes, max_execution_time (21, 27, 28, 30) |
-| `offload_6a`, `offload_6b`, `offload_6c1`, `offload_6c2`, `offload_6c3`, `offload_division`, `offload_weights` | the query lists `project_duckdb/duckdb_offload_*_queries.sql`, InnoDB vs DuckDB |
+| `offload_6a`, `offload_6b`, `offload_6c1`, `offload_6c2`, `offload_6c3`, `offload_division`, `offload_weights` | the query lists `project_duckdb/offload_queries/duckdb_offload_*_queries.sql`, InnoDB vs DuckDB |
 | `offload_time` | TIME: constants in every form, negative and > 24 h values, fractions, refusals (37) |
 | `offload_enum` | ENUM and SET: value and index contexts, invalid value, history copy across a definition change, refusals (38) |
 | `offload_like` | LIKE on binary collations (latin1_bin, utf8mb4_bin): trailing spaces, case, accents, escapes, NO_BACKSLASH_ESCAPES; LIKE on _ci refused (40) |
 | `offload_grouped_char` | grouped CHAR under binary collations shown in a join (exact); VARCHAR and _ci refused; PAD_CHAR_TO_FULL_LENGTH refused (41) |
 | `offload_functions` | functions reviewed against DuckDB: date, number and string functions with edge values; the refused ones (42) |
 | `offload_yb` | YEAR and BIT: load, applier, results (YEAR columns zero-filled, BIT as bytes), unsigned arithmetic, refusals (36) |
-| `offload_refusals` | the refusal lists `duckdb_offload_*_refusals.sql` |
+| `offload_refusals` | the refusal lists `project_duckdb/offload_queries/duckdb_offload_*_refusals.sql` |
 | `offload_counters` | SUM / AVG of FLOAT and DOUBLE (`duckdb_offload_float_aggregates`), FLOAT sent as FLOAT, the offload counters (runs, EXPLAIN, waits), `duckdb_offload_wait_timeout_ms`, the user's `optimizer_switch` kept around offload |
 
 Not in MTR (manual-test-plan.md): restarts with special options and long
