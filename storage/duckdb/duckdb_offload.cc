@@ -474,6 +474,7 @@ class Generator {
   bool exact_division(const std::string &a, int f1, const std::string &b,
                       int f2, int round_to, int a_digits, std::string *out);
   bool temporal_arg(Item *item, std::string *out);
+  bool cast(Item_func *fn, std::string *out);
   bool order_key(Item *item, std::string *out);
   bool enum_index(Item *item, std::string *out);
   bool weight_expr(Item *item, const CHARSET_INFO *cs, std::string *out);
@@ -2210,6 +2211,10 @@ bool Generator::function(Item_func *fn, std::string *out) {
     *out = "CAST(instr(" + hay + ", " + needle + ") AS BIGINT)";
     return false;
   }
+  if (name == "cast_as_signed" || name == "cast_as_unsigned" ||
+      name == "cast_as_decimal" || name == "cast_as_real" ||
+      name == "cast_as_char" || name == "cast_as_datetime")
+    return cast(fn, out);
   struct DateFn {
     const char *mysql;
     const char *prefix;
@@ -2238,6 +2243,115 @@ bool Generator::function(Item_func *fn, std::string *out) {
     return false;
   }
   return refuse("unsupported_function:" + name);
+}
+
+// CAST / CONVERT (T3, 2026-11-24): the conversions DuckDB does as MySQL.
+// Sources: integers, DECIMAL, DATE, DATETIME (not TIMESTAMP: session time
+// zone). Strings and DOUBLE as sources are refused: MySQL's string to
+// number rules (prefix, warnings) and its DOUBLE printing differ from
+// DuckDB's. CAST AS DATE goes through the date functions (function()).
+// - SIGNED: integers; DECIMAL rounded half away from zero (both), when
+//   its integer part fits in BIGINT (MySQL clips with a warning, DuckDB
+//   errors); BIGINT UNSIGNED refused (MySQL reinterprets the bits).
+// - UNSIGNED: integers; a negative value wraps to 2^64 + x as in MySQL.
+// - DECIMAL(M, D): integers and DECIMAL whose integer part fits (else
+//   MySQL clips to 99.9 with a warning); a smaller scale rounds half away
+//   from zero in both.
+// - DOUBLE / FLOAT: integers (both round to the nearest double).
+// - CHAR [(N)]: integers, DECIMAL (printed with MySQL's scale), DATE,
+//   DATETIME(0); N truncates (MySQL also warns). BINARY refused.
+// - DATETIME(n): DATE, or DATETIME(m) with m <= n (fewer digits round in
+//   MySQL).
+bool Generator::cast(Item_func *fn, std::string *out) {
+  const std::string name = fn->func_name();
+  Item *a = fn->arguments()[0]->real_item();
+  if (special_column(a) != SpecialColumn::NONE || is_string(a) ||
+      a->data_type() == MYSQL_TYPE_TIMESTAMP ||
+      a->data_type() == MYSQL_TYPE_TIME || a->data_type() == MYSQL_TYPE_JSON)
+    return refuse("cast_source:" + name);
+  const bool integer = a->result_type() == INT_RESULT && !a->is_temporal();
+  const bool decimal = a->result_type() == DECIMAL_RESULT && !a->is_temporal();
+  const enum_field_types t = a->data_type();
+  std::string e;
+  // A DECIMAL source with the precision and scale MySQL gave it (an
+  // expression's DuckDB scale can differ; the cast fixes it).
+  auto source = [&](std::string *s) -> bool {
+    if (expr(a, s)) return true;
+    if (decimal) {
+      const unsigned p = a->decimal_precision();
+      if (p > 38) return refuse("cast_decimal_over_38_digits");
+      *s = "CAST(" + *s + " AS DECIMAL(" + std::to_string(std::max(p, 1u)) +
+           ", " + std::to_string(a->decimals) + "))";
+    }
+    return false;
+  };
+  if (name == "cast_as_signed") {
+    if (integer && !(a->unsigned_flag && t == MYSQL_TYPE_LONGLONG)) {
+      if (source(&e)) return true;
+      *out = "CAST(" + e + " AS BIGINT)";
+      return false;
+    }
+    if (decimal && a->decimal_int_part() <= 18) {
+      if (source(&e)) return true;
+      *out = "CAST(" + e + " AS BIGINT)";
+      return false;
+    }
+    return refuse("cast_source:" + name);
+  }
+  if (name == "cast_as_unsigned") {
+    if (!integer) return refuse("cast_source:" + name);
+    if (source(&e)) return true;
+    if (a->unsigned_flag)
+      *out = "CAST(" + e + " AS UBIGINT)";
+    else
+      *out = "CAST(CASE WHEN " + e + " < 0 THEN CAST(" + e +
+             " AS HUGEINT) + 18446744073709551616 ELSE " + e +
+             " END AS UBIGINT)";
+    return false;
+  }
+  if (name == "cast_as_decimal") {
+    const unsigned p = fn->decimal_precision();
+    const unsigned d = fn->decimals;
+    if (p > 38) return refuse("cast_decimal_over_38_digits");
+    if (!(integer || decimal) ||
+        static_cast<unsigned>(a->decimal_int_part()) > p - d)
+      return refuse("cast_source:" + name);
+    if (source(&e)) return true;
+    *out = "CAST(" + e + " AS DECIMAL(" + std::to_string(p) + ", " +
+           std::to_string(d) + "))";
+    return false;
+  }
+  if (name == "cast_as_real") {
+    if (!integer) return refuse("cast_source:" + name);
+    if (source(&e)) return true;
+    *out = "CAST(" + e + " AS " +
+           (fn->data_type() == MYSQL_TYPE_FLOAT ? "FLOAT" : "DOUBLE") + ")";
+    return false;
+  }
+  if (name == "cast_as_datetime") {
+    if (t != MYSQL_TYPE_DATE &&
+        !(t == MYSQL_TYPE_DATETIME && a->decimals <= fn->decimals))
+      return refuse("cast_source:" + name);
+    if (temporal_arg(a, &e)) return true;
+    *out = "CAST(" + e + " AS TIMESTAMP)";
+    return false;
+  }
+  // cast_as_char
+  if (fn->collation.collation == &my_charset_bin)
+    return refuse("cast_as_binary");
+  if (integer || decimal) {
+    if (source(&e)) return true;
+  } else if (t == MYSQL_TYPE_DATE ||
+             (t == MYSQL_TYPE_DATETIME && a->decimals == 0)) {
+    if (temporal_arg(a, &e)) return true;
+  } else {
+    return refuse("cast_source:" + name);
+  }
+  e = "CAST(" + e + " AS VARCHAR)";
+  if (a->max_char_length() > fn->max_char_length())
+    e = "left(" + e + ", " + std::to_string(fn->max_char_length()) + ")";
+  *out = e;
+  return false;
 }
 
 // A grouped PAD SPACE string expression shown after grouping: the group

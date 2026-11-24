@@ -776,7 +776,7 @@ not a read). Last update: 2026-11-17 (function review, TPC-H 19/22,
 | Unsigned arithmetic | partial | + and * that cannot overflow; subtraction refused (MySQL error 1690) |
 | DECIMAL results declared above 38 digits | done | 2026-11-17: computed as DECIMAL(38, scale), run first; `duckdb_decimal_overflow` FALLBACK / ROUND / ERROR (TPC-H Q11) |
 | CASE, IF, IFNULL, COALESCE, NULLIF | done | |
-| CAST / CONVERT | missing | not reviewed yet |
+| CAST / CONVERT | partial | 2026-11-24 (T3): from integers, DECIMAL, DATE, DATETIME to SIGNED, UNSIGNED, DECIMAL(M,D), DOUBLE / FLOAT, CHAR[(N)], DATETIME(n), DATE; rounding half away from zero as MySQL. Refused: string, DOUBLE, TIMESTAMP, TIME sources; casts MySQL clips with a warning (integer part that may not fit); BIGINT UNSIGNED to SIGNED; fewer fractional digits; DATETIME(n>0) to CHAR; BINARY, TIME, YEAR, JSON targets; CONVERT ... USING. MTR `offload_cast` |
 | Numeric functions | partial | ABS, ROUND (not of DOUBLE), FLOOR, CEIL, SIGN, TRUNCATE (exact), SQRT, LN, LOG, LOG2, LOG10, GREATEST / LEAST of numbers (2026-11-17 review, DWL-06); refused: EXP, POW (overflow errors), RAND |
 | String functions | partial | CHAR_LENGTH, LENGTH (UTF-8 charsets), SUBSTRING, LEFT, RIGHT, CONCAT, CONCAT_WS, TRIM (spaces / one character), REPLACE, REVERSE, LPAD, RPAD, INSTR, LOCATE (binary collations) (2026-11-17); refused: UPPER, LOWER (case mapping differs), ASCII; not reviewed: REGEXP, SOUNDEX, FORMAT, ... |
 | Date parts: YEAR, MONTH, DAYOFMONTH, DAYOFYEAR, QUARTER, DAYOFWEEK, WEEKDAY, HOUR, MINUTE, SECOND, DATE of DATE / DATETIME | done | 6b |
@@ -965,8 +965,9 @@ archived rows)
       CURRENT_DATE, DATE_FORMAT, functions on TIMESTAMP columns.
       Done: the NOW() family (2026-11-24, MTR `offload_now`: NOW,
       CURRENT_TIMESTAMP(n), CURDATE, CURTIME, UTC_*, UNIX_TIMESTAMP(), as
-      the statement's fixed value; SYSDATE refused). Next: CAST / CONVERT,
-      DATE_FORMAT, functions on TIMESTAMP columns.
+      the statement's fixed value; SYSDATE refused); CAST / CONVERT from
+      numbers and dates (2026-11-24, MTR `offload_cast`). Next: DATE_FORMAT,
+      functions on TIMESTAMP columns.
 - [ ] Applier: XA transactions on loaded tables, `binlog_encryption=ON`.
 
 **T4. Loadability** (a table that cannot be loaded has no offload and no

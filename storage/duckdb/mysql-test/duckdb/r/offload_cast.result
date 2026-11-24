@@ -1,0 +1,74 @@
+CREATE TABLE tc (id INT PRIMARY KEY, i INT, bi BIGINT, u INT UNSIGNED, ubi BIGINT UNSIGNED,
+dc DECIMAL(10,3), dl DECIMAL(30,2), dbl DOUBLE, s VARCHAR(20), d DATE, dt DATETIME, dt3 DATETIME(3), ts TIMESTAMP NULL)
+SECONDARY_ENGINE = duckdb;
+INSERT INTO tc VALUES
+(1, 42, 9000000000, 7, 18446744073709551615, 2.500, 12345678901234567890123.45, 1.5, '12abc', '2024-11-24', '2024-11-24 10:11:12', '2024-11-24 10:11:12.345', '2024-11-24 10:00:00'),
+(2, -42, -9000000000, 0, 0, -2.500, -1.50, -1.5, '7', '0999-01-31', '2000-02-29 23:59:59', '2000-02-29 23:59:59.999', NULL),
+(3, 0, 0, 4294967295, 5, 1.449, 0.05, 0, '', '2024-02-29', '2024-01-01 00:00:00', '2024-01-01 00:00:00.000', NULL),
+(4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+(5, 2147483647, 9223372036854775807, 1, 1, -0.499, 99.995, 2, 'x', '2024-12-31', '2024-12-31 23:59:59', '2024-12-31 23:59:59.500', NULL);
+Warnings:
+Note	1265	Data truncated for column 'dl' at row 5
+ALTER TABLE tc SECONDARY_LOAD;
+# SELECT id, CAST(i AS SIGNED), CAST(bi AS SIGNED), CAST(u AS SIGNED), CAST(dc AS SIGNED), CAST(dc * 3 AS SIGNED) FROM tc ORDER BY id
+# SELECT id, CAST(i AS UNSIGNED), CAST(bi AS UNSIGNED), CAST(u AS UNSIGNED), CAST(ubi AS UNSIGNED) FROM tc ORDER BY id
+# SELECT id, CAST(dc AS DECIMAL(8,1)), CAST(dc AS DECIMAL(9,2)), CAST(i AS DECIMAL(12,2)), CAST(dl AS DECIMAL(30,1)), CONVERT(dc, DECIMAL(8,0)) FROM tc ORDER BY id
+# SELECT id, CAST(i AS DOUBLE), CAST(bi AS DOUBLE), CAST(i AS FLOAT), CAST(bi AS REAL) FROM tc ORDER BY id
+# SELECT id, CAST(i AS CHAR), CAST(dc AS CHAR), CAST(dl AS CHAR), CAST(d AS CHAR), CAST(dt AS CHAR), CAST(bi AS CHAR(3)), CONVERT(ubi, CHAR) FROM tc ORDER BY id
+# SELECT id, CAST(dc / 7 AS CHAR), CAST(i * dc AS CHAR) FROM tc ORDER BY id
+# SELECT id, CAST(d AS DATETIME), CAST(dt AS DATETIME), CAST(dt AS DATETIME(2)), CAST(dt3 AS DATETIME(6)), CAST(dt3 AS DATE) FROM tc ORDER BY id
+# SELECT id FROM tc WHERE CAST(dt AS DATE) = '2024-11-24' OR CAST(d AS DATETIME) < '2000-01-01 00:00:01' ORDER BY id
+# SELECT CAST(dc AS SIGNED) AS k, COUNT(*) FROM tc GROUP BY k ORDER BY k
+# Refused: string, DOUBLE, TIMESTAMP sources; overflow MySQL clips;
+# BIGINT UNSIGNED to SIGNED; fewer fractional digits; BINARY.
+# SELECT id, CAST(s AS SIGNED) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(s AS SIGNED) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(dbl AS SIGNED) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(dbl AS SIGNED) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(dbl AS CHAR) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(dbl AS CHAR) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(ts AS DATETIME) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(ts AS DATETIME) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(dl AS SIGNED) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(dl AS SIGNED) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(dc AS DECIMAL(3,2)) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(dc AS DECIMAL(3,2)) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(ubi AS SIGNED) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(ubi AS SIGNED) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(dt3 AS DATETIME) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(dt3 AS DATETIME) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(dt3 AS CHAR) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(dt3 AS CHAR) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(i AS BINARY) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(i AS BINARY) FROM tc ORDER BY id;
+Got one of the listed errors
+# SELECT id, CAST(dt AS TIME) FROM tc ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, CAST(dt AS TIME) FROM tc ORDER BY id;
+Got one of the listed errors
+# The result of CAST AS CHAR has the connection's collation
+# (utf8mb4_0900_ai_ci): LIKE and comparisons on it follow the collation rules.
+# SELECT id FROM tc WHERE CAST(i AS CHAR) LIKE '4%' ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id FROM tc WHERE CAST(i AS CHAR) LIKE '4%' ORDER BY id;
+Got one of the listed errors
+DROP TABLE tc;
