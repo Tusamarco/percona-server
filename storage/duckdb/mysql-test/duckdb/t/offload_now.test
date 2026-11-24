@@ -1,0 +1,56 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# T3 step 1 (2026-11-24): NOW() / CURRENT_TIMESTAMP, CURDATE() /
+# CURRENT_DATE, UTC_TIMESTAMP, UTC_DATE, UNIX_TIMESTAMP() are fixed when the
+# statement starts: printed as constants. SYSDATE() changes during the
+# statement: refused. SET TIMESTAMP fixes the clock so that the InnoDB and
+# DuckDB runs of each query see the same time.
+--source ../include/have_duckdb.inc
+CREATE TABLE tn (id INT PRIMARY KEY, d DATE, dt DATETIME(3), ts TIMESTAMP(3) NULL) SECONDARY_ENGINE = duckdb;
+INSERT INTO tn VALUES (1, '2024-11-23', '2024-11-24 09:59:59.999', '2024-11-24 09:00:00'),
+  (2, '2024-11-24', '2024-11-24 10:00:00.000', '2024-11-24 10:30:00'), (3, '2024-11-25', '2024-11-25 00:00:00', '2024-11-24 12:00:00'),
+  (4, '2023-11-24', '2023-11-24 10:00:00', NULL), (5, NULL, NULL, '2025-01-01 00:00:00');
+ALTER TABLE tn SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+SET SESSION time_zone = '+02:00';
+# 2024-11-24 10:00:00.250 in the session time zone (08:00:00.250 UTC)
+SET TIMESTAMP = UNIX_TIMESTAMP('2024-11-24 10:00:00.250');
+
+--let $query= SELECT id FROM tn WHERE d >= CURDATE() ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM tn WHERE d >= NOW() ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM tn WHERE dt < NOW() AND dt > NOW() - INTERVAL 1 YEAR ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM tn WHERE dt >= CURRENT_TIMESTAMP(3) ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM tn WHERE ts > NOW() ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, DATEDIFF(CURDATE(), d) FROM tn ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, NOW(), NOW(3), CURDATE(), UTC_TIMESTAMP(), UTC_DATE(), UNIX_TIMESTAMP() FROM tn WHERE id < 3 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT COUNT(*) FROM tn WHERE dt BETWEEN CURRENT_DATE - INTERVAL 1 DAY AND NOW()
+--source ../include/duckdb_compare.inc
+
+--echo # SYSDATE() changes during the statement: refused
+--let $query= SELECT id FROM tn WHERE dt < SYSDATE() ORDER BY id
+--source ../include/duckdb_refused.inc
+
+SET TIMESTAMP = DEFAULT;
+SET SESSION time_zone = DEFAULT;
+DROP TABLE tn;
+--source ../include/cleanup.inc

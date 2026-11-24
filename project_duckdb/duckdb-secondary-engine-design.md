@@ -782,7 +782,8 @@ not a read). Last update: 2026-11-17 (function review, TPC-H 19/22,
 | Date parts: YEAR, MONTH, DAYOFMONTH, DAYOFYEAR, QUARTER, DAYOFWEEK, WEEKDAY, HOUR, MINUTE, SECOND, DATE of DATE / DATETIME | done | 6b |
 | EXTRACT(unit FROM ...) | done | 2026-11-17, every unit but WEEK (default_week_format) |
 | Date arithmetic on columns | partial | `d +/- INTERVAL n unit`, DATE_ADD / SUB, ADDDATE / SUBDATE, DATEDIFF, TO_DAYS, LAST_DAY, DAYNAME / MONTHNAME (en_US) (2026-11-17); missing: TIMESTAMPDIFF, multi-part units |
-| DATE_FORMAT, STR_TO_DATE, CURRENT_DATE / NOW() in expressions | missing | |
+| NOW() / CURRENT_TIMESTAMP, CURDATE() / CURRENT_DATE, CURTIME(), UTC_TIMESTAMP / UTC_DATE / UTC_TIME, UNIX_TIMESTAMP() | done | 2026-11-24 (T3): the value MySQL fixed at the start of the statement, sent as a typed literal (so `SET TIMESTAMP` and the session time zone apply); a DATE column compared with NOW() compares as DATETIME as in MySQL; SYSDATE() refused (it changes during the statement); MTR `offload_now` |
+| DATE_FORMAT, STR_TO_DATE | missing | |
 | Functions on TIMESTAMP columns (session time zone) | missing | |
 | Bit operators (& | ^ ~ << >>) | missing | |
 | JSON functions | missing | |
@@ -962,6 +963,10 @@ archived rows)
       of its last applied state with a warning instead of refusing.
 - [ ] Translate first what history reports use: CAST / CONVERT, NOW() /
       CURRENT_DATE, DATE_FORMAT, functions on TIMESTAMP columns.
+      Done: the NOW() family (2026-11-24, MTR `offload_now`: NOW,
+      CURRENT_TIMESTAMP(n), CURDATE, CURTIME, UTC_*, UNIX_TIMESTAMP(), as
+      the statement's fixed value; SYSDATE refused). Next: CAST / CONVERT,
+      DATE_FORMAT, functions on TIMESTAMP columns.
 - [ ] Applier: XA transactions on loaded tables, `binlog_encryption=ON`.
 
 **T4. Loadability** (a table that cannot be loaded has no offload and no

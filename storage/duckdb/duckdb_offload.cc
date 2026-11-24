@@ -273,9 +273,20 @@ bool is_constant(const Item *item) {
   const Item *r = const_cast<Item *>(item)->real_item();
   if (r->type() == Item::PARAM_ITEM || r->type() == Item::ROUTINE_FIELD_ITEM)
     return true;
-  return r->type() == Item::FUNC_ITEM &&
-         down_cast<const Item_func *>(r)->functype() ==
-             Item_func::GUSERVAR_FUNC;
+  // The optimizer caches a value fixed for the statement (NOW() compared
+  // with a column): constant when what it caches is.
+  if (r->type() == Item::CACHE_ITEM) {
+    const Item *example = down_cast<const Item_cache *>(r)->get_example();
+    return example != nullptr && is_constant(example);
+  }
+  if (r->type() != Item::FUNC_ITEM) return false;
+  const auto *fn = down_cast<const Item_func *>(r);
+  if (fn->functype() == Item_func::GUSERVAR_FUNC) return true;
+  // The clock functions fixed at the start of the statement (T3).
+  const std::string name = fn->func_name();
+  return name == "now" || name == "utc_timestamp" || name == "curdate" ||
+         name == "utc_date" || name == "curtime" || name == "utc_time" ||
+         (name == "unix_timestamp" && fn->argument_count() == 0);
 }
 
 // Columns whose lake value is not what MySQL uses in every context: TIME
@@ -752,13 +763,16 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
   Item **args = fn->arguments();
   enum_field_types temporal = MYSQL_TYPE_NULL;
   bool timestamp = false, strings = false, numbers = false, pad = false;
-  bool const_numbers = false, time = false;
+  bool const_numbers = false, time = false, const_datetime = false;
   size_t max_bytes = 0;
   for (unsigned i = from; i < to; i++) {
     Item *a = args[i]->real_item();
     if (is_constant(a)) {
       if (is_string(a))
         max_bytes = std::max<size_t>(max_bytes, a->max_length);
+      else if (a->data_type() == MYSQL_TYPE_DATETIME ||
+               a->data_type() == MYSQL_TYPE_TIMESTAMP)
+        const_datetime = true;  // NOW(): a DATE column compares as DATETIME
       else if (!a->is_temporal() && !a->is_null())
         const_numbers = true;
       continue;
@@ -787,6 +801,8 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
     return refuse("mixed_timestamp_comparison");
   if (temporal != MYSQL_TYPE_NULL && (strings || numbers))
     return refuse("mixed_temporal_comparison");
+  if (temporal == MYSQL_TYPE_DATE && const_datetime)
+    temporal = MYSQL_TYPE_DATETIME;
   // ENUM / SET columns compared with number constants: MySQL compares as
   // DOUBLE, the column giving its index / bitmask (val_real).
   if (strings && const_numbers && !numbers) {
@@ -1069,8 +1085,16 @@ bool Generator::unsigned_arith(Item *left, Item *right, char op,
 // TIMESTAMP (UTC in DuckDB) and strings are refused.
 bool Generator::temporal_arg(Item *item, std::string *out) {
   Item *a = item->real_item();
-  if (!is_date_or_datetime(a->data_type()) || is_constant(a))
+  if (!is_date_or_datetime(a->data_type()))
     return refuse("date_function_argument");
+  // A constant of DATE / DATETIME type (NOW(), CURDATE(), a parameter): its
+  // value, typed as it is.
+  if (is_constant(a))
+    return typed_literal(a,
+                         a->data_type() == MYSQL_TYPE_DATE
+                             ? MYSQL_TYPE_DATE
+                             : MYSQL_TYPE_DATETIME,
+                         out);
   return expr(a, out);
 }
 
@@ -1481,6 +1505,21 @@ bool Generator::function(Item_func *fn, std::string *out) {
   Item **args = fn->arguments();
   const unsigned n = fn->argument_count();
   const std::string name = fn->func_name();
+  // NOW() / CURRENT_TIMESTAMP / LOCALTIME, CURDATE() / CURRENT_DATE,
+  // UTC_TIMESTAMP, UTC_DATE, CURTIME, UTC_TIME, UNIX_TIMESTAMP(): MySQL fixes
+  // their value when the statement starts (thd->query_start), the same for
+  // every row: we print that value (T3, 2026-11-24). SYSDATE() changes during
+  // the statement: not translated.
+  if (name == "now" || name == "utc_timestamp" || name == "curdate" ||
+      name == "utc_date") {
+    const bool date = name == "curdate" || name == "utc_date";
+    enum_field_types t = date ? MYSQL_TYPE_DATE : MYSQL_TYPE_DATETIME;
+    // Compared with a TIMESTAMP column: in UTC, as the column is stored.
+    if (m_temporal == MYSQL_TYPE_TIMESTAMP) t = MYSQL_TYPE_TIMESTAMP;
+    return typed_literal(fn, t, out);
+  }
+  if (name == "curtime" || name == "utc_time") return time_literal(fn, out);
+  if (name == "unix_timestamp" && n == 0) return value_literal(fn, out);
   // A user variable (@x): its value, constant in a statement that does not
   // assign it (@x := ... is not translated).
   if (fn->functype() == Item_func::GUSERVAR_FUNC) {

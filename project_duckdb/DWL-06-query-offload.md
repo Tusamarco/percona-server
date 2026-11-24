@@ -1030,6 +1030,8 @@ only where the results match, with the guards listed. Tests:
 | `INSTR`, `LOCATE(sub, s)` | translated | binary collations only (a search under `_ci` ignores case); the parser builds LOCATE with the string first; `LOCATE` with a start position not yet |
 | `UPPER`, `LOWER` | refused | case mappings differ (DuckDB `upper('ß')` = 'ẞ', MySQL 'ß') |
 | `ASCII` | refused | MySQL: first byte; DuckDB: code point |
+| `NOW()` / `CURRENT_TIMESTAMP(n)` / `LOCALTIME`, `CURDATE()` / `CURRENT_DATE`, `CURTIME()`, `UTC_TIMESTAMP`, `UTC_DATE`, `UTC_TIME`, `UNIX_TIMESTAMP()` | translated (2026-11-24, T3) | MySQL fixes them at the start of the statement; we send that value as a typed literal (`TIMESTAMP '2024-11-24 10:00:00.250'`, `DATE ...`), so `SET TIMESTAMP` and the session time zone give MySQL's value. Compared with a DATE column, NOW() makes the comparison DATETIME (the date at midnight) as in MySQL; with a TIMESTAMP column the literal is converted as the column's other constants. The optimizer's cached copy (`Item_cache`) of such a value counts as a constant. MTR `offload_now` |
+| `SYSDATE()` | refused | its value changes during the statement |
 | not reviewed yet | refused | DATE_FORMAT, STR_TO_DATE, TIMESTAMPDIFF, CAST / CONVERT, bit operators, REGEXP, JSON, STDDEV / VARIANCE, GROUP_CONCAT, window functions |
 
 Also fixed during the review: string constants of these functions'
