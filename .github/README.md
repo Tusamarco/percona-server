@@ -100,16 +100,22 @@ The function-by-function version of both paths is in the
 | `SECONDARY_LOAD` / `UNLOAD`, detach and reattach, history copies (DWL-03) | done |
 | Binlog applier: DML, large transactions, DDL follow-up, compressed payloads (DWL-04) | done |
 | History retention, tagged purges, LIVE/FULL scope (DWL-05) | done |
-| Query offload: expressions, joins, subqueries, derived tables, views, CTEs, UNION / INTERSECT / EXCEPT, LIKE, collations (DWL-06) | in progress |
+| Query offload: expressions, joins, subqueries, derived tables, views, CTEs, UNION / INTERSECT / EXCEPT, LIKE, collations, prepared statement parameters and variables, CAST / CONVERT, DATE_FORMAT, NOW() and the other clock functions (DWL-06) | in progress |
+| JSON and spatial columns (loaded; the column itself, IS NULL and COUNT offloaded) | done |
+| DuckDB errors at the start of execution (out of memory, temporary disk full): the query runs on InnoDB | done |
 | FULL scope guard (DWL-07) | done |
-| TPC-H, 22 queries (correctness check at scale factor 0.01) | **19 offloaded with identical results**, 3 refused (Q16, Q21, Q22), none wrong — [details](/project_duckdb/tpch/README.md) |
-| Tests | 25 MTR tests, each offloaded query run with offload OFF and FORCED and the results compared; 39 unit tests |
+| TPC-H, 22 queries (correctness check at scale factor 0.01) | **22 of 22 offloaded with identical results**, none wrong — [details](/project_duckdb/tpch/README.md); all 22 also run offloaded in HammerDB TPROC-H at scale factor 100 on a release build |
+| Tests | 37 MTR tests, each offloaded query run with offload OFF and FORCED and the results compared; 41 unit tests |
 
 Not yet supported:
-- Window functions and ROLLUP.
-- JSON, spatial and VECTOR columns.
-- DECIMAL above precision 38.
-- Offload inside multi-statement transactions (a server rule).
+- Window functions, ROLLUP, GROUP_CONCAT.
+- Functions on TIMESTAMP columns (they depend on the session time zone).
+- Functions and comparisons on JSON and spatial columns (the columns
+  themselves are loaded and can be selected).
+- VECTOR columns, DECIMAL columns above precision 38, tables without a
+  primary key.
+- Offload inside multi-statement transactions (`autocommit = 0`, `BEGIN`):
+  MySQL never uses a secondary engine there.
 
 The full list is in [HOWTO § 12](/project_duckdb/HOWTO.md).
 

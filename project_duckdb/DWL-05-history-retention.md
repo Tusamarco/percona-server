@@ -1,6 +1,6 @@
 # DWL#5: History retention: purge marker and archive marks
 
-Affects: Percona Server 9.7 — Status: implemented, verified on a throwaway instance (2026-11-12); MTR postponed
+Affects: Percona Server 9.7 — Status: implemented, verified on a throwaway instance (2026-11-12); MTR `history` in the suite
 
 FR 1 to 6 were implemented with the applier (DWL#4 steps 4b and 4c); FR 9
 and 10 on 2026-11-12. FR 7 and 8 were dropped (see the decisions).

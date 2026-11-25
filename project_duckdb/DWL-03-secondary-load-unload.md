@@ -1,6 +1,6 @@
 # DWL#3: Secondary tables: SECONDARY_LOAD and SECONDARY_UNLOAD
 
-Affects: Percona Server 9.7 — Status: step 3a implemented (under test), step 3b implemented, verified on a throwaway instance (2026-11-11) and on the reference instance (2026-11-12); MTR postponed
+Affects: Percona Server 9.7 — Status: step 3a implemented (under test), step 3b implemented, verified on a throwaway instance (2026-11-11) and on the reference instance (2026-11-12); MTR `duckdb_plugin`, `history`, `foreign_keys`, `json_geometry` in the suite
 
 ## Description
 
@@ -96,11 +96,15 @@ table for the speedup measurement.
 4. Supported types in the POC: TINYINT, SMALLINT, MEDIUMINT, INT, BIGINT (signed
    and unsigned), DECIMAL (precision up to 38), FLOAT, DOUBLE, CHAR, VARCHAR,
    TEXT types, BINARY, VARBINARY, BLOB types, DATE, DATETIME, TIMESTAMP.
+   Added since: YEAR, BIT, TIME, ENUM, SET (2026-11-16); JSON and spatial
+   types (2026-11-23, see Type mapping). Still refused: VECTOR, DECIMAL
+   above 38 digits.
 5. Text columns in any character set and any collation are loaded; values are
    stored as UTF-8 (converted with the server's own conversion when the
    character set is not UTF-8 compatible). Binary strings are stored as BLOB.
    Collation semantics are enforced at query time (DWL#6) and made exact in
-   Phase 2.
+   Phase 2. (2026-11-14: exact with hidden weight columns `__w_<col>`, DWL#6
+   step A.)
 6. Zero dates and zero timestamps make the load fail, naming the column.
 7. `SECONDARY_ENGINE_ATTRIBUTE` must be a JSON object with `retain_history`
    (boolean) and `adopt_history_from` ("db.table" or "table", 3b; requires
@@ -365,7 +369,7 @@ flight at load start.
 - `enable_external_access=false`: verified by loading `mill1` (DuckLake must
   still write Parquet files to `data/`).
 - File cleanup after unload and discard: Phase 3 (snapshot expiry).
-- MTR suite: postponed.
+- MTR suite: postponed. (Since 2026-11-16: `duckdb_plugin`, `history`.)
 - A resync waits at most 60 s for the applier; on a timeout it fails ("try
   again").
 

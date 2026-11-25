@@ -12,12 +12,12 @@ MySQL WL numbers.
 | ID | Title | Status | Depends on |
 |---|---|---|---|
 | [DWL#1](DWL-01-build-integration.md) | Build integration of DuckDB, DuckLake and CRoaring | Implemented, verified | none |
-| [DWL#2](DWL-02-plugin-infrastructure.md) | Plugin infrastructure, configuration and DuckLake storage | Implemented (2a, executor pool), under test | DWL#1 |
-| [DWL#3](DWL-03-secondary-load-unload.md) | Secondary tables: SECONDARY_LOAD and SECONDARY_UNLOAD | 3a implemented, under test; 3b (reattach, resync, adopt_history_from, structure check, confirmed discard, two-transaction load) implemented, verified on a throwaway instance; MTR postponed | DWL#2 |
-| [DWL#4](DWL-04-binlog-applier.md) | Change propagation: binlog applier | 4a verified; 4b implemented, under test; 4c-1 implemented, under test (gaps and repoint verified); 4c-2 implemented, under test; 4d (DDL refresh, compressed payloads) implemented, verified on a throwaway instance; MTR postponed | DWL#3 |
-| [DWL#5](DWL-05-history-retention.md) | History retention: purge marker and archive marks | Implemented (fixed purge tag, counters, `duckdb_history_scope` and `DUCKDB_HISTORY_READER`), verified on a throwaway instance; MTR postponed | DWL#4 |
-| [DWL#6](DWL-06-query-offload.md) | Query offload through the external executor | 6a (single table, external executor, read your own writes) and 6b (expressions, PAD SPACE collations, TIMESTAMP constants) verified on the reference instance; 6c-1 (joins, semi/anti joins, derived tables, views, CTEs) and 6c-2 (UNION, INTERSECT, EXCEPT) verified on the reference instance; 6c-3 (subqueries) implemented, verified on a throwaway instance; types, DECIMAL overflow, LIKE, grouped CHAR, function review implemented, MTR tests | DWL#3, DWL#4, DWL#5 |
-| [DWL#7](DWL-07-full-scope-guard.md) | FULL scope guard plugin | Implemented (duckdb_guard audit plugin), verified on a throwaway instance | DWL#6 |
+| [DWL#2](DWL-02-plugin-infrastructure.md) | Plugin infrastructure, configuration and DuckLake storage | Implemented (2a, executor pool); MTR `duckdb_plugin` | DWL#1 |
+| [DWL#3](DWL-03-secondary-load-unload.md) | Secondary tables: SECONDARY_LOAD and SECONDARY_UNLOAD | 3a implemented, under test; 3b (reattach, resync, adopt_history_from, structure check, confirmed discard, two-transaction load) implemented, verified on a throwaway instance; MTR `duckdb_plugin`, `history`, `foreign_keys`, `json_geometry` | DWL#2 |
+| [DWL#4](DWL-04-binlog-applier.md) | Change propagation: binlog applier | 4a verified; 4b implemented, under test; 4c-1 implemented, under test (gaps and repoint verified); 4c-2 implemented, under test; 4d (DDL refresh, compressed payloads) implemented, verified on a throwaway instance; MTR `applier`, `super_read_only`, `binlog_reset`, `ddl_wait`, `json_geometry` | DWL#3 |
+| [DWL#5](DWL-05-history-retention.md) | History retention: purge marker and archive marks | Implemented (fixed purge tag, counters, `duckdb_history_scope` and `DUCKDB_HISTORY_READER`), verified on a throwaway instance; MTR `history` | DWL#4 |
+| [DWL#6](DWL-06-query-offload.md) | Query offload through the external executor | 6a (single table, external executor, read your own writes) and 6b (expressions, PAD SPACE collations, TIMESTAMP constants) verified on the reference instance; 6c-1 (joins, semi/anti joins, derived tables, views, CTEs) and 6c-2 (UNION, INTERSECT, EXCEPT) verified on the reference instance; 6c-3 (subqueries) implemented, verified on a throwaway instance; types, DECIMAL overflow, LIKE, grouped CHAR, function review implemented, MTR tests; T1 parameters and variables, T2 DuckDB errors at the start of execution, JSON and spatial columns (2026-11-23); NOW() family, CAST / CONVERT, DATE_FORMAT, NOT EXISTS as anti join (2026-11-24), MTR tests; TPC-H 22 of 22 | DWL#3, DWL#4, DWL#5 |
+| [DWL#7](DWL-07-full-scope-guard.md) | FULL scope guard plugin | Implemented (duckdb_guard audit plugin), verified on a throwaway instance; MTR `guard` | DWL#6 |
 
 Done 2026-11-15/16: replica test (test plan section 18, with the guard and
 super_read_only fixes), `INFORMATION_SCHEMA.DUCKDB_TABLES` (the registry as a
@@ -44,6 +44,13 @@ stop a result set" (T1 prepared statements and variables, T2 DuckDB errors
 during execution, T3 FULL scope survival, T4 loadability, T5 concurrency,
 leftovers B1, D1, E1).
 
+Done 2026-11-19 to 2026-11-24: T0 (the statement after a DDL waits for the
+copy refresh, `duckdb_ddl_wait_refresh`, with progress), T1, T2, JSON and
+spatial columns loadable, T3 translations (NOW() family, CAST / CONVERT,
+DATE_FORMAT), TPC-H 22 of 22 (Q21 at scale factor 100: 5.2 s on the release
+build). MTR suite: 37 tests; unit tests `duckdb_apply-t`: 41. Next: functions
+on TIMESTAMP columns (design doc "TODO from 2026-11-18").
+
 Development order follows the table. DWL#6 must not be enabled before DWL#4:
 without the applier, DML on InnoDB does not reach DuckDB and offloaded queries
 would return stale data. Its translation code can be developed earlier, with
@@ -55,7 +62,8 @@ and `TUTORIAL.md` (step by step guide).
 What offloaded queries can contain, against the SQL standard: the **SQL
 coverage tracker** in `duckdb-secondary-engine-design.md` (update it with
 every step that changes coverage). TPC-H / HammerDB readiness and its plan:
-`tpch/README.md` (19 of 22 queries offloaded on 2026-11-17).
+`tpch/README.md` (19 of 22 queries offloaded on 2026-11-17; 22 of 22 since
+2026-11-23).
 
 Manual test commands for what is implemented: `manual-test-plan.md` (and the MTR suite
 `storage/duckdb/mysql-test/duckdb`).

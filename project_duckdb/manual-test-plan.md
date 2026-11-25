@@ -4,7 +4,10 @@ Lines marked `-- EXPECTED ERROR` must fail with that error: it is the result
 the test checks, not a problem.
 
 Manual checks for what is implemented so far: DWL#1 to DWL#5 and DWL#6
-steps 6a to 6d, A1, A2 and DWL#7 (sections 1 to 34). Since 2026-11-15 most of them are also in the MTR suite
+steps 6a to 6d, A1, A2 and DWL#7 (sections 1 to 34; later additions in
+sections 35 to 42; T0 to T3, 2026-11-19 to 2026-11-24, only in MTR:
+ddl_wait, offload_params, offload_exec_errors, offload_now, offload_cast,
+offload_date_format, json_geometry). Since 2026-11-15 most of them are also in the MTR suite
 `storage/duckdb/mysql-test/duckdb` (its README maps tests to sections); the
 sections that need restarts with special options, a replica, semi-sync or
 long runs stay manual. Update this file and the suite whenever a step adds
@@ -19,7 +22,8 @@ Test tables with `retain_history` created by this plan use the prefix
 the confirmed discard (`duckdb_unload_history_confirm`), they stay in the
 lake; re-creating one with the same name and loading it is refused. Use a new
 name, or start from an empty lake (move `duckdb_data` aside while mysqld is
-stopped). On the reference instance `t_h` (created by an earlier version of
+stopped). (Step 3b is done: a same-name re-create with the same structure
+reattaches, and `duckdb_discard_stale_copy` removes a stale copy, section 19.) On the reference instance `t_h` (created by an earlier version of
 this plan) is such a leftover.
 
 ## 0. Setup
@@ -107,7 +111,7 @@ ls -la $DATADIR/duckdb_data/        # catalog.ducklake  data/  tmp/   (mode drwx
 
 ```sql
 SHOW ENGINES;                               -- duckdb listed
-SHOW VARIABLES LIKE 'duckdb%';              -- 7 variables
+SHOW VARIABLES LIKE 'duckdb%';              -- 7 variables (25 on 2026-11-25)
 SHOW STATUS    LIKE 'duckdb%';              -- duckdb_enabled=ON, duckdb_lake_path, 3 executor counters
 SELECT @@thread_stack;                      -- server default
 ```
@@ -196,9 +200,10 @@ CREATE TABLE t_fk (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES t_paren
 ALTER TABLE t_fk SECONDARY_LOAD;                 -- ok since 2026-11-17 (innodb_native_foreign_keys=OFF:
                                                  -- cascades are binlogged; with ON a cascading child is refused)
 
-CREATE TABLE t_enum (id INT PRIMARY KEY, g GEOMETRY) SECONDARY_ENGINE = duckdb;
+CREATE TABLE t_enum (id INT PRIMARY KEY, g VECTOR(4)) SECONDARY_ENGINE = duckdb;
 ALTER TABLE t_enum SECONDARY_LOAD;               -- EXPECTED ERROR: column g: type not supported
-                                                 -- (ENUM, SET, TIME, YEAR, BIT are supported since 2026-11-16)
+                                                 -- (ENUM, SET, TIME, YEAR, BIT are supported since 2026-11-16;
+                                                 -- GEOMETRY and JSON since 2026-11-23, MTR json_geometry)
 
 CREATE TABLE t_attr (id INT PRIMARY KEY) SECONDARY_ENGINE = duckdb SECONDARY_ENGINE_ATTRIBUTE = '{"retain_hist": true}';
 ALTER TABLE t_attr SECONDARY_LOAD;               -- EXPECTED ERROR: unknown SECONDARY_ENGINE_ATTRIBUTE key 'retain_hist'
@@ -1397,7 +1402,7 @@ generated data (SF ~0.01), the 22 queries compared OFF / FORCED.
 
 ```bash
 mysql ... < tpch/tpch_schema.sql && mysql ... < tpch/tpch_data.sql
-MYSQL="mysql ... tpch" ./duckdb_offload_compare.sh tpch/tpch_queries.sql   # 7/22 on 2026-11-17
+MYSQL="mysql ... tpch" ./duckdb_offload_compare.sh tpch/tpch_queries.sql   # 7/22 on 2026-11-17; 22/22 since 2026-11-23
 ```
 
 ## 40. LIKE on binary collations (2026-11-17)
@@ -1434,7 +1439,7 @@ MYSQL="mysql --default-character-set=utf8mb4 ... windmills_small" ./duckdb_offlo
 EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh offload_queries/duckdb_offload_fn_refusals.sql                                     # 11/11
 ```
 
-TPC-H: 19 of 22.
+TPC-H: 19 of 22 (22 of 22 since 2026-11-23; Q21 at SF100 fixed 2026-11-24).
 
 ## Results log
 

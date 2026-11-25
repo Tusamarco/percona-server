@@ -1,6 +1,6 @@
 # DWL#4: Change propagation: binlog applier
 
-Affects: Percona Server 9.7 — Status: 4a verified (2026-11-10); 4b implemented, under test; 4c-1 implemented, under test (2026-11-10); 4c-2 implemented, under test (2026-11-11); 4d implemented, verified on a throwaway instance and on the reference instance (2026-11-11, after the deferred-refresh fix); MTR postponed
+Affects: Percona Server 9.7 — Status: 4a verified (2026-11-10); 4b implemented, under test; 4c-1 implemented, under test (2026-11-10); 4c-2 implemented, under test (2026-11-11); 4d implemented, verified on a throwaway instance and on the reference instance (2026-11-11, after the deferred-refresh fix); MTR `applier`, `super_read_only`, `binlog_reset`, `ddl_wait`, `json_geometry` in the suite
 
 Step 4b: `duckdb_row_decoder.*` (packed row images to typed values, no THD,
 links with mysys and strings only), `duckdb_changes.*` (collapse per primary
@@ -605,18 +605,26 @@ Implemented: `duckdb_apply_reader_state`, `duckdb_apply_reader_file`,
 `duckdb_applied_file`,
 `duckdb_applied_position`, `duckdb_applied_gtid`.
 Later: lag (seconds, transactions) and time per phase.
+Added 2026-11-20 (monitoring): `duckdb_apply_lag_seconds`,
+`duckdb_apply_lag_bytes`, `duckdb_apply_reader_state_code`,
+`duckdb_memory_used_bytes`, `duckdb_temp_spill_bytes`. DWL#5 adds
+`duckdb_apply_archived_rows`, `duckdb_apply_purge_transactions`.
 
 ### Open points
 
-- Gap on a retain_history table: it cannot be reloaded until 3b.
+- Gap on a retain_history table: it cannot be reloaded until 3b. (3b
+  implemented: resync, DWL#3 FR 17.)
 - A refresh stops the applier for the other tables while it runs (it is a
   full reload of one table). Acceptable for the POC.
 - DWL#6: no query may be offloaded to a table while it is refreshed or
   stale.
-- Replica: not tested yet (manual test plan section 18, after 4d).
+- Replica: not tested yet (manual test plan section 18, after 4d). (Tested
+  2026-11-15/16, see Replicas.)
 - MTR suite: postponed (2026-11-11); the Test Plan below lists the cases.
+  (Since 2026-11-16: `applier`, `super_read_only`; later `binlog_reset`,
+  `ddl_wait`, `json_geometry`.)
 - XA transactions on loaded tables: not supported (reader stops).
-- Lag status variables.
+- Lag status variables. (Done 2026-11-20, see Status variables.)
 
 ## Test Plan
 

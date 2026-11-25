@@ -1,7 +1,7 @@
 # DuckDB secondary engine: how-to
 
 How to build, configure and use the DuckDB secondary engine of Percona Server
-9.7 (POC, branch `9.7-duckdb`). It describes the code as it is on 2026-11-16:
+9.7 (POC, branch `9.7-duckdb`). It describes the code as it is on 2026-11-25:
 DWL#1 to DWL#5 (with DWL#3 step 3b), **query offload (DWL#6)**: queries with
 expressions, joins, subqueries, derived tables, views, CTEs and UNION /
 INTERSECT / EXCEPT run in DuckDB, with every collation (section 6), the FULL
@@ -68,14 +68,14 @@ cd ../percona-server-9.7-build/mysql-test
 MTR_SHUTDOWN_TIMEOUT=120 ./mtr --suite=/opt/mysql_source/percona-server/storage/duckdb/mysql-test/duckdb --parallel=2
 ```
 
-25 tests (about 1.5 hours with a debug build); see
+37 tests (about 1.5 hours with a debug build); see
 `storage/duckdb/mysql-test/duckdb/README.md`.
 
 ### Results and checks
 
 ```bash
 ls -l plugin_output_directory/ha_duckdb.so          # the plugin
-./runtime_output_directory/duckdb_apply-t | tail -1  # [  PASSED  ] 39 tests.
+./runtime_output_directory/duckdb_apply-t | tail -1  # [  PASSED  ] 41 tests.
 ctest -R duckdb_build_smoke --output-on-failure      # DuckDB libraries alone
 ```
 
@@ -580,7 +580,7 @@ long as the table has its own copy.
 
 ## 6. SELECT on a table with a DuckDB copy
 
-**Status: DWL#6 steps 6a, 6b and 6c (6c-1, 6c-2, 6c-3).** A query runs in DuckDB when all of this holds,
+**Status: DWL#6 steps 6a to 6d, T1, T2 and T3 steps 1 to 3 (TPC-H: 22 of 22 queries).** A query runs in DuckDB when all of this holds,
 otherwise it runs on InnoDB:
 
 - `use_secondary_engine` is ON (default) or FORCED;
@@ -647,7 +647,9 @@ otherwise it runs on InnoDB:
   ...),
   date functions on TIMESTAMP columns, comparing a string column with a
   number;
-- it is not inside a transaction that has written.
+- it is not inside a multi-statement transaction (`autocommit = 0`, or
+  after BEGIN / START TRANSACTION): MySQL never offloads those (with
+  FORCED: an error with the reason).
 
 ```sql
 SET SESSION use_secondary_engine = ON;                  -- default
@@ -671,7 +673,8 @@ execution are error 3877 `DuckDB error: ...`. KILL QUERY and
 max_execution_time stop the DuckDB query within about a second.
 
 After RENAME TABLE the copy follows once the applier has read the RENAME
-(usually within a second): a query in between runs on InnoDB (FORCED:
+(usually within a second; the session that ran it waits for that, section
+9): a query of another session in between runs on InnoDB (FORCED:
 "Table has not been loaded").
 
 The result is the same as on InnoDB: types, NULL order, exact SUM and AVG,
@@ -1094,6 +1097,10 @@ What to know when reading the tables:
 
 ### Status variables
 
+For PMM / Grafana: a dashboard and custom queries for these numbers, the
+copies and the load progress are in `project_duckdb/monitoring/` (README
+there).
+
 ```sql
 SHOW GLOBAL STATUS LIKE 'duckdb%';
 ```
@@ -1137,7 +1144,7 @@ A query that should run in DuckDB but does not: `SHOW GLOBAL STATUS LIKE
 'duckdb_offload_last_refusal'` gives the reason of the last refusal; run it
 with `use_secondary_engine = FORCED` to get the reason as an error, or look
 at the optimizer trace (section 7). Common reasons: `collation:<column>`,
-`unsupported_function:<name>`, `not_single_table`, `not_loaded:<table>`.
+`unsupported_function:<name>`, `not_loaded:<table>`.
 Below `secondary_engine_cost_threshold` it is not even tried (no refusal).
 
 A DuckDB error while the query starts (out of memory, temporary disk full)
@@ -1170,16 +1177,16 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | `duckdb_apply_batch_max_rows` | global | yes | 100000 | 1000 .. 100,000,000 | The applier commits a batch after this many changed rows. A larger transaction is applied in pieces of this size inside one DuckDB transaction. |
 | `duckdb_apply_batch_max_delay_ms` | global | yes | 1000 | 10 .. 60000 | A batch is committed at most this long after its first change (bounds the lag under light load). |
 | `duckdb_apply_gap_action` | global | yes | STOP | STOP, FIRST_AVAILABLE | When binary logs the applier needs were purged and loaded tables miss changes: stop in error state, or warn and continue at the first available binary log. |
-| `duckdb_apply_start_position` | global | yes (command) | `""` | binary log name, FIRST, CURRENT | Setting it restarts the applier at the start of that binary log, which becomes the applied position. Positions before the applied position are refused. A command: the variable stays empty afterwards. Not persisted. |
+| `duckdb_apply_start_position` | global | yes (command) | `""` | binary log name, FIRST, CURRENT | Setting it restarts the applier at the start of that binary log, which becomes the applied position. Positions before the applied position are refused (except after a binary log reset, section 10). A command: the variable stays empty afterwards. Not persisted. |
 | `duckdb_discard_stale_copy` | global | yes (command) | `""` | `'db.table'` | Setting it drops a stale copy (after DROP TABLE or SECONDARY_ENGINE = NULL of a history table, or a failed refresh), whether the MySQL table exists or not. History copies need `duckdb_unload_history_confirm=ON`. A command: the variable stays empty afterwards. Not persisted. |
 | `duckdb_history_scope` | session, global, `SET_VAR` | yes | LIVE | LIVE, FULL | What queries see in history tables: live rows only, or also archived rows. FULL requires `DUCKDB_HISTORY_READER` and the `duckdb_guard` plugin, and always runs in DuckDB (or fails with the reason). |
 | `duckdb_apply_debug_log` | global | yes | OFF | ON, OFF | Testing aid: one error log line per change and per table of each batch, with DuckDB row counts (needs `log_error_verbosity=3`). |
 | `duckdb_offload_min_rows` | session, global, `SET_VAR` | yes | 1000000 | 0 .. 2^64-1 | Also try a query in DuckDB when MySQL's plan reads a loaded table of at least this many rows by a full scan, full index scan or non-unique index lookup, whatever its estimated cost. 0: only `secondary_engine_cost_threshold` decides. |
 | `duckdb_decimal_overflow` | session, global, `SET_VAR` | yes | FALLBACK | FALLBACK, ROUND, ERROR | DECIMAL results MySQL declares above 38 digits are computed as DECIMAL(38, scale) and the statement runs in DuckDB first; if a value does not fit: FALLBACK runs it on InnoDB (FORCED: error), ROUND runs it again with fewer decimals and a warning (when that helps; otherwise as FALLBACK), ERROR fails with DuckDB's error (no first run). |
-| `duckdb_offload_wait_applied` | session, `SET_VAR` | yes | ON | ON, OFF | Before a query runs in DuckDB, wait until the applier has applied this connection's last commit (at most `duckdb_offload_wait_timeout_ms`, otherwise InnoDB). |
-| `duckdb_offload_wait_timeout_ms` | session, `SET_VAR` | yes | 5000 | 0 - 3600000 | How long that wait lasts, in milliseconds. |
-| `duckdb_ddl_wait_refresh` | session, global | yes | ON | ON, OFF | After a DDL on a table with a copy, the session's next statement waits until the applier has refreshed the copy (section 9), showing the progress in SHOW PROCESSLIST and Performance Schema. |
-| `duckdb_ddl_wait_refresh_timeout` | session, global | yes | 0 | 0 - 31536000 | Longest wait of `duckdb_ddl_wait_refresh`, in seconds; 0 = until the refresh is done. |
+| `duckdb_offload_wait_applied` | session, global, `SET_VAR` | yes | ON | ON, OFF | Before a query runs in DuckDB, wait until the applier has applied this connection's last commit (at most `duckdb_offload_wait_timeout_ms`, otherwise InnoDB). |
+| `duckdb_offload_wait_timeout_ms` | session, global, `SET_VAR` | yes | 5000 | 0 - 3600000 | How long that wait lasts, in milliseconds. |
+| `duckdb_ddl_wait_refresh` | session, global, `SET_VAR` | yes | ON | ON, OFF | After a DDL on a table with a copy, the session's next statement waits until the applier has refreshed the copy (section 9), showing the progress in SHOW PROCESSLIST and Performance Schema. |
+| `duckdb_ddl_wait_refresh_timeout` | session, global, `SET_VAR` | yes | 0 | 0 - 31536000 | Longest wait of `duckdb_ddl_wait_refresh`, in seconds; 0 = until the refresh is done. |
 | `duckdb_offload_float_aggregates` | session, global, `SET_VAR` | yes | APPROXIMATE | APPROXIMATE, REFUSE | SUM and AVG of FLOAT / DOUBLE: DuckDB adds in parallel in no fixed order, so the last digits can differ from InnoDB and between runs. APPROXIMATE runs them in DuckDB; REFUSE runs such queries on InnoDB (under FULL scope they fail). |
 | `duckdb_history_check_only` | session | yes | OFF | ON, OFF | SECONDARY_LOAD of a history table only checks that it can take over a history copy (adopt, reattach, resync) and always ends with an error giving the result. |
 | `duckdb_unload_history_confirm` | session | yes | OFF | ON, OFF | Allows SECONDARY_UNLOAD of a history table and `duckdb_discard_stale_copy` of a history copy (archived rows are deleted). |
@@ -1232,11 +1239,16 @@ Counters restart at 0 when the server starts.
 ## 12. Limitations of this version
 
 - Offload covers the queries and constructs in section 6 (DWL#6 steps 6a
-  to 6d, weight strings, the types of section 6, the reviewed date, number
-  and string functions); everything else runs on InnoDB: window functions,
-  UPPER / LOWER, DATE_FORMAT, CAST, GROUP_CONCAT, LIKE and string functions
+  to 6d, T1 to T3 step 3, weight strings, the types of section 6, the
+  reviewed date, number and string functions); everything else runs on
+  InnoDB: window functions, ROLLUP, UPPER / LOWER, STR_TO_DATE, functions on
+  TIMESTAMP columns, CAST of strings, GROUP_CONCAT, LIKE and string functions
   on non-binary collations, a grouped string in a join whose groups mix
   values equal under the collation ('a' / 'a ' / 'A').
+- MySQL never offloads a query inside a multi-statement transaction
+  (`autocommit = 0`, or after BEGIN / START TRANSACTION): such queries run
+  on InnoDB. HammerDB's TPROC-H driver must run with autocommit on (the
+  patched driver `project_duckdb/tpch/mysql_tproch_run.tcl`).
 - Not supported: `binlog_encryption=ON`, `duckdb_encryption`, XA transactions
   on loaded tables (the applier stops), partial JSON updates, the types listed
   in section 3.
@@ -1248,7 +1260,7 @@ Counters restart at 0 when the server starts.
   expiry, Phase 3).
 - A refresh after DDL reloads the whole table and pauses the applier for all
   tables while it runs.
-- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 25 tests) covers the
+- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 37 tests) covers the
   features; restarts with special options, replica, semi-sync, relocation
   and performance stay in `manual-test-plan.md`.
 - Replicas: tested with a source without the plugin (section 2, Replicas).

@@ -1,6 +1,6 @@
 # DWL#6: Query offload through the external executor
 
-Affects: Percona Server 9.7 — Status: steps 6a and 6b implemented, verified on the reference instance (6a 2026-11-12, 6b 2026-11-13); 6c-1, 6c-2 verified on the reference instance, 6c-3, 6d-1 and 6d-2 implemented, verified on a throwaway instance (2026-11-13); 6d-3 first release run done; types, DECIMAL overflow, LIKE, grouped CHAR and the function review implemented with MTR tests (2026-11-16/17)
+Affects: Percona Server 9.7 — Status: steps 6a and 6b implemented, verified on the reference instance (6a 2026-11-12, 6b 2026-11-13); 6c-1, 6c-2 verified on the reference instance, 6c-3, 6d-1 and 6d-2 implemented, verified on a throwaway instance (2026-11-13); 6d-3 first release run done; types, DECIMAL overflow, LIKE, grouped CHAR and the function review implemented with MTR tests (2026-11-16/17); T1 parameters and variables, T2 DuckDB errors at the start of execution, JSON and spatial columns (2026-11-23); NOW() family, CAST / CONVERT, DATE_FORMAT, NOT EXISTS as anti join (2026-11-24), all with MTR tests; TPC-H 22 of 22 (since 2026-11-23)
 
 Steps (one at a time, tested by Marco before the next):
 
@@ -28,7 +28,7 @@ Steps (one at a time, tested by Marco before the next):
   on a release build (separate build directory) with a production-like
   workload (decided 2026-11-13).
 - Weight-string columns for non-binary collations: a later step, to be
-  placed after 6c (decided 2026-11-12).
+  placed after 6c (decided 2026-11-12). Implemented 2026-11-14 (step A).
 
 Decisions (2026-11-12):
 
@@ -71,10 +71,13 @@ so DuckDB runs the whole query vectorized.
 - every table in the query has `SECONDARY_ENGINE=duckdb` and is loaded (joins
   included);
 - the estimated cost is above `secondary_engine_cost_threshold` (our pre-prepare
-  hook), unless forced;
+  hook), unless forced; since 2026-11-14 also when the plan scans a loaded
+  table of at least `duckdb_offload_min_rows` rows (step C);
 - every expression is on the allow list;
 - the statement is a top-level SELECT returning rows to the client;
-- the session has not written in the current transaction.
+- the session has not written in the current transaction (and MySQL never
+  offloads inside a multi-statement transaction at all: `autocommit = 0`,
+  BEGIN).
 
 ### HISTORY SCOPE
 
@@ -95,6 +98,9 @@ scope the predicate is omitted, and fallback is forbidden (DWL#7).
    COUNT(DISTINCT), GROUP BY, HAVING, ORDER BY, LIMIT and OFFSET, DISTINCT,
    derived tables and views over loaded tables, and a first set of date
    functions (YEAR, MONTH, DAY, DATE, DATE_FORMAT subset: to define).
+   (Since 2026-11-17/24 much more: the reviewed functions, CAST / CONVERT,
+   NOW() family, DATE_FORMAT with a constant format; see "Function review
+   against DuckDB" and the design doc's SQL coverage tracker.)
 4. Any unsupported construct rejects the offload with a reason, visible in the
    optimizer trace and in a status counter; in LIVE scope the query then runs on
    InnoDB.
@@ -107,7 +113,8 @@ scope the predicate is omitted, and fallback is forbidden (DWL#7).
    fails. String operations on binary collations, and all non-string
    operations, are offloaded. Results are converted back to the character set
    of each select-list item. Phase 2 lifts the restriction with weight-string
-   columns (design doc, Semantic equivalence).
+   columns (design doc, Semantic equivalence). (Lifted 2026-11-14 by step A;
+   what stays refused on `_ci` collations is listed there.)
 6. INSERT ... SELECT, CREATE ... SELECT, SELECT ... INTO, and subqueries inside
    DML are not offloaded (POC).
 7. A query in a transaction that has already written is not offloaded (LIVE) or
@@ -115,7 +122,8 @@ scope the predicate is omitted, and fallback is forbidden (DWL#7).
 8. With `use_secondary_engine=FORCED`, a query that cannot be offloaded fails
    with our reason.
 9. EXPLAIN shows that the query is executed by DuckDB and the scope used; EXPLAIN
-   FORMAT=TREE shows the generated DuckDB SQL (proposal).
+   FORMAT=TREE shows the generated DuckDB SQL (proposal). (Implemented in
+   6d-1 as notes, any format.)
 10. Status variables count offloaded queries, rejections by reason, and DuckDB
     execution time.
 11. A KILL QUERY on an offloaded query interrupts DuckDB execution.
@@ -1096,10 +1104,15 @@ next step, the data check).
 
 - Value holder Items versus protocol: to verify.
 - Behaviour of `override_executor_func` for UNION and set operations: to verify.
+  (Set operations implemented in 6c-2.)
 - More functions (string functions, DATE_FORMAT, date arithmetic,
   TIMESTAMP date parts in the session time zone, exact division): later.
+  (Done: exact division 2026-11-14, function review with date arithmetic
+  and string functions 2026-11-17, DATE_FORMAT 2026-11-24. Open: functions
+  on TIMESTAMP columns, next.)
 - Collations: the POC rejects collation-dependent operations on non-binary
   collations (FR 5a); Phase 2 adds weight-string columns for exact semantics.
+  (Weight columns implemented 2026-11-14, step A.)
 
 ## Test Plan
 

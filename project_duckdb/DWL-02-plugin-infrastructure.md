@@ -1,6 +1,6 @@
 # DWL#2: Plugin infrastructure, configuration and DuckLake storage
 
-Affects: Percona Server 9.7 — Status: implemented (2a and executor pool), under test; MTR tests in DWL#3 step 3b
+Affects: Percona Server 9.7 — Status: implemented (2a and executor pool); MTR `duckdb_plugin` in the suite
 
 ## Description
 

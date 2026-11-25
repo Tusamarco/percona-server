@@ -14,6 +14,7 @@ results of 2026-11-17.
 | `tpch_schema.sql` | The schema as HammerDB creates it for MySQL (`src/mysql/mysqlolap.tcl`): database `latin1`, every character column `BINARY` (so `latin1_bin`), the same primary keys, indexes and foreign keys; plus `SECONDARY_ENGINE = duckdb`. |
 | `tpch_data.sql` | About scale factor 0.01 (LINEITEM 60,000 rows), deterministic, with TPC-H value domains so every query finds rows; loads the copies; creates the view of Q15. Not a dbgen replacement. |
 | `tpch_queries.sql` | The 22 queries in HammerDB's MySQL syntax (`date '...' + interval '3' month`, `extract(year from ...)`, `substr(...)`), validation parameters, one per line. |
+| `mysql_tproch_run.tcl` | HammerDB CLI script for a TPROC-H run (`./hammerdbcli auto mysql_tproch_run.tcl`): patches HammerDB's MySQL driver so autocommit is on and sets `use_secondary_engine` (ON or FORCED) on its sessions. |
 
 ## Run
 
@@ -55,7 +56,7 @@ on InnoDB.
 | Q18 | identical, offloaded | |
 | Q19 | identical, offloaded | |
 | Q20 | identical, offloaded (since 2026-11-17, LIKE on binary collations) | |
-| Q21 | identical, offloaded (since 2026-11-23: in a join condition, a column of the EXISTS nest replaced by an equal outer column; 2026-11-24: at SF100 it filled DuckDB's memory, fixed: the ORDERS-l1 key printed outside the EXISTS, NOT EXISTS printed as NOT EXISTS instead of MySQL's DISTINCT derived table, DWL-06) | |
+| Q21 | identical, offloaded (since 2026-11-23: in a join condition, a column of the EXISTS nest replaced by an equal outer column; 2026-11-24: at SF100 it filled DuckDB's memory, fixed: the ORDERS-l1 key printed outside the EXISTS, NOT EXISTS printed as NOT EXISTS instead of MySQL's DISTINCT derived table, DWL-06; 5.2 s on the release build) | |
 | Q22 | identical, offloaded (since 2026-11-22, grouped string expressions under PAD SPACE checked per group; real rows in MTR `offload_group_expr`, the quick check's data gives Q22 no rows) | |
 
 ## What a HammerDB run needs
@@ -93,14 +94,14 @@ on InnoDB.
 | Grouped CHAR values in joins under binary collations: done 2026-11-17 (equal values are identical) | Q4, Q5, Q9, Q10, Q12 | done |
 | `EXTRACT(unit FROM date)`: done 2026-11-17 (function review) | Q7, Q8, Q9 | done |
 | DECIMAL results declared above 38 digits: done 2026-11-17 (DECIMAL(38, s), run first, `duckdb_decimal_overflow`) | Q11, Q14 | done |
-| SUBSTR: done 2026-11-17; grouping by it under PAD SPACE needs the data check | Q22 | with the data check |
-| Equalities MySQL propagates between a semi-join (EXISTS) and an anti-join (NOT EXISTS) nest: print the propagated equality with a column visible in each subquery | Q21 | medium |
-| Grouped VARCHAR value in a join without the primary key (`p_type`): exact after a data check (no two different values equal under the collation), decided as the next step | Q16 | medium |
+| SUBSTR: done 2026-11-17; grouping by it under PAD SPACE needs the data check (done 2026-11-22: checked per group in the query) | Q22 | done |
+| Equalities MySQL propagates between a semi-join (EXISTS) and an anti-join (NOT EXISTS) nest: print the propagated equality with a column visible in each subquery (done 2026-11-23; at scale factor 100 2026-11-24) | Q21 | done |
+| Grouped VARCHAR value in a join without the primary key (`p_type`): exact after a data check (no two different values equal under the collation), decided as the next step (done 2026-11-22: checked per group in the query) | Q16 | done |
 
 Done so far: foreign keys, DECIMAL above 38 digits, LIKE on binary
 collations, grouped CHAR in joins, EXTRACT and the function review (19 of
 22). With the data check for grouped strings 21 (Q16, Q22); with the Q21
-item 22.
+item 22. (2026-11-23: 22 of 22.)
 
 ## Plan to prove it with HammerDB
 
@@ -111,4 +112,7 @@ item 22.
    schema with HammerDB, load the copies, run the power test with InnoDB
    (`use_secondary_engine = OFF`) and with the plugin, same results, compare
    the times. `autocommit = 1` in HammerDB's MySQL OLAP script.
+   (2026-11-24: TPROC-H at scale factor 100 runs offloaded on the release
+   build with `mysql_tproch_run.tcl`; the timing comparison at scale factor 1
+   and 10 is still to do.)
 3. Record the runs in `project_duckdb/perf/` as the other performance runs.

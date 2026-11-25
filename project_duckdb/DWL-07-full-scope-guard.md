@@ -1,6 +1,6 @@
 # DWL#7: FULL scope guard plugin
 
-Affects: Percona Server 9.7 — Status: implemented, verified on a throwaway instance (2026-11-15); MTR in the suite step
+Affects: Percona Server 9.7 — Status: implemented, verified on a throwaway instance (2026-11-15); MTR `guard` in the suite
 
 ## Implementation (2026-11-15)
 
@@ -181,6 +181,8 @@ verify that the reason affects only the error message.
   does not work, the fallback is to document that FULL scope requires
   `use_secondary_engine=FORCED` (option b of the design discussion).
 - Timing of SET_VAR application: to verify.
+- (2026-11-15: both verified, see Implementation: events reach audit
+  plugins, hints are applied before `open_tables()`.)
 
 ## Test Plan
 

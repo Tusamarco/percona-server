@@ -1077,10 +1077,11 @@ SELECT * FROM information_schema.DUCKDB_TABLES;
 | Column | Meaning |
 |---|---|
 | `TABLE_SCHEMA`, `TABLE_NAME` | The MySQL table. |
-| `STATE` | `LOADED` (kept current), `STALE` (no longer updated: a dropped history table, or a DDL the copy could not follow), `REFRESH_PENDING` (a refresh waits for a later RENAME). |
+| `STATE` | `LOADED` (kept current), `REFRESHING` (being reloaded after a DDL), `STALE` (no longer updated: a dropped history table, or a DDL the copy could not follow), `REFRESH_PENDING` (a refresh waits for a later RENAME). |
 | `RETAIN_HISTORY` | YES for history copies. |
 | `PRIMARY_KEY`, `WEIGHT_COLUMNS` | Key columns; columns with a hidden weight column. |
 | `LOAD_BINLOG_FILE`, `LOAD_BINLOG_POSITION`, `LOAD_GTID_SET` | Where the load was taken: the applier starts from there for this table. |
+| `REFRESH_ROWS_DONE`, `REFRESH_ROWS_TOTAL` | While `REFRESHING`: rows reloaded so far, rows expected (section 5.1); NULL otherwise. |
 
 ---
 
@@ -1277,14 +1278,17 @@ the table. To read while MySQL runs, query through MySQL, or copy the whole
   parts, DATE_ADD / DATE_SUB / INTERVAL arithmetic, DATEDIFF, TO_DAYS,
   LAST_DAY, FLOOR / CEILING / SIGN / TRUNCATE / SQRT / LN / LOG,
   GREATEST / LEAST, CONCAT / CONCAT_WS, SUBSTRING / LEFT / RIGHT, TRIM,
-  REPLACE, REVERSE, LPAD / RPAD, INSTR / LOCATE, CHAR_LENGTH / LENGTH.
+  REPLACE, REVERSE, LPAD / RPAD, INSTR / LOCATE, CHAR_LENGTH / LENGTH,
+  CAST / CONVERT of numbers and dates, DATE_FORMAT with a constant format,
+  NOW() / CURDATE() / CURTIME() and the UTC_ variants (the statement's
+  fixed value), prepared statement parameters and user variables.
 - DECIMAL results beyond 38 digits: InnoDB answers, or rounded with a
   warning, or an error (`duckdb_decimal_overflow`).
 - Follow every collation in comparisons, grouping and ordering (`_ci`,
   `_as_cs`, `general_ci`, latin1 ...).
 - Column types: integers, DECIMAL up to 38 digits, FLOAT, DOUBLE, CHAR,
   VARCHAR, TEXT, BINARY, VARBINARY, BLOB, DATE, DATETIME, TIMESTAMP, YEAR,
-  BIT, TIME, ENUM, SET.
+  BIT, TIME, ENUM, SET; JSON and spatial with limits (below).
 - Keep history: purge rows from InnoDB and keep them in DuckDB; query live
   or full history; archive partitions by purging them before dropping them.
 - Survive DDL: ALTER, RENAME, TRUNCATE, partition changes without stopping
@@ -1295,7 +1299,8 @@ the table. To read while MySQL runs, query through MySQL, or copy the whole
 ### Cannot (in this version)
 
 - Write to DuckDB directly: all writes go to InnoDB.
-- Offload everything: window functions, UPPER / LOWER, DATE_FORMAT, CAST,
+- Offload everything: window functions, UPPER / LOWER, CAST of strings,
+  DATE_FORMAT week codes (%U %u %V %v %X %x), SYSDATE(),
   LIKE and string functions on non-binary collations, functions on
   TIMESTAMP columns, a grouped string in a join whose groups mix 'a' and
   'a ' (or 'A' and 'a'), GROUP_CONCAT, JSON
