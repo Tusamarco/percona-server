@@ -18,6 +18,12 @@
 # a LEFT JOIN with a derived table and writes its ON with l2.k, a column of
 # the EXISTS nest we print in WHERE. An equal outer column (l1.k) stands for
 # it. Results as InnoDB.
+# 2026-11-24 (Q21 at SF100 filled 80 GB): MySQL anchors od.ok = l2.ok and
+# l1.ok = l2.ok on l2 (in the EXISTS), so the outer query had no od-l1 key
+# and DuckDB built a cross product; we now also print l1.ok = od.ok outside.
+# And the derived table of the NOT EXISTS (LEFT JOIN (SELECT DISTINCT ...)
+# ... IS NULL) is printed back as NOT EXISTS, without DISTINCT. Checked on
+# the plan (duckdb_plan_shape.inc), not only on the rows.
 --source ../include/have_duckdb.inc
 CREATE TABLE li (ok INT, ln INT, sk INT, rd DATE, cd DATE, PRIMARY KEY (ok, ln)) SECONDARY_ENGINE = duckdb;
 CREATE TABLE su (sk INT PRIMARY KEY, name VARCHAR(20) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
@@ -41,6 +47,7 @@ ALTER TABLE od SECONDARY_LOAD;
 --echo # Q21's shape
 --let $query= SELECT su.name, COUNT(*) AS numwait FROM su, li l1, od WHERE su.sk = l1.sk AND od.ok = l1.ok AND od.st = 'F' AND l1.rd > l1.cd AND EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.sk <> l1.sk AND l3.rd > l3.cd) GROUP BY su.name ORDER BY numwait DESC, su.name
 --source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
 --echo # Without GROUP BY, and the rows themselves
 --let $query= SELECT l1.ok, l1.sk FROM li l1 WHERE EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.sk <> l1.sk AND l3.rd > l3.cd) ORDER BY l1.ok, l1.sk
 --source ../include/duckdb_compare.inc
@@ -48,6 +55,22 @@ ALTER TABLE od SECONDARY_LOAD;
 --let $query= SELECT l1.ok, l1.ln FROM li l1 WHERE NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.ln > l1.ln) AND EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.ln < l1.ln) ORDER BY 1, 2
 --source ../include/duckdb_compare.inc
 --let $query= SELECT l1.ok, COUNT(*) FROM li l1 WHERE EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND EXISTS (SELECT * FROM od WHERE od.ok = l1.ok AND od.st = 'F') GROUP BY l1.ok ORDER BY 1
+--source ../include/duckdb_compare.inc
+
+--echo # NOT EXISTS alone, and NOT IN (NOT NULL and nullable columns)
+--let $query= SELECT od.ok FROM od WHERE NOT EXISTS (SELECT * FROM li WHERE li.ok = od.ok AND li.rd > li.cd) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--let $query= SELECT od.ok FROM od WHERE od.ok NOT IN (SELECT li.ok FROM li WHERE li.sk = 2) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--let $query= SELECT su.sk FROM su WHERE su.sk NOT IN (SELECT li.sk FROM li WHERE li.ok = 14) ORDER BY 1
+--source ../include/duckdb_compare.inc
+INSERT INTO li VALUES (15, 1, NULL, NULL, NULL);
+--source ../include/wait_applier.inc
+--let $query= SELECT su.sk FROM su WHERE su.sk NOT IN (SELECT li.sk FROM li) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT od.ok FROM od WHERE NOT EXISTS (SELECT * FROM li WHERE li.ok = od.ok AND li.rd > li.cd) AND od.st = 'F' ORDER BY 1
 --source ../include/duckdb_compare.inc
 
 DROP TABLE li, su, od;

@@ -617,7 +617,9 @@ otherwise it runs on InnoDB:
   CURTIME(), UTC_TIMESTAMP / UTC_DATE / UTC_TIME, UNIX_TIMESTAMP() (the
   value fixed at the start of the statement, as MySQL; not SYSDATE()),
   CAST / CONVERT of numbers and dates to SIGNED, UNSIGNED, DECIMAL, DOUBLE,
-  CHAR, DATE, DATETIME (not of strings, DOUBLE or TIMESTAMP), FLOOR, CEILING, SIGN, TRUNCATE, SQRT, LN, LOG,
+  CHAR, DATE, DATETIME (not of strings, DOUBLE or TIMESTAMP), DATE_FORMAT
+  (English names; not the week codes %U %u %V %v %X %x; GROUP BY on it, and
+  ORDER BY on numeric formats such as '%Y-%m'), FLOOR, CEILING, SIGN, TRUNCATE, SQRT, LN, LOG,
   GREATEST / LEAST of numbers, CHAR_LENGTH, LENGTH, SUBSTRING, LEFT, RIGHT,
   CONCAT, CONCAT_WS, TRIM, REPLACE, REVERSE, LPAD, RPAD, INSTR, LOCATE
   (refused because DuckDB differs: UPPER, LOWER, ASCII, EXP, POW,
@@ -641,7 +643,7 @@ otherwise it runs on InnoDB:
   refused;
 - not translated, so answered by InnoDB: unsigned arithmetic that could
   leave 0..2^64-1 (subtraction, possible overflow), functions outside
-  the reviewed list above (UPPER / LOWER, DATE_FORMAT, CAST of a string
+  the reviewed list above (UPPER / LOWER, STR_TO_DATE, CAST of a string
   ...),
   date functions on TIMESTAMP columns, comparing a string column with a
   number;

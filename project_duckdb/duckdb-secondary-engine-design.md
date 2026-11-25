@@ -783,7 +783,8 @@ not a read). Last update: 2026-11-17 (function review, TPC-H 19/22,
 | EXTRACT(unit FROM ...) | done | 2026-11-17, every unit but WEEK (default_week_format) |
 | Date arithmetic on columns | partial | `d +/- INTERVAL n unit`, DATE_ADD / SUB, ADDDATE / SUBDATE, DATEDIFF, TO_DAYS, LAST_DAY, DAYNAME / MONTHNAME (en_US) (2026-11-17); missing: TIMESTAMPDIFF, multi-part units |
 | NOW() / CURRENT_TIMESTAMP, CURDATE() / CURRENT_DATE, CURTIME(), UTC_TIMESTAMP / UTC_DATE / UTC_TIME, UNIX_TIMESTAMP() | done | 2026-11-24 (T3): the value MySQL fixed at the start of the statement, sent as a typed literal (so `SET TIMESTAMP` and the session time zone apply); a DATE column compared with NOW() compares as DATETIME as in MySQL; SYSDATE() refused (it changes during the statement); MTR `offload_now` |
-| DATE_FORMAT, STR_TO_DATE | missing | |
+| DATE_FORMAT | partial | 2026-11-24 (T3): built code by code from DuckDB date parts (English names, `lc_time_names = en_US`); week codes `%U %u %V %v %X %x` refused; DATE / DATETIME arguments (TIMESTAMP: step 4). GROUP BY and DISTINCT on any translated format, ORDER BY on fixed-width numeric formats (`%Y-%m-%d`), on the text directly: one format gives one spelling of each value, so the collation compares them as their bytes. Comparisons with constants still refused (collation). MTR `offload_date_format` |
+| STR_TO_DATE | missing | |
 | Functions on TIMESTAMP columns (session time zone) | missing | |
 | Bit operators (& | ^ ~ << >>) | missing | |
 | JSON functions | missing | |
@@ -863,7 +864,9 @@ reference instance; the SQL coverage tracker is updated).
    Q22, `GROUP BY substr(...)`). About 1-2 days. An opt-in "any value" mode
    (`duckdb_grouped_value = EXACT | ANY`) stays a possible later option.
 3. **TPC-H Q21**: done 2026-11-23 (22 of 22). Equalities propagated between EXISTS and NOT EXISTS
-   nests. SUBSTR is done (review). Expected with 1-3: 22 of 22.
+   nests. 2026-11-24: at SF100 it filled DuckDB's memory (a cross product
+   ORDERS x LINEITEM and a DISTINCT derived table from MySQL's NOT EXISTS
+   plan); fixed (DWL-06, "Q21 at SF100"). SUBSTR is done (review). Expected with 1-3: 22 of 22.
 4. **HammerDB TPROC-H on the release build**, scale factor 1 then 10: build
    with HammerDB (`autocommit = 1` in its MySQL OLAP script, otherwise MySQL
    offloads nothing), load the copies, power run with InnoDB and with the
@@ -966,8 +969,9 @@ archived rows)
       Done: the NOW() family (2026-11-24, MTR `offload_now`: NOW,
       CURRENT_TIMESTAMP(n), CURDATE, CURTIME, UTC_*, UNIX_TIMESTAMP(), as
       the statement's fixed value; SYSDATE refused); CAST / CONVERT from
-      numbers and dates (2026-11-24, MTR `offload_cast`). Next: DATE_FORMAT,
-      functions on TIMESTAMP columns.
+      numbers and dates (2026-11-24, MTR `offload_cast`); DATE_FORMAT
+      (2026-11-24, MTR `offload_date_format`). Next: functions on TIMESTAMP
+      columns.
 - [ ] Applier: XA transactions on loaded tables, `binlog_encryption=ON`.
 
 **T4. Loadability** (a table that cannot be loaded has no offload and no

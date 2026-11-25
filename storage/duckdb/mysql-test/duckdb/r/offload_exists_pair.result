@@ -13,9 +13,28 @@ ALTER TABLE su SECONDARY_LOAD;
 ALTER TABLE od SECONDARY_LOAD;
 # Q21's shape
 # SELECT su.name, COUNT(*) AS numwait FROM su, li l1, od WHERE su.sk = l1.sk AND od.ok = l1.ok AND od.st = 'F' AND l1.rd > l1.cd AND EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.sk <> l1.sk AND l3.rd > l3.cd) GROUP BY su.name ORDER BY numwait DESC, su.name
+# plan shape: SELECT su.name, COUNT(*) AS numwait FROM su, li l1, od WHERE su.sk = l1.sk AND od.ok = l1.ok AND od.st = 'F' AND l1.rd > l1.cd AND EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.sk <> l1.sk AND l3.rd > l3.cd) GROUP BY su.name ORDER BY numwait DESC, su.name
+cross product in DuckDB plan: no
+DISTINCT derived table: no
+NOT EXISTS: yes
 # Without GROUP BY, and the rows themselves
 # SELECT l1.ok, l1.sk FROM li l1 WHERE EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.sk <> l1.sk AND l3.rd > l3.cd) ORDER BY l1.ok, l1.sk
 # NOT EXISTS first, EXISTS second; and EXISTS + EXISTS
 # SELECT l1.ok, l1.ln FROM li l1 WHERE NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.ln > l1.ln) AND EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.ln < l1.ln) ORDER BY 1, 2
 # SELECT l1.ok, COUNT(*) FROM li l1 WHERE EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND EXISTS (SELECT * FROM od WHERE od.ok = l1.ok AND od.st = 'F') GROUP BY l1.ok ORDER BY 1
+# NOT EXISTS alone, and NOT IN (NOT NULL and nullable columns)
+# SELECT od.ok FROM od WHERE NOT EXISTS (SELECT * FROM li WHERE li.ok = od.ok AND li.rd > li.cd) ORDER BY 1
+# plan shape: SELECT od.ok FROM od WHERE NOT EXISTS (SELECT * FROM li WHERE li.ok = od.ok AND li.rd > li.cd) ORDER BY 1
+cross product in DuckDB plan: no
+DISTINCT derived table: no
+NOT EXISTS: yes
+# SELECT od.ok FROM od WHERE od.ok NOT IN (SELECT li.ok FROM li WHERE li.sk = 2) ORDER BY 1
+# plan shape: SELECT od.ok FROM od WHERE od.ok NOT IN (SELECT li.ok FROM li WHERE li.sk = 2) ORDER BY 1
+cross product in DuckDB plan: no
+DISTINCT derived table: no
+NOT EXISTS: yes
+# SELECT su.sk FROM su WHERE su.sk NOT IN (SELECT li.sk FROM li WHERE li.ok = 14) ORDER BY 1
+INSERT INTO li VALUES (15, 1, NULL, NULL, NULL);
+# SELECT su.sk FROM su WHERE su.sk NOT IN (SELECT li.sk FROM li) ORDER BY 1
+# SELECT od.ok FROM od WHERE NOT EXISTS (SELECT * FROM li WHERE li.ok = od.ok AND li.rd > li.cd) AND od.st = 'F' ORDER BY 1
 DROP TABLE li, su, od;

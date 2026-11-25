@@ -1,0 +1,63 @@
+CREATE TABLE tf (id INT PRIMARY KEY, d DATE, dt DATETIME(6), amount INT, ts TIMESTAMP NULL) SECONDARY_ENGINE = duckdb;
+INSERT INTO tf VALUES
+(1, '2024-11-01', '2024-11-01 00:00:00.000000', 10, NULL),
+(2, '2024-11-02', '2024-11-02 12:05:09.123456', 20, NULL),
+(3, '2024-11-03', '2024-11-03 13:59:59.999999', 30, NULL),
+(4, '2024-11-11', '2024-11-11 23:00:01.000100', 40, NULL),
+(5, '2024-11-12', '2024-11-12 11:59:59.500000', 50, NULL),
+(6, '2024-11-13', '2024-11-13 00:30:00', 60, NULL),
+(7, '2024-11-21', '2024-11-21 01:02:03', 70, NULL),
+(8, '2024-11-22', '2024-11-22 09:09:09', 80, NULL),
+(9, '2024-11-23', '2024-11-23 10:10:10', 90, NULL),
+(10, '2023-01-31', '2023-01-31 15:16:17', 100, NULL),
+(11, '0999-12-31', '0999-12-31 23:59:59', 110, NULL),
+(12, '2000-02-29', '2000-02-29 12:00:00', 120, NULL),
+(13, '2009-06-07', '2009-06-07 00:00:00', 130, '2024-11-24 10:00:00'),
+(14, NULL, NULL, 140, NULL);
+ALTER TABLE tf SECONDARY_LOAD;
+# SELECT id, DATE_FORMAT(d, '%Y-%m-%d'), DATE_FORMAT(dt, '%Y-%m-%d %H:%i:%s'), DATE_FORMAT(dt, '%T.%f'), DATE_FORMAT(d, '%y/%c/%e %k:%l') FROM tf ORDER BY id
+# SELECT id, DATE_FORMAT(dt, '%h %I %l %p %r'), DATE_FORMAT(dt, '%j %w'), DATE_FORMAT(d, '%W %a %M %b %D') FROM tf ORDER BY id
+# SELECT id, DATE_FORMAT(dt, '%% 100%% it''s %q %Y'), DATE_FORMAT(d, ''), DATE_FORMAT(d, 'plain') FROM tf ORDER BY id
+# SELECT DATE_FORMAT(d, '%Y-%m') AS ym, SUM(amount), COUNT(*) FROM tf GROUP BY ym ORDER BY ym
+# SELECT DATE_FORMAT(d, '%M %Y') AS ym, SUM(amount) FROM tf GROUP BY ym ORDER BY SUM(amount)
+# SELECT COUNT(*), COUNT(w) FROM (SELECT DISTINCT DATE_FORMAT(dt, '%W') AS w FROM tf) x
+# SELECT DISTINCT DATE_FORMAT(dt, '%Y') AS y FROM tf ORDER BY y
+# SELECT id, DATE_FORMAT(NOW(), '%Y-%m-%d') FROM tf WHERE id < 3 ORDER BY DATE_FORMAT(dt, '%d %H:%i:%s.%f') DESC
+# Refused: week codes, TIMESTAMP and string arguments, format not
+# constant, ORDER BY a format with names or variable widths,
+# comparisons with constants (collation rules), lc_time_names.
+# SELECT id, DATE_FORMAT(d, '%U %u %V %v %X %x') FROM tf ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, DATE_FORMAT(d, '%U %u %V %v %X %x') FROM tf ORDER BY id;
+Got one of the listed errors
+# SELECT id, DATE_FORMAT(ts, '%Y') FROM tf ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, DATE_FORMAT(ts, '%Y') FROM tf ORDER BY id;
+Got one of the listed errors
+# SELECT id, DATE_FORMAT('2024-01-01', '%Y') FROM tf ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, DATE_FORMAT('2024-01-01', '%Y') FROM tf ORDER BY id;
+Got one of the listed errors
+# SELECT id, DATE_FORMAT(d, IF(id > 2, '%Y', '%m')) FROM tf ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, DATE_FORMAT(d, IF(id > 2, '%Y', '%m')) FROM tf ORDER BY id;
+Got one of the listed errors
+# SELECT id FROM tf ORDER BY DATE_FORMAT(d, '%M'), id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id FROM tf ORDER BY DATE_FORMAT(d, '%M'), id;
+Got one of the listed errors
+# SELECT id FROM tf ORDER BY DATE_FORMAT(d, '%e'), id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id FROM tf ORDER BY DATE_FORMAT(d, '%e'), id;
+Got one of the listed errors
+# SELECT id FROM tf WHERE DATE_FORMAT(d, '%Y-%m') = '2024-11' ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id FROM tf WHERE DATE_FORMAT(d, '%Y-%m') = '2024-11' ORDER BY id;
+Got one of the listed errors
+SET SESSION lc_time_names = 'de_DE';
+# SELECT id, DATE_FORMAT(d, '%Y') FROM tf ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, DATE_FORMAT(d, '%Y') FROM tf ORDER BY id;
+Got one of the listed errors
+SET SESSION lc_time_names = DEFAULT;
+DROP TABLE tf;

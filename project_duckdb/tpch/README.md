@@ -55,7 +55,7 @@ on InnoDB.
 | Q18 | identical, offloaded | |
 | Q19 | identical, offloaded | |
 | Q20 | identical, offloaded (since 2026-11-17, LIKE on binary collations) | |
-| Q21 | identical, offloaded (since 2026-11-23: in a join condition, a column of the EXISTS nest replaced by an equal outer column) | |
+| Q21 | identical, offloaded (since 2026-11-23: in a join condition, a column of the EXISTS nest replaced by an equal outer column; 2026-11-24: at SF100 it filled DuckDB's memory, fixed: the ORDERS-l1 key printed outside the EXISTS, NOT EXISTS printed as NOT EXISTS instead of MySQL's DISTINCT derived table, DWL-06) | |
 | Q22 | identical, offloaded (since 2026-11-22, grouped string expressions under PAD SPACE checked per group; real rows in MTR `offload_group_expr`, the quick check's data gives Q22 no rows) | |
 
 ## What a HammerDB run needs

@@ -899,6 +899,40 @@ return DOUBLE and `sum` returns NULL.
   scalars, JSON null and SQL NULL, unicode and escapes, points, lines,
   polygons with SRID; joins and derived tables; nine refusals).
 
+### Q21 at SF100: anti joins and the join key (2026-11-24)
+
+Q21 ran correctly on small data but at SF100 on the release build it never
+returned (also its EXPLAIN, queued behind it on the executor): DuckDB used
+the full `duckdb_memory_limit` (80 GB) and kept spilling (40 GB and
+growing). Two causes in the SQL we sent, both from MySQL's plan:
+
+- **No join key between ORDERS and l1.** MySQL's best-equal-field
+  substitution writes `o_orderkey = l2.k` and `l1.k = l2.k`, both on `l2`,
+  a table of the EXISTS. Both went into the EXISTS, so the outer query
+  joined ORDERS and l1 with no condition: DuckDB built ORDERS x l1 (about
+  30M x 120M) and filtered it with the EXISTS afterwards. Fix: when plain
+  equalities tie two outer columns to the same column of a semi-join nest,
+  we also print the equality between the outer columns in the outer WHERE
+  (`l1.k = o.k`). It is implied by the EXISTS, so the result cannot change.
+  Only where DuckDB's `=` is MySQL's: the same exact type (not DOUBLE), or
+  binary strings.
+- **NOT EXISTS as a DISTINCT derived table.** For a secondary engine MySQL
+  always plans NOT EXISTS / NOT IN as `LEFT JOIN (SELECT DISTINCT 1 AS c,
+  ie ...) AS d ON <cond> WHERE d.c IS NULL` (`cannot_do_antijoin` in
+  `Item_exists_subselect::is_semijoin_candidate`); DuckDB computed the
+  DISTINCT over every late LINEITEM row first. That form is exactly `NOT
+  EXISTS (SELECT 1 FROM (SELECT ...) AS d WHERE <cond>)` when `d.c` is never
+  NULL in d and d is used nowhere else (select list, GROUP BY, HAVING,
+  ORDER BY, other joins, other WHERE parts): we print it so, without
+  DISTINCT, and DuckDB plans its own anti join (`derived_anti_marker()`).
+  A column of another nest in `<cond>` is replaced by an equal outer
+  column, as before.
+- Tests: MTR `offload_exists_pair` now also checks the DuckDB plan
+  (`include/duckdb_plan_shape.inc`: no cross product, no DISTINCT derived
+  table, NOT EXISTS), plus NOT EXISTS alone and NOT IN on NOT NULL and
+  nullable columns. TPC-H 22 of 22 identical; no TPC-H plan has a cross
+  product except Q11 and Q22 (a one-row scalar subquery).
+
 ### EXISTS and NOT EXISTS on the same column (2026-11-23, TPC-H Q21)
 
 - `EXISTS (... l2 ... l2.k = l1.k) AND NOT EXISTS (... l3 ... l3.k = l1.k)`
@@ -1040,7 +1074,8 @@ only where the results match, with the guards listed. Tests:
 | ... to DATETIME(n) | translated | DATE, and DATETIME(m) with m <= n; fewer digits round in MySQL: refused |
 | ... to DATE | translated | DATE / DATETIME (earlier) |
 | CAST from strings, DOUBLE, TIMESTAMP, TIME; to BINARY, TIME, YEAR, JSON; `CONVERT(x USING cs)` | refused | MySQL's string-to-number rules (prefix, warnings) and DOUBLE printing differ; TIMESTAMP depends on the session time zone (T3 step 4) |
-| not reviewed yet | refused | DATE_FORMAT, STR_TO_DATE, TIMESTAMPDIFF, bit operators, REGEXP, JSON, STDDEV / VARIANCE, GROUP_CONCAT, window functions |
+| `DATE_FORMAT(d, 'format')` | translated (2026-11-24, T3) | constant format; each code from DuckDB parts as MySQL prints it: `%Y` (4 digits, year 0999 too), `%y %m %c %d %e %j %H %k %h %I %l %i %S %s %f %T %r %p %w`, names `%M %b %W %a` and `%D` (1st, 2nd, 11th) in English (`lc_time_names = en_US`), `%%` and any other `%x` as x. Refused: week codes `%U %u %V %v %X %x` (`default_week_format` / week rules), a trailing `%`, non-ASCII formats, TIMESTAMP arguments (session time zone), strings. The result has the connection's collation: GROUP BY and DISTINCT use the text directly for every translated format, ORDER BY for fixed-width numeric formats (`%Y-%m`, `%d %H:%i:%s.%f`; their bytes order as the collation does); a comparison with a constant follows the collation rules (refused for `_ci`) |
+| not reviewed yet | refused | STR_TO_DATE, TIMESTAMPDIFF, bit operators, REGEXP, JSON, STDDEV / VARIANCE, GROUP_CONCAT, window functions |
 
 Also fixed during the review: string constants of these functions'
 arguments no longer take the date type of an enclosing comparison
