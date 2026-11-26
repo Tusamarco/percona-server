@@ -37,7 +37,7 @@ on InnoDB.
 | Query | Result | Missing |
 |---|---|---|
 | Q1 | identical, offloaded | |
-| Q2 | identical, offloaded (since 2026-11-17, LIKE on binary collations) | |
+| Q2 | identical, offloaded (since 2026-11-17, LIKE on binary collations; 2026-11-25: its correlated subquery printed as LATERAL, so DuckDB aggregates only the needed keys) | |
 | Q3 | identical, offloaded | |
 | Q4 | identical, offloaded (since 2026-11-17, grouped CHAR in joins) | |
 | Q5 | identical, offloaded (since 2026-11-17, grouped CHAR in joins) | |
@@ -52,10 +52,10 @@ on InnoDB.
 | Q14 | identical, offloaded (since 2026-11-17) | |
 | Q15 | identical, offloaded (view) | |
 | Q16 | identical, offloaded (since 2026-11-22, grouped strings in joins checked per group) | |
-| Q17 | identical, offloaded | |
+| Q17 | identical, offloaded (2026-11-25: its correlated subquery printed as LATERAL, so DuckDB aggregates only the needed keys; it was 10x slower than AliSQL at SF100) | |
 | Q18 | identical, offloaded | |
 | Q19 | identical, offloaded | |
-| Q20 | identical, offloaded (since 2026-11-17, LIKE on binary collations) | |
+| Q20 | identical, offloaded (since 2026-11-17, LIKE on binary collations; 2026-11-25: its correlated subquery printed as LATERAL, so DuckDB aggregates only the needed keys) | |
 | Q21 | identical, offloaded (since 2026-11-23: in a join condition, a column of the EXISTS nest replaced by an equal outer column; 2026-11-24: at SF100 it filled DuckDB's memory, fixed: the ORDERS-l1 key printed outside the EXISTS, NOT EXISTS printed as NOT EXISTS instead of MySQL's DISTINCT derived table, DWL-06; 5.2 s on the release build) | |
 | Q22 | identical, offloaded (since 2026-11-22, grouped string expressions under PAD SPACE checked per group; real rows in MTR `offload_group_expr`, the quick check's data gives Q22 no rows) | |
 

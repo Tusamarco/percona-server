@@ -178,7 +178,7 @@ std::string registry_where(const std::string &db, const std::string &table) {
          " AND tbl = " + quote_literal(table);
 }
 
-// Drops a copy and its registry row in one DuckLake transaction; the caller
+// Drops a copy and its registry row in one DuckDB transaction; the caller
 // holds apply_mutex.
 bool drop_copy(Lake::Connection &con, const std::string &db,
                const std::string &table, std::string *err) {
@@ -728,7 +728,7 @@ bool load_table_into_lake(THD *thd, const TABLE &table) {
                   "adopt_history_from); nothing loaded "
                   "(duckdb_history_check_only=ON)");
 
-  // Every load builds its copy under a build name in a first DuckLake
+  // Every load builds its copy under a build name in a first DuckDB
   // transaction (T1: the data, no registry write), then renames it and writes
   // the registry in a short second one under apply_mutex (T2). The registry
   // is written by other transactions too (unload, stale marking, renames, the
@@ -1091,9 +1091,8 @@ bool unload_table_from_lake(THD *thd, const char *db, const char *table,
     return false;
   }
 
-  // Classic copy, or a history copy with the confirmation: we drop it. Its
-  // Parquet files are removed later by snapshot expiry and file cleanup
-  // (Phase 3).
+  // Classic copy, or a history copy with the confirmation: we drop it.
+  // DuckDB reuses its space in lake.duckdb after the next checkpoint.
   if (drop_copy(*con, db, table, &err)) return report(err);
   if (drop_history) {
     DUCKDB_LOG_WARNING(
@@ -1163,7 +1162,7 @@ bool rename_in_lake(Lake::Connection &con, const std::string &db,
                           quote_ident(new_table),
                       e);
         } else if (!f) {
-          // DuckLake renames within a schema only: we copy the table (all its
+          // DuckDB renames within a schema only: we copy the table (all its
           // rows, archived ones included) and drop the old one.
           f = run_sql(c, "CREATE SCHEMA IF NOT EXISTS lake." +
                              quote_ident(new_db),

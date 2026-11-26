@@ -519,6 +519,23 @@ std::string pad_sort_key(const std::string &e, size_t max_bytes) {
          std::to_string(max_bytes + 1) + "))";
 }
 
+// A CHAR column (not BINARY): stored without trailing spaces (the binary
+// log strips them, the load too), so under PAD SPACE its equality key is the
+// column itself; rtrim() would hide it from DuckDB's filter pushdown and
+// statistics (TPC-H: PART 4M estimated rows instead of 20K, 2026-11-26).
+bool is_char_column(const Item *item) {
+  const Item *r = const_cast<Item *>(item)->real_item();
+  if (r->type() != Item::FIELD_ITEM) return false;
+  const auto *fi = down_cast<const Item_field *>(r);
+  const Field *f = fi->field;
+  // Base tables only: a derived table's or view's CHAR column is an
+  // expression in DuckDB, which may keep trailing spaces.
+  return f != nullptr && f->real_type() == MYSQL_TYPE_STRING &&
+         f->charset() != &my_charset_bin && fi->m_table_ref != nullptr &&
+         !fi->m_table_ref->is_view_or_derived() &&
+         f->table != nullptr && f->table->s->tmp_table == NO_TMP_TABLE;
+}
+
 std::string pad_equal_key(const std::string &e) {
   return "rtrim(" + e + ", ' ')";
 }
@@ -598,7 +615,7 @@ class Generator {
   bool aggregate(Item_sum *s, std::string *out);
   bool operands(Item_func *fn, bool ordering, unsigned from, unsigned to,
                 std::vector<std::string> *ops);
-  bool numeric(Item *item, std::string *out);
+  bool numeric(Item *item, std::string *out, bool in_decimal = false);
   bool unsigned_arith(Item *left, Item *right, char op, std::string *out);
   bool time_literal(Item *item, std::string *out);
   bool special_args(Item_func *fn);
@@ -687,8 +704,11 @@ class Generator {
     };
     std::vector<Semi> semi;  // semi- and anti-join nests at the top
     // WHERE parts printed elsewhere: the IS NULL of a derived anti-join
-    // (derived_anti_marker()).
+    // (derived_marker()).
     std::set<const Item *> skip_where;
+    // [NOT] EXISTS printed in place of a derived table's IS [NOT] NULL
+    // marker inside OR (derived_marker()).
+    std::map<const Item *, std::string> marker_sql;
   };
   bool grouped_value(const Field *field, const TableInfo &ti,
                      const std::string &col, std::string *out);
@@ -701,7 +721,16 @@ class Generator {
   table_map m_anti_others{0};
   table_map m_anti_mine{0};
   Item_field *outer_equal(Item_field *f);
-  Item *derived_anti_marker(Table_ref *e);
+  Item *derived_marker(Table_ref *e, bool *anti, bool *top);
+  bool unique_match(Table_ref *e);
+  bool lateral_keys(Table_ref *e,
+                    std::vector<std::pair<Item *, std::string>> *keys);
+  // Tables a derived table printed now may reference as LATERAL (the
+  // tables before it in its FROM list; in an EXISTS also the outer
+  // query's), and the correlation for the next derived block printed.
+  table_map m_lateral_ok{0};
+  table_map m_main_visible{0};
+  std::vector<std::pair<Item *, std::string>> m_lateral_keys;
   // Set while the derived table of a derived anti-join is printed: its
   // block leaves DISTINCT out (NOT EXISTS does not need it).
   bool m_drop_distinct{false};
@@ -1027,7 +1056,8 @@ bool Generator::operands(Item_func *fn, bool ordering, unsigned from,
       // the weights (the character set's byte order is not UTF-8's).
       std::string e;
       failed = expr(a, &e);
-      s = cs->pad_attribute == NO_PAD ? e : pad_equal_key(e);
+      s = cs->pad_attribute == NO_PAD || is_char_column(a) ? e
+                                                          : pad_equal_key(e);
     } else if (strings && is_string(a)) {
       // The comparison key of the collation: bytes, rtrim / padded key, or
       // MySQL's weight.
@@ -1141,7 +1171,45 @@ bool Generator::exact_division(const std::string &a, int f1,
 // integers widened to BIGINT as MySQL computes them (DuckDB keeps INTEGER and
 // would overflow at 32 bits). Unsigned integers are refused (MySQL's mixed
 // signed/unsigned rules).
-bool Generator::numeric(Item *item, std::string *out) {
+// The scale DuckDB gives the expression we print for item, when we know
+// it: DECIMAL columns and literals keep MySQL's scale, integers 0, + and -
+// the larger, * the sum, as MySQL (above 30 decimals MySQL caps: unknown).
+// -1: unknown (the caller casts).
+int decimal_scale(const Item *item) {
+  const Item *a = const_cast<Item *>(item)->real_item();
+  if (a->result_type() == INT_RESULT && !a->is_temporal() &&
+      special_column(a) == SpecialColumn::NONE)
+    return 0;
+  if (a->result_type() != DECIMAL_RESULT) return -1;
+  if (a->type() == Item::FIELD_ITEM || a->type() == Item::DECIMAL_ITEM)
+    return a->decimals;
+  if (a->type() != Item::FUNC_ITEM) return -1;
+  const auto *fn = down_cast<const Item_func *>(a);
+  if (fn->argument_count() != 2) return -1;
+  const int l = decimal_scale(fn->arguments()[0]);
+  const int r = decimal_scale(fn->arguments()[1]);
+  if (l < 0 || r < 0) return -1;
+  int sc = -1;
+  switch (fn->functype()) {
+    case Item_func::PLUS_FUNC:
+    case Item_func::MINUS_FUNC:
+      sc = std::max(l, r);
+      break;
+    case Item_func::MUL_FUNC:
+      sc = l + r;
+      break;
+    default:
+      return -1;
+  }
+  // Only when MySQL agrees (its own caps, a wide result printed with a
+  // cast): otherwise the caller casts.
+  if (sc != static_cast<int>(fn->decimals) || sc > 30 ||
+      fn->decimal_precision() > 38)
+    return -1;
+  return sc;
+}
+
+bool Generator::numeric(Item *item, std::string *out, bool in_decimal) {
   Item *a = item->real_item();
   // An ENUM / SET column as a number is its index / bitmask (val_real).
   if (special_column(a) == SpecialColumn::OTHER && !a->is_temporal()) {
@@ -1156,7 +1224,9 @@ bool Generator::numeric(Item *item, std::string *out) {
     return refuse("arithmetic_on_unsigned");
   std::string e;
   if (expr(a, &e)) return true;
-  *out = a->result_type() == INT_RESULT ? "CAST(" + e + " AS BIGINT)" : e;
+  *out = a->result_type() == INT_RESULT && !in_decimal
+             ? "CAST(" + e + " AS BIGINT)"
+             : e;
   return false;
 }
 
@@ -1345,7 +1415,9 @@ bool Generator::string_key(Item *item, const CHARSET_INFO *cs, bool ordering,
     case StrMode::PAD: {
       std::string e;
       if (expr(item, &e)) return true;
-      *out = ordering ? pad_sort_key(e, max_bytes) : pad_equal_key(e);
+      *out = ordering                ? pad_sort_key(e, max_bytes)
+             : is_char_column(item) ? e
+                                    : pad_equal_key(e);
       return false;
     }
     case StrMode::WEIGHT: {
@@ -1685,19 +1757,29 @@ bool Generator::function(Item_func *fn, std::string *out) {
     return false;
   };
   auto arith = [&](const char *op) {
-    if (fn->result_type() == DECIMAL_RESULT && fn->decimal_precision() > 38)
-      m_decimal_wide = true;
+    const bool wide =
+        fn->result_type() == DECIMAL_RESULT && fn->decimal_precision() > 38;
+    if (wide) m_decimal_wide = true;
     if (fn->result_type() == INT_RESULT && fn->unsigned_flag &&
         (op[0] == '+' || op[0] == '*'))
       return unsigned_arith(args[0], args[1], op[0], out);
     std::string l, r;
-    if (numeric(args[0], &l) || numeric(args[1], &r)) return true;
+    // In DECIMAL arithmetic an integer operand stays as it is (DuckDB
+    // turns it into DECIMAL(w, 0) exactly); CAST(.. AS BIGINT) would make
+    // the operation 128-bit (2026-11-25, about 30% of Q1's time).
+    const bool dec = fn->result_type() == DECIMAL_RESULT;
+    if (numeric(args[0], &l, dec) || numeric(args[1], &r, dec)) return true;
     *out = "(" + l + " " + op + " " + r + ")";
     // MySQL rounds a DECIMAL result to the item's scale
     // (Item_func_numhybrid::val_decimal): it matters when an operand has
-    // more digits (AVG).
-    if (fn->result_type() == DECIMAL_RESULT)
+    // more digits (AVG). When DuckDB's own result scale is already MySQL's
+    // (decimal_scale()), the CAST changes nothing and is left out: it cost
+    // about 30% of Q1's time (2026-11-25).
+    if (dec && (wide || decimal_scale(fn) != static_cast<int>(fn->decimals) ||
+                m_scale_cap >= 0))
       *out = "CAST(" + *out + " AS " + dec38(fn->decimals) + ")";
+    else if (dec)
+      m_max_scale = std::max(m_max_scale, static_cast<int>(fn->decimals));
     return false;
   };
   switch (fn->functype()) {
@@ -2253,6 +2335,33 @@ bool Generator::function(Item_func *fn, std::string *out) {
     if (text_arg(0, &s0) || int_arg(1, &p)) return true;
     if (name == "substr" && n == 3 && int_arg(2, &l)) return true;
     const std::string len = "length(" + s0 + ")";
+    // Constant position and length (SUBSTRING(c, 1, 2), TPC-H Q22): the
+    // edge cases are decided now (2026-11-26).
+    auto const_int = [&](unsigned i, long long *v) {
+      Item *a = args[i]->real_item();
+      if (!is_constant(a) || a->result_type() != INT_RESULT) return false;
+      *v = a->val_int();
+      return !a->null_value;
+    };
+    long long pv = 0, lv = 1;
+    const std::string empty =
+        "(CASE WHEN " + s0 + " IS NULL THEN NULL ELSE '' END)";
+    if (const_int(1, &pv) && (name != "substr" || n < 3 || const_int(2, &lv))) {
+      if (name == "left" || name == "right") {
+        *out = pv < 1 ? empty
+                      : name + "(" + s0 + ", " + std::to_string(pv) + ")";
+        return false;
+      }
+      if (pv == 0 || (n == 3 && lv < 1)) {
+        *out = empty;
+        return false;
+      }
+      if (pv > 0) {
+        *out = "substring(" + s0 + ", " + std::to_string(pv) +
+               (n == 3 ? ", " + std::to_string(lv) : std::string()) + ")";
+        return false;
+      }
+    }
     if (name == "left" || name == "right") {
       *out = "(CASE WHEN " + p + " IS NULL OR " + s0 +
              " IS NULL THEN NULL WHEN " + p + " < 1 THEN '' ELSE " + name +
@@ -2533,6 +2642,13 @@ bool Generator::grouped_expression(Item *item, std::string *out) {
 
 bool Generator::expr(Item *item, std::string *out) {
   item = item->real_item();
+  if (!m_block->marker_sql.empty()) {
+    const auto m = m_block->marker_sql.find(item);
+    if (m != m_block->marker_sql.end()) {
+      *out = m->second;
+      return false;
+    }
+  }
   if (m_block->post_group && m_block->agg_depth == 0 &&
       item->type() != Item::FIELD_ITEM) {
     for (Item *g : m_block->group_pad_exprs)
@@ -2766,11 +2882,17 @@ bool Generator::table_ref(Table_ref *tr, std::string *out) {
     std::vector<std::string> names;
     for (uint i = 0; i < table->visible_field_count(); i++)
       names.emplace_back(table->visible_field_ptr()[i]->field_name);
+    // A grouped derived table joined on its GROUP BY columns (MySQL's
+    // rewrite of correlated scalar / ALL / ANY subqueries for secondary
+    // engines): LATERAL with the correlation put back (lateral_keys()).
+    std::vector<std::pair<Item *, std::string>> keys;
+    if (lateral_keys(tr, &keys)) return true;
     Block inner;
     Block *outer = m_block;
     const enum_field_types temporal = m_temporal;
     m_block = &inner;
     m_temporal = MYSQL_TYPE_NULL;
+    m_lateral_keys = keys;
     std::string sql;
     // Columns of weight collations carry their weights when they can.
     const bool failed =
@@ -2792,7 +2914,8 @@ bool Generator::table_ref(Table_ref *tr, std::string *out) {
             ") AS r) AS r WHERE CASE WHEN \"__duckdb_rows\" > 1 THEN "
             "error('" +
             std::string(kDuckDBMultipleRows) + "') ELSE TRUE END";
-    *out = "(" + sql + ") AS " + ti.alias;
+    *out = std::string(keys.empty() ? "" : "LATERAL ") + "(" + sql + ") AS " +
+           ti.alias;
     ti.derived = true;
     ti.scalar = tr->m_was_scalar_subquery;
   } else {
@@ -2834,6 +2957,125 @@ bool Generator::table_ref(Table_ref *tr, std::string *out) {
   return false;
 }
 
+// MySQL plans a correlated scalar subquery (and ALL / ANY) for a secondary
+// engine as a derived table grouped on the correlation columns, joined on
+// them (Query_block::transform_scalar_subqueries_to_join_with_derived):
+//   FROM ot JOIN (SELECT agg(..), it.k FROM it GROUP BY it.k) AS d
+//   ON / WHERE d.k = ot.k
+// DuckDB then aggregates the whole inner table (TPC-H Q17: 600M rows into
+// 20M groups at SF100) before the join can reduce it. Filtering the
+// derived block on it.k = ot.k removes whole groups that the join drops
+// anyway, so the result is the same; as LATERAL, DuckDB decorrelates it
+// and aggregates only the keys it needs (2026-11-25). The equalities come
+// from d's ON condition and, for an inner join, the block's WHERE (also
+// multiple equalities); the outer column must be of a table d may
+// reference (m_lateral_ok), the types such that DuckDB's = is MySQL's.
+// keys: (d's select-list item for the key, the outer column's SQL).
+bool Generator::lateral_keys(
+    Table_ref *e, std::vector<std::pair<Item *, std::string>> *keys) {
+  if (m_lateral_ok == 0 || e->table == nullptr) return false;
+  Query_expression *unit = e->derived_query_expression();
+  if (unit == nullptr || !unit->is_simple() || unit->m_reject_multiple_rows ||
+      unit->m_lateral_deps != 0)
+    return false;
+  // Only what was a correlated subquery in the statement, as AliSQL and
+  // MariaDB send it: a scalar one (m_was_scalar_subquery), or ALL / ANY
+  // (a derived table MySQL made, "derived_N_M", whose select list has the
+  // aggregates, grouped on the correlation columns). A grouped view, or an
+  // uncorrelated IN (SELECT k ... GROUP BY k HAVING ...) whose select list
+  // is the key (TPC-H Q15, Q18), is better as it is: LATERAL makes DuckDB
+  // first collect all outer keys. (LATERAL is exact either way.)
+  if (!e->m_was_scalar_subquery) {
+    if (e->alias == nullptr || strncmp(e->alias, "derived_", 8) != 0)
+      return false;
+    bool aggregates = false;
+    for (Item *v : unit->first_query_block()->visible_fields())
+      aggregates = aggregates || v->has_aggregation();
+    if (!aggregates) return false;
+  }
+  Query_block *dq = unit->first_query_block();
+  if (dq->group_list.elements == 0 || dq->olap != UNSPECIFIED_OLAP_TYPE ||
+      dq->has_windows() || dq->select_limit != nullptr ||
+      dq->offset_limit != nullptr)
+    return false;
+  // d's column -> its select-list item, if it is a GROUP BY item.
+  auto group_item = [&](const Item_field *f) -> Item * {
+    if (f->field == nullptr || f->field->table != e->table) return nullptr;
+    const uint idx = f->field->field_index();
+    uint k = 0;
+    Item *src = nullptr;
+    for (Item *v : dq->visible_fields())
+      if (k++ == idx) {
+        src = v;
+        break;
+      }
+    if (src == nullptr) return nullptr;
+    for (ORDER *o = dq->group_list.first; o != nullptr; o = o->next)
+      if ((*o->item)->real_item() == src->real_item() ||
+          (*o->item)->real_item()->eq(src->real_item()))
+        return src;
+    return nullptr;
+  };
+  auto usable = [&](Item *x, Item *y) {
+    const bool strings = is_string(x) || is_string(y);
+    if (strings)
+      return is_string(x) && is_string(y) && str_mode(x) == StrMode::RAW &&
+             str_mode(y) == StrMode::RAW;
+    return x->result_type() == y->result_type() &&
+           x->result_type() != REAL_RESULT && !x->is_temporal() &&
+           !y->is_temporal();
+  };
+  std::set<const Item *> done;
+  auto consider = [&](Item_field *a, Item_field *b) -> bool {
+    Item *src = group_item(a);
+    if (src == nullptr || done.count(src->real_item()) != 0) return false;
+    if (b->field == nullptr || b->field->table == e->table) return false;
+    const table_map bm = b->used_tables() & ~PSEUDO_TABLE_BITS;
+    if (bm == 0 || (bm & ~m_lateral_ok) != 0) return false;
+    if (!usable(src->real_item(), b)) return false;
+    std::string o;
+    if (expr(b, &o)) return true;
+    done.insert(src->real_item());
+    keys->emplace_back(src, o);
+    return false;
+  };
+  std::vector<Item *> parts;
+  auto split = [&](Item *c) {
+    if (c == nullptr) return;
+    c = c->real_item();
+    if (c->type() == Item::COND_ITEM &&
+        down_cast<Item_func *>(c)->functype() == Item_func::COND_AND_FUNC) {
+      for (Item &a : *down_cast<Item_cond *>(c)->argument_list())
+        parts.push_back(a.real_item());
+    } else {
+      parts.push_back(c);
+    }
+  };
+  split(e->join_cond());
+  if (!e->outer_join && m_block->qb != nullptr)
+    split(m_block->qb->where_cond());
+  for (Item *c : parts) {
+    if (c->type() != Item::FUNC_ITEM) continue;
+    auto *fn = down_cast<Item_func *>(c);
+    if (fn->functype() == Item_func::EQ_FUNC) {
+      Item *l = fn->arguments()[0]->real_item();
+      Item *r = fn->arguments()[1]->real_item();
+      if (l->type() != Item::FIELD_ITEM || r->type() != Item::FIELD_ITEM)
+        continue;
+      auto *lf = down_cast<Item_field *>(l), *rf = down_cast<Item_field *>(r);
+      if (consider(lf, rf) || consider(rf, lf)) return true;
+    } else if (fn->functype() == Item_func::MULTI_EQ_FUNC) {
+      std::vector<Item_field *> fields;
+      for (Item_field &f : down_cast<Item_multi_eq *>(fn)->get_fields())
+        fields.push_back(&f);
+      for (Item_field *a : fields)
+        for (Item_field *b : fields)
+          if (a != b && consider(a, b)) return true;
+    }
+  }
+  return false;
+}
+
 // MySQL plans NOT EXISTS / NOT IN for a secondary engine as a derived
 // table (Item_exists_subselect::is_derived_candidate, cannot_do_antijoin):
 //   FROM ot LEFT JOIN (SELECT DISTINCT 1 AS c, ie ...) AS d ON <cond>
@@ -2844,7 +3086,7 @@ bool Generator::table_ref(Table_ref *tr, std::string *out) {
 // derived table first (TPC-H Q21 at SF100: hundreds of millions of rows,
 // spilled to disk). Returns the IS NULL part of WHERE, or nullptr when e
 // is not such a table.
-Item *Generator::derived_anti_marker(Table_ref *e) {
+Item *Generator::derived_marker(Table_ref *e, bool *anti, bool *top) {
   if (!e->outer_join || !e->is_view_or_derived() || e->table == nullptr ||
       e->m_was_scalar_subquery)
     return nullptr;
@@ -2857,45 +3099,6 @@ Item *Generator::derived_anti_marker(Table_ref *e) {
   Query_block *dq = unit->first_query_block();
   if (dq->select_limit != nullptr || dq->offset_limit != nullptr)
     return nullptr;
-  const table_map map = e->map();
-  std::vector<Item *> parts;
-  Item *where = qb->where_cond()->real_item();
-  if (where->type() == Item::COND_ITEM &&
-      down_cast<Item_func *>(where)->functype() == Item_func::COND_AND_FUNC) {
-    for (Item &a : *down_cast<Item_cond *>(where)->argument_list())
-      parts.push_back(a.real_item());
-  } else {
-    parts.push_back(where);
-  }
-  Item *marker = nullptr;
-  for (Item *p : parts) {
-    if ((p->used_tables() & map) == 0) continue;
-    if (marker == nullptr && p->type() == Item::FUNC_ITEM &&
-        down_cast<Item_func *>(p)->functype() == Item_func::ISNULL_FUNC) {
-      Item *a = down_cast<Item_func *>(p)->arguments()[0]->real_item();
-      if (a->type() == Item::FIELD_ITEM &&
-          down_cast<Item_field *>(a)->field != nullptr &&
-          down_cast<Item_field *>(a)->field->table == e->table) {
-        // The column of d: its expression in d must never be NULL.
-        const uint idx = down_cast<Item_field *>(a)->field->field_index();
-        uint k = 0;
-        Item *src = nullptr;
-        for (Item *f : dq->visible_fields())
-          if (k++ == idx) {
-            src = f;
-            break;
-          }
-        if (src != nullptr && !src->is_nullable()) {
-          marker = p;
-          continue;
-        }
-      }
-    }
-    return nullptr;  // d used by another WHERE part
-  }
-  if (marker == nullptr) return nullptr;
-  // d nowhere else: select list, GROUP BY, HAVING, ORDER BY, other joins.
-  // (used_tables() is not enough: COUNT(*) reports every table.)
   auto uses_d = [&](Item *item) {
     return item != nullptr &&
            WalkItem(item, enum_walk::PREFIX, [&](Item *i) {
@@ -2905,6 +3108,84 @@ Item *Generator::derived_anti_marker(Table_ref *e) {
                     down_cast<const Item_field *>(r)->field->table == e->table;
            });
   };
+  // d's column idx is in an equality (EQ or multiple equality) of ON.
+  auto on_equated = [&](uint idx) {
+    if (e->join_cond() == nullptr) return false;
+    bool found = false;
+    WalkItem(e->join_cond(), enum_walk::PREFIX, [&](Item *i) {
+      if (i->type() != Item::FUNC_ITEM) return false;
+      auto *fn = down_cast<Item_func *>(i);
+      auto is_d = [&](Item *x) {
+        x = x->real_item();
+        return x->type() == Item::FIELD_ITEM &&
+               down_cast<Item_field *>(x)->field != nullptr &&
+               down_cast<Item_field *>(x)->field->table == e->table &&
+               down_cast<Item_field *>(x)->field->field_index() == idx;
+      };
+      if (fn->functype() == Item_func::EQ_FUNC &&
+          (is_d(fn->arguments()[0]) || is_d(fn->arguments()[1])))
+        found = true;
+      if (fn->functype() == Item_func::MULTI_EQ_FUNC)
+        for (Item_field &f : down_cast<Item_multi_eq *>(fn)->get_fields())
+          if (is_d(&f)) found = true;
+      return found;
+    });
+    return found;
+  };
+  // IS [NOT] NULL on a column of d that is never NULL in d, or that ON
+  // equates.
+  auto is_marker = [&](Item *p, bool *is_anti) {
+    if (p->type() != Item::FUNC_ITEM) return false;
+    const auto ft = down_cast<Item_func *>(p)->functype();
+    if (ft != Item_func::ISNULL_FUNC && ft != Item_func::ISNOTNULL_FUNC)
+      return false;
+    Item *a = down_cast<Item_func *>(p)->arguments()[0]->real_item();
+    if (a->type() != Item::FIELD_ITEM ||
+        down_cast<Item_field *>(a)->field == nullptr ||
+        down_cast<Item_field *>(a)->field->table != e->table)
+      return false;
+    const uint idx = down_cast<Item_field *>(a)->field->field_index();
+    uint k = 0;
+    Item *src = nullptr;
+    for (Item *f : dq->visible_fields())
+      if (k++ == idx) {
+        src = f;
+        break;
+      }
+    if (src == nullptr) return false;
+    // A nullable column (the key of IN) is a marker too when ON equates
+    // it: a matched row then never has NULL there.
+    if (src->is_nullable() && !on_equated(idx)) return false;
+    *is_anti = ft == Item_func::ISNULL_FUNC;
+    return true;
+  };
+  // Walk AND / OR: d may appear only in one marker.
+  Item *marker = nullptr;
+  bool bad = false;
+  Item *where = qb->where_cond()->real_item();
+  std::function<void(Item *, bool)> walk = [&](Item *c, bool at_top) {
+    c = c->real_item();
+    if (c->type() == Item::COND_ITEM) {
+      const bool is_and = down_cast<Item_func *>(c)->functype() ==
+                          Item_func::COND_AND_FUNC;
+      for (Item &a : *down_cast<Item_cond *>(c)->argument_list())
+        walk(&a, at_top && is_and);
+      return;
+    }
+    if (!uses_d(c)) return;
+    bool a = false;
+    if (marker == nullptr && is_marker(c, &a)) {
+      marker = c;
+      *anti = a;
+      *top = at_top;
+      return;
+    }
+    bad = true;
+  };
+  walk(where, true);
+  if (bad || marker == nullptr) return nullptr;
+  // d nowhere else: select list, GROUP BY, HAVING, ORDER BY, other joins.
+  // (used_tables() is not enough: COUNT(*) reports every table.)
   for (Item *f : qb->fields)
     if (uses_d(f)) return nullptr;
   if (uses_d(qb->having_cond())) return nullptr;
@@ -2926,6 +3207,71 @@ Item *Generator::derived_anti_marker(Table_ref *e) {
   return marker;
 }
 
+// d (a DISTINCT derived table) matches each outer row at most once: its ON
+// condition is only equalities, together fixing every column of d that is
+// not a constant (the EXISTS marker). Then LEFT JOIN d ... d.c IS [NOT] NULL
+// never duplicated a row and [NOT] EXISTS gives the same rows anywhere in
+// WHERE.
+bool Generator::unique_match(Table_ref *e) {
+  Query_expression *unit = e->derived_query_expression();
+  if (unit == nullptr || e->join_cond() == nullptr) return false;
+  Query_block *dq = unit->first_query_block();
+  if (!dq->is_distinct()) return false;
+  std::set<uint> fixed;
+  auto d_field = [&](Item *i) -> const Item_field * {
+    i = i->real_item();
+    if (i->type() != Item::FIELD_ITEM) return nullptr;
+    const auto *f = down_cast<const Item_field *>(i);
+    return f->field != nullptr && f->field->table == e->table ? f : nullptr;
+  };
+  auto uses_d = [&](Item *item) {
+    return WalkItem(item, enum_walk::PREFIX,
+                    [&](Item *i) { return d_field(i) != nullptr; });
+  };
+  std::vector<Item *> parts;
+  Item *c = e->join_cond()->real_item();
+  if (c->type() == Item::COND_ITEM &&
+      down_cast<Item_func *>(c)->functype() == Item_func::COND_AND_FUNC) {
+    for (Item &a : *down_cast<Item_cond *>(c)->argument_list())
+      parts.push_back(a.real_item());
+  } else {
+    parts.push_back(c);
+  }
+  for (Item *p : parts) {
+    if (p->type() != Item::FUNC_ITEM) return false;
+    auto *fn = down_cast<Item_func *>(p);
+    if (fn->functype() == Item_func::EQ_FUNC) {
+      Item *l = fn->arguments()[0], *r = fn->arguments()[1];
+      const Item_field *dl = d_field(l), *dr = d_field(r);
+      if (dl != nullptr && !uses_d(r))
+        fixed.insert(dl->field->field_index());
+      else if (dr != nullptr && !uses_d(l))
+        fixed.insert(dr->field->field_index());
+      else
+        return false;
+    } else if (fn->functype() == Item_func::MULTI_EQ_FUNC) {
+      bool outer = false;
+      std::vector<uint> mine;
+      for (Item_field &f : down_cast<Item_multi_eq *>(fn)->get_fields()) {
+        if (d_field(&f) != nullptr)
+          mine.push_back(f.field->field_index());
+        else
+          outer = true;
+      }
+      if (!outer) return false;
+      fixed.insert(mine.begin(), mine.end());
+    } else {
+      return false;
+    }
+  }
+  uint k = 0;
+  for (Item *f : dq->visible_fields()) {
+    if (fixed.count(k) == 0 && !f->const_item()) return false;
+    k++;
+  }
+  return true;
+}
+
 // A join list (stored in reverse order by the parser). Inner joins, CROSS
 // JOIN and LEFT JOIN (RIGHT JOIN is already a LEFT JOIN) are printed as
 // joins; semi-join nests (IN / EXISTS subqueries the optimizer flattened)
@@ -2934,12 +3280,18 @@ Item *Generator::derived_anti_marker(Table_ref *e) {
 bool Generator::from_list(mem_root_deque<Table_ref *> &list, bool under_outer,
                           bool in_semi, std::string *out) {
   std::string from;
+  table_map seen = 0;  // tables of this list printed so far
   // The tables of this list's semi- and anti-join nests (printed as EXISTS
   // / NOT EXISTS in WHERE, not visible in FROM).
   table_map semi_all = 0;
   if (!in_semi)
     for (Table_ref *e : list)
       if (e->is_sj_or_aj_nest()) semi_all |= e->nested_join->used_tables;
+  // The tables an EXISTS of this block can see: the block's tables outside
+  // its semi- and anti-join nests.
+  if (!in_semi && !under_outer && m_block->qb != nullptr &&
+      &list == &m_block->qb->m_table_nest)
+    m_main_visible = m_block->qb->all_tables_map() & ~semi_all;
   for (auto it = list.rbegin(); it != list.rend(); ++it) {
     Table_ref *e = *it;
     if (e->is_sj_or_aj_nest()) {
@@ -2956,10 +3308,39 @@ bool Generator::from_list(mem_root_deque<Table_ref *> &list, bool under_outer,
       continue;
     }
     // NOT EXISTS / NOT IN made a derived table by MySQL (2026-11-24):
-    // printed back as NOT EXISTS (derived_anti_marker()).
-    if (!in_semi && !under_outer && !from.empty() &&
-        e->nested_join == nullptr) {
-      if (Item *marker = derived_anti_marker(e); marker != nullptr) {
+    // printed back as NOT EXISTS (derived_marker()).
+    bool anti = false, top = false;
+    Item *marker = !in_semi && !under_outer && !from.empty() &&
+                           e->nested_join == nullptr
+                       ? derived_marker(e, &anti, &top)
+                       : nullptr;
+    if (marker != nullptr && !(anti && top) && unique_match(e)) {
+      // Inside OR (or IS NOT NULL): [NOT] EXISTS in place of the marker;
+      // each outer row matches at most one row of d (unique_match()), so
+      // the LEFT JOIN never duplicated rows (2026-11-26).
+      std::string sub;
+      m_drop_distinct = true;
+      bool failed = table_ref(e, &sub);
+      m_drop_distinct = false;
+      if (failed) return true;
+      std::string on = "TRUE";
+      if (e->join_cond() != nullptr) {
+        const table_map saved_others = m_anti_others;
+        const table_map saved_mine = m_anti_mine;
+        m_anti_others = semi_all;
+        m_anti_mine = e->map();
+        failed = expr(e->join_cond(), &on);
+        m_anti_others = saved_others;
+        m_anti_mine = saved_mine;
+        if (failed) return true;
+      }
+      m_block->marker_sql[marker] = std::string(anti ? "(NOT EXISTS (" : "(EXISTS (") +
+                                    "SELECT 1 FROM " + sub + " WHERE " + on +
+                                    "))";
+      continue;
+    }
+    if (marker != nullptr && anti && top) {
+      {
         Block::Semi s;
         s.nest = e;
         s.anti = true;
@@ -2982,9 +3363,17 @@ bool Generator::from_list(mem_root_deque<Table_ref *> &list, bool under_outer,
         return true;
       if (nest.empty()) return refuse("empty_join_nest");
       item = "(" + nest + ")";
-    } else if (table_ref(e, &item)) {
-      return true;
+    } else {
+      // LATERAL only at the top of a block or of an EXISTS (not inside a
+      // parenthesized join).
+      m_lateral_ok =
+          under_outer ? 0 : (seen | (in_semi ? m_main_visible : 0));
+      const bool failed = table_ref(e, &item);
+      m_lateral_ok = 0;
+      if (failed) return true;
     }
+    seen |= e->nested_join != nullptr ? e->nested_join->used_tables
+                                      : (e->table != nullptr ? e->map() : 0);
     std::string on;
     if (e->join_cond() != nullptr) {
       // A join condition may name a column of a semi-join nest of this
@@ -3143,6 +3532,10 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
   m_block->qb = qb;
   const bool drop_distinct = m_drop_distinct;  // this block only
   m_drop_distinct = false;
+  const std::vector<std::pair<Item *, std::string>> lateral =
+      std::move(m_lateral_keys);
+  m_lateral_keys.clear();
+  const table_map saved_main_visible = m_main_visible;
 
   std::string from;
   if (from_sql != nullptr)
@@ -3152,6 +3545,7 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
   // A block without tables (SELECT 1, as a set operation operand) has no
   // FROM.
   if (from.empty() && qb->leaf_table_count != 0) return refuse("no_table");
+  m_main_visible = saved_main_visible;
 
   // WHERE, on rows before grouping. A semi-join's condition was merged into
   // WHERE: each AND part that uses a semi-join's tables goes into its EXISTS
@@ -3237,7 +3631,7 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
         if (j != i) others |= m_block->semi[j].tables;
       const table_map mine = s.tables;
       if (s.nest->nested_join == nullptr) {
-        // A derived anti-join (derived_anti_marker()): its ON condition,
+        // A derived anti-join (derived_marker()): its ON condition,
         // where a column of another nest is printed as an equal outer
         // column (outer_equal()), as when it was a LEFT JOIN.
         std::string c;
@@ -3278,6 +3672,13 @@ bool Generator::block_sql(Query_block *qb, const std::vector<std::string> *names
       body += (j == 0 ? " WHERE " : " AND ") + conds[j];
     where.push_back(std::string(s.anti ? "NOT EXISTS (" : "EXISTS (") + body +
                     ")");
+  }
+  // A LATERAL derived block: its GROUP BY columns equal to the outer
+  // columns the join compares them with (lateral_keys()).
+  for (const auto &k : lateral) {
+    std::string inner;
+    if (expr(k.first, &inner)) return true;
+    where.push_back("(" + inner + " = " + k.second + ")");
   }
 
   // GROUP BY. PAD SPACE strings group on rtrim(); a plain column of the

@@ -324,21 +324,27 @@ bool store_field(duckdb_vector vec, idx_t row, Field &field,
     case MYSQL_TYPE_STRING:
     case MYSQL_TYPE_VARCHAR:
     case MYSQL_TYPE_BLOB: {
-      // CHAR values come without trailing spaces, as MySQL returns them;
       // ENUM / SET give their string value (Field_enum::val_str).
       String buf;
       const String *s = field.val_str(&buf);
+      size_t len = s->length();
+      // CHAR values without trailing spaces, as the binary log has them
+      // (Field_string::pack), also when the loading session has
+      // PAD_CHAR_TO_FULL_LENGTH: the offload compares CHAR columns without
+      // rtrim() (2026-11-26).
+      if (field.real_type() == MYSQL_TYPE_STRING &&
+          field.charset() != &my_charset_bin)
+        len = field.charset()->cset->lengthsp(field.charset(), s->ptr(), len);
       if (field.charset() == &my_charset_bin ||
           is_utf8_compatible(field.charset())) {
-        duckdb_vector_assign_string_element_len(vec, row, s->ptr(),
-                                                s->length());
+        duckdb_vector_assign_string_element_len(vec, row, s->ptr(), len);
         return false;
       }
       // Other character sets: we convert to UTF-8 with the server's own
       // conversion; values convert back exactly when results are sent.
       String utf8;
       uint errors = 0;
-      if (utf8.copy(s->ptr(), s->length(), s->charset(),
+      if (utf8.copy(s->ptr(), len, s->charset(),
                     &my_charset_utf8mb4_bin, &errors) ||
           errors != 0) {
         *err = column_error(field, "value cannot be converted to UTF-8");

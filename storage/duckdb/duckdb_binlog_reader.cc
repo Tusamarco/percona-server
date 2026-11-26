@@ -85,7 +85,7 @@ struct RowsEventHeader : public bev::Rows_event {
 constexpr unsigned kMaxDebugLines = 100;
 
 // Without changes to loaded tables we record a new applied position at most
-// this often: each commit is a DuckLake snapshot, and the position only
+// this often: each commit writes to the lake file, and the position only
 // shortens the re-read after a restart.
 constexpr std::chrono::seconds kPositionCommitInterval{60};
 

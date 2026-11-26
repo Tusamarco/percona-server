@@ -1,0 +1,74 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# Correlated scalar, ALL and ANY subqueries (2026-11-25): MySQL plans them
+# for a secondary engine as a derived table grouped on the correlation
+# columns over the whole inner table, joined on them. We print it as
+# LATERAL with the correlation put back (the filter only removes whole
+# groups the join drops anyway), so DuckDB aggregates only the keys it
+# needs (TPC-H Q17, Q2, Q20). Results as InnoDB; the plan shape checked.
+--source ../include/have_duckdb.inc
+CREATE TABLE po (pk INT PRIMARY KEY, brand CHAR(5) COLLATE utf8mb4_bin, s VARCHAR(10) COLLATE utf8mb4_bin, c VARCHAR(10) COLLATE utf8mb4_0900_ai_ci, price DECIMAL(10,2)) SECONDARY_ENGINE = duckdb;
+CREATE TABLE li (id INT PRIMARY KEY, pk INT, sk INT, qty INT, price DECIMAL(10,2), s VARCHAR(10) COLLATE utf8mb4_bin, c VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) SECONDARY_ENGINE = duckdb;
+INSERT INTO po VALUES (1, 'B1', 'a', 'X', 10.00), (2, 'B1', 'b', 'y', 20.00), (3, 'B2', 'c', 'Z', 30.00),
+  (4, 'B1', 'd', 'w', 5.00), (5, NULL, NULL, NULL, NULL);
+# part 4 has no lines (empty group), part 5 a NULL brand; line 9 a NULL pk
+INSERT INTO li VALUES (1, 1, 1, 5, 9.00, 'a', 'x'), (2, 1, 2, 50, 11.00, 'a', 'X'), (3, 1, 1, 7, 12.00, 'a', 'x'),
+  (4, 2, 1, 1, 25.00, 'b', 'Y'), (5, 2, 2, 100, 15.00, 'b', 'y'), (6, 3, 3, 3, 31.00, 'c', 'z'),
+  (7, 3, 3, NULL, NULL, 'c', 'Z'), (8, 5, 1, 4, 1.00, NULL, NULL), (9, NULL, 1, 8, 2.00, 'q', 'q');
+ALTER TABLE po SECONDARY_LOAD;
+ALTER TABLE li SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+--echo # TPC-H Q17's shape
+--let $query= SELECT SUM(li.price) FROM li, po WHERE po.pk = li.pk AND po.brand = 'B1' AND li.qty < (SELECT 0.5 * AVG(l2.qty) FROM li l2 WHERE l2.pk = po.pk)
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--echo # Q2's shape: equal to the minimum of the part
+--let $query= SELECT po.pk, li.id FROM po, li WHERE li.pk = po.pk AND li.price = (SELECT MIN(l2.price) FROM li l2 WHERE l2.pk = po.pk) ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+--echo # In the select list (LEFT JOIN): empty group gives NULL; COUNT gives 0
+--let $query= SELECT po.pk, (SELECT MAX(l2.price) FROM li l2 WHERE l2.pk = po.pk), (SELECT COUNT(*) FROM li l2 WHERE l2.pk = po.pk), (SELECT COUNT(l2.qty) FROM li l2 WHERE l2.pk = po.pk) FROM po ORDER BY 1
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--echo # Two correlation columns (Q20's shape)
+--let $query= SELECT li.id FROM li WHERE li.qty > (SELECT 0.5 * SUM(l2.qty) FROM li l2 WHERE l2.pk = li.pk AND l2.sk = li.sk) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--echo # ALL / ANY
+--let $query= SELECT po.pk FROM po WHERE po.price > ALL (SELECT l2.price FROM li l2 WHERE l2.pk = po.pk) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--let $query= SELECT po.pk FROM po WHERE po.price < ANY (SELECT l2.price FROM li l2 WHERE l2.pk = po.pk) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--echo # String keys: PAD SPACE (utf8mb4_bin) and _ci compare by rtrim / weights,
+--echo # not by DuckDB =: no LATERAL (results as InnoDB)
+--let $query= SELECT po.pk, (SELECT COUNT(*) FROM li l2 WHERE l2.s = po.s) FROM po ORDER BY 1
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--let $query= SELECT po.pk, (SELECT COUNT(*) FROM li l2 WHERE l2.c = po.c) FROM po ORDER BY 1
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--echo # Uncorrelated IN with GROUP BY (TPC-H Q18's shape): as it is, no LATERAL
+--echo # (LATERAL would make DuckDB collect every outer key first)
+--let $query= SELECT po.pk FROM po WHERE po.pk IN (SELECT l2.pk FROM li l2 GROUP BY l2.pk HAVING SUM(l2.qty) > 10) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--echo # Uncorrelated: a one-row derived table, nothing to correlate
+--let $query= SELECT li.id FROM li WHERE li.qty > (SELECT AVG(qty) FROM li) ORDER BY 1
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+
+DROP TABLE po, li;
+--source ../include/cleanup.inc

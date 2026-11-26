@@ -907,6 +907,75 @@ return DOUBLE and `sum` returns NULL.
   scalars, JSON null and SQL NULL, unicode and escapes, points, lines,
   polygons with SRID; joins and derived tables; nine refusals).
 
+### Performance review against AliSQL and MariaDB (2026-11-25)
+
+HammerDB TPROC-H at SF100, 1 thread: the plugin was about 3x slower than
+AliSQL's and MariaDB's DuckDB engines (sum of the 22 means 63.8 s against
+20.4 s and 25.3 s). Measured causes, each fixed or planned:
+
+- **Storage**: DuckLake (Parquet) scans 2-3x slower than DuckDB's native
+  format on the same data (30M rows: Q6 61 ms native, 157-174 ms DuckLake;
+  Parquet codecs and DuckDB's file caches make no difference). Decided
+  2026-11-25: native DuckDB storage (design document, Storage).
+- **Per-row DECIMAL casts**: every DECIMAL `+ - *` was printed as
+  `CAST(... AS DECIMAL(38, s))` and integer operands as `CAST(.. AS
+  BIGINT)`, making the arithmetic 128-bit; about 30% of Q1's time. Now the
+  cast is printed only when DuckDB's own result scale differs from MySQL's
+  (`decimal_scale()`: DECIMAL columns and literals keep MySQL's scale,
+  integers 0, `+ -` the larger, `*` the sum; anything else, a ROUND cap or
+  a result above 38 digits keeps the cast), and integer operands of DECIMAL
+  arithmetic are left as they are (DuckDB widens them exactly).
+- **Correlated scalar / ALL / ANY subqueries** (TPC-H Q17 10x, Q2 7x, Q20
+  4x): for a secondary engine MySQL plans them as a derived table grouped
+  on the correlation columns over the whole inner table, joined on them
+  (`transform_scalar_subqueries_to_join_with_derived`, also `ALL` / `ANY`
+  as aggregated derived tables). DuckDB then aggregates everything (Q17:
+  600M rows into 20M groups) before the join reduces it. We print such a
+  derived table as `LATERAL` with `WHERE <group column> = <outer column>`
+  (`lateral_keys()`): the filter removes only whole groups the join drops
+  anyway, so the result is the same, and DuckDB decorrelates it and
+  aggregates only the keys it needs. Conditions: a single grouped block
+  without LIMIT, windows, ROLLUP or the one-row check; the equality in the
+  derived table's ON or, for an inner join, the WHERE (also MySQL's
+  multiple equalities); the outer column of a table printed before it in
+  the same FROM list (in an EXISTS also the outer query's); the same exact
+  type (not DOUBLE, not temporal) or binary strings (PAD SPACE and `_ci`
+  keys compare by rtrim / weights: not yet). MTR `offload_lateral`.
+- LATERAL only where the statement had a correlated subquery (a scalar
+  one, or ALL / ANY: a derived table MySQL made whose select list has the
+  aggregates), as AliSQL and MariaDB send it. A grouped view or an
+  uncorrelated `IN (SELECT k ... GROUP BY k HAVING ...)` (Q15, Q18) stays as
+  it is: LATERAL would make DuckDB collect every outer key first.
+- 2026-11-26, **CHAR without `rtrim()`**: CHAR values are stored without
+  trailing spaces (the binary log strips them; the load now too, also when
+  the loading session has `PAD_CHAR_TO_FULL_LENGTH`), so under PAD SPACE a
+  base table's CHAR column is its own equality key: `col = rtrim('MED BOX',
+  ' ')` (the constant is folded by DuckDB), which DuckDB pushes into the scan
+  and estimates (PART at SF100: 4M estimated rows instead of 20K before,
+  which drove join orders in 13 TPC-H queries). Ordering keeps the padded
+  key; VARCHAR and derived tables' columns keep `rtrim()` (they can hold
+  trailing spaces). A table loaded by an earlier version from a session
+  with `PAD_CHAR_TO_FULL_LENGTH` needs a reload.
+- 2026-11-26, **SUBSTRING / LEFT / RIGHT with constant positions**: the
+  edge cases (position 0, length below 1) are decided when the SQL is
+  generated; `SUBSTRING(c, 1, 2)` is `substring(c, 1, 2)` (Q22).
+- 2026-11-26, **EXISTS / IN / NOT EXISTS inside OR** (MySQL: `LEFT JOIN
+  (SELECT DISTINCT ...) AS d ... WHERE ... OR d.c IS [NOT] NULL`): printed
+  in place as `[NOT] EXISTS (SELECT 1 FROM (derived without DISTINCT) AS d
+  WHERE <ON>)` (`derived_marker()`), when each outer row matches at most
+  one row of d (`unique_match()`: DISTINCT d, ON made of equalities fixing
+  every column of d that is not a constant), so the LEFT JOIN never
+  duplicated a row. The marker may be a nullable column when ON equates it
+  (the key of IN). Other shapes keep the LEFT JOIN. A correlation that is
+  not an equality inside OR is refused by MySQL itself for a secondary
+  engine (error 3973 with FORCED; InnoDB answers with ON).
+- MTR `offload_char_or` (padded constants, CHAR = VARCHAR joins, a derived
+  table's padded CHAR value, a load under `PAD_CHAR_TO_FULL_LENGTH`,
+  SUBSTRING / LEFT / RIGHT edge cases, EXISTS / IN / NOT EXISTS inside OR
+  with the plan checked); `offload_lateral` adds Q18's shape (no LATERAL).
+  TPC-H 22/22 identical; no TPC-H query has a DISTINCT derived table, and
+  `rtrim()` on a column is left only in Q8.
+
 ### Q21 at SF100: anti joins and the join key (2026-11-24)
 
 Q21 ran correctly on small data but at SF100 on the release build it never

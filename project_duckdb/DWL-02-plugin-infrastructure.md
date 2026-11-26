@@ -54,6 +54,28 @@ fixed, `duckdb_avoid_purge`: no variable.)
 One in-memory DuckDB instance per mysqld with `ATTACH 'ducklake:<path>/catalog.ducklake'
 AS lake (DATA_PATH '<path>/data/')`.
 
+**2026-11-25: native DuckDB storage replaces DuckLake** (decided by Marco;
+design document, Storage). Measured on 30M LINEITEM-like rows, DuckLake
+(Parquet) scans were 2-3x slower than native (TPC-H Q6 shape 61 ms against
+157-174 ms, Q1 shape 214 ms against 408 ms), and its own features (snapshots,
+time travel, open Parquet files) were not used. The layout under
+`duckdb_data_path` is now `lake.duckdb` (a native DuckDB database file with
+every copy, the hidden columns and the schema `__mysql`), its WAL
+`lake.duckdb.wal`, and `tmp/`; the plugin attaches it as `lake`, so its SQL is
+unchanged. At the first start, if `lake.duckdb` does not exist and
+`catalog.ducklake` does, the plugin attaches the DuckLake lake read-only,
+copies it with `COPY FROM DATABASE` into `lake.duckdb.migrating`, compares
+every table's row count, then renames it to `lake.duckdb` and the old catalog
+to `catalog.ducklake.migrated` (and its `.wal`); `data/` is left for the DBA
+to remove. A crash during the copy leaves only the `.migrating` file, removed
+at the next start, which migrates again. If `lake.duckdb` and
+`catalog.ducklake` are both missing but `data/` contains files, the plugin
+refuses to open the lake. `duckdb_lake_relocate` now matters only for that
+migration (a DuckLake catalog storing another data path); a native file stores
+no path. Tested on a TPC-H lake: 11 tables, identical counts, TPC-H 22 of 22
+identical afterwards. The text below describes the DuckLake storage as first
+built.
+
 ### CONFIGURATION EXAMPLE
 
 ```ini
@@ -87,6 +109,8 @@ loose-duckdb_threads      = 8
    path when every data and delete file of the current snapshot is under
    it, updates the path stored in the catalog and logs a warning; a missing
    file, or OFF, refuses to open the lake (plugin not loaded at startup).
+   (2026-11-25: with native storage this applies only to the migration of
+   a DuckLake lake; see DUCKLAKE STORAGE.)
 7. Plugin initialization fails if the resolved path is the datadir itself or
    inside a schema directory, or if the directory is world-writable.
 8. A warning is logged if the path is inside `secure_file_priv`, if

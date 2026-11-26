@@ -11,6 +11,10 @@ current data into DuckLake. We implement `load_table()` and `unload_table()` of
 the handler, the preconditions checked at load, the type mapping, the registry
 of loaded tables, and the behavior of DDL on tables with a DuckDB copy.
 
+(2026-11-25: storage moved to a native DuckDB file, `lake.duckdb`; design
+document, Storage. The loads below are now DuckDB transactions; Parquet
+files and snapshot expiry no longer apply.)
+
 The work is split in two steps:
 
 - 3a (implemented): SECONDARY_LOAD, registry, type mapping, `open()` of loaded

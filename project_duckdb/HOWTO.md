@@ -32,7 +32,8 @@ Contents:
 ### Requirements
 
 - A compiler with C++23 (the reference build uses clang 21) and CMake 3.x/4.x.
-- The three submodules under `extra/duckdb/`: DuckDB, DuckLake, CRoaring.
+- The three submodules under `extra/duckdb/`: DuckDB, DuckLake, CRoaring
+  (DuckLake only migrates a lake of an earlier version, section 2).
 - About 10 GB of disk for the build directory; the first build compiles DuckDB
   and takes a long time (later builds reuse it).
 
@@ -259,19 +260,51 @@ SHOW GLOBAL STATUS LIKE 'duckdb_lake_path';         -- the lake directory
 SHOW GLOBAL STATUS LIKE 'duckdb_apply_reader_state';  -- idle
 ```
 
-The error log shows `DuckDB lake: catalog=..., data=..., created=yes|no` and
-`binlog reader started at ...`.
+The error log shows `DuckDB lake: file=.../lake.duckdb, created=yes|no, executor
+threads=N` and `binlog reader started at ...`.
+
+The lake directory (`duckdb_data_path`) holds `lake.duckdb`, a native DuckDB
+database file with every copy, the hidden columns and the plugin's schema
+`__mysql` (registry, applied position), its WAL `lake.duckdb.wal`, and `tmp/`
+for spills.
 
 ### Move the lake (duckdb_data_path)
 
-DuckLake stores the data path in its catalog. After moving or restoring the
-lake directory elsewhere, set `duckdb_data_path` to the new place and start
-the server: with `duckdb_lake_relocate = ON` (default) the plugin checks that
-every file of the catalog is there, stores the new path and logs
-`DuckDB lake moved: the catalog's data path ... is now ...`. If a file is
-missing (or with OFF) the plugin is not loaded and the error log says why.
+The lake file stores no path. After moving or restoring the lake directory
+elsewhere, set `duckdb_data_path` to the new place and start the server; the
+lake opens as it is. `duckdb_lake_relocate` matters only for a DuckLake lake
+of an earlier version that is migrated (below).
 The binary log index lists absolute paths too: when moving a whole
 instance, fix `my.cnf` and the `*.index` files.
+
+### Back up the lake
+
+The lake is one file plus its WAL: copy `lake.duckdb` and
+`lake.duckdb.wal` (if present) with mysqld stopped, or while the plugin is
+disabled: `SET GLOBAL duckdb_enable = OFF` closes the lake (DuckDB writes
+its WAL into the file when it closes), copy, then `SET GLOBAL duckdb_enable
+= ON` (the applier resumes from the applied position, which is inside the
+file, so the copy and its position always match). Queries run on InnoDB
+meanwhile; FULL scope queries fail.
+
+### Upgrade from a DuckLake lake (before 2026-11-25)
+
+Earlier versions stored the lake as DuckLake (`catalog.ducklake` and Parquet
+files under `data/`). At the first start of this version, if `lake.duckdb`
+does not exist and `catalog.ducklake` does, the plugin copies the old lake
+into `lake.duckdb.migrating`, compares every table's row count, then renames
+it to `lake.duckdb` and the old catalog to `catalog.ducklake.migrated` (and
+its `.wal`). The error log shows an info line `DuckDB lake: migrating the
+DuckLake lake ...` and a warning `DuckDB lake migrated from DuckLake to ...: N
+tables, M rows checked ...`. The old `data/` directory is left in place:
+remove it after a check. A crash during the copy leaves only
+`lake.duckdb.migrating`, removed at the next start, which migrates again;
+nothing old is deleted. If the old catalog stores another data path (the lake
+was moved or restored), `duckdb_lake_relocate = ON` (default) reads its files
+from `duckdb_data_path`; OFF refuses and the plugin is not loaded. If both
+`lake.duckdb` and `catalog.ducklake` are missing but `data/` contains files,
+the catalog was lost: the plugin refuses to open the lake until it is
+restored.
 
 ### Turn it off and on at runtime
 
@@ -483,8 +516,8 @@ duckdb`, it is simply not loaded afterwards. Until a stale copy is
 discarded, a new table with the same name and `retain_history` reattaches it
 on its first SECONDARY_LOAD (if the structure is the same).
 
-Disk space: DuckLake keeps the Parquet files of dropped copies until snapshot
-expiry and file cleanup, which this version does not run yet.
+Disk space: DuckDB reuses freed space in `lake.duckdb` at checkpoints; the
+file does not shrink by itself.
 
 ---
 
@@ -1036,12 +1069,11 @@ the lake is closed (`duckdb_enable=OFF`) and for accounts without the
 
 ### Reading the lake while MySQL is down
 
-The copies are a DuckLake lake in `duckdb_data_path` (default
-`<datadir>/duckdb_data`): a catalog `catalog.ducklake` and Parquet files under
-`data/`. With MySQL stopped, DuckDB itself can read it. Use `duckq`
-(`project_duckdb/tools/duckq.c`), built from the same DuckDB and DuckLake
-libraries as the plugin, so the versions match (DuckDB v2.0.0, DuckLake
-`55cc50c`):
+The copies are a native DuckDB database file, `lake.duckdb`, in
+`duckdb_data_path` (default `<datadir>/duckdb_data`). With MySQL stopped,
+DuckDB itself can read it. Use `duckq` (`project_duckdb/tools/duckq.c`),
+built from the same DuckDB libraries as the plugin, so the versions match
+(DuckDB v2.0.0):
 
 ```bash
 B=/opt/mysql_source/percona-server-9.7-build          # the build directory
@@ -1056,7 +1088,7 @@ tab-separated:
 
 ```bash
 LAKE=/path/to/datadir/duckdb_data
-A="ATTACH 'ducklake:$LAKE/catalog.ducklake' AS lake (DATA_PATH '$LAKE/data/', READ_ONLY)"
+A="ATTACH '$LAKE/lake.duckdb' AS lake (READ_ONLY)"
 ~/duckq :memory: "$A" \
   "SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'lake' ORDER BY 1, 2" \
   "SELECT db, tbl, state, retain_history FROM lake.__mysql.tables"
@@ -1086,14 +1118,14 @@ What to know when reading the tables:
   is not in InnoDB and is not known to the applier, so the copy would no
   longer match.
 - **MySQL must be stopped:** while it runs, mysqld holds a lock on the
-  catalog and the attach fails with `Could not set lock on file ...
+  lake file and the attach fails with `Could not set lock on file ...
   Conflicting lock is held in .../mysqld`. To read while MySQL runs, query
   through MySQL (`use_secondary_engine = FORCED`), or copy the whole
   `duckdb_data` directory while MySQL is stopped and read the copy.
 - **Other DuckDB clients:** a DuckDB CLI or Python package also works if
-  its DuckDB and DuckLake versions match the plugin's (see the
-  `extra/duckdb` submodules). A different version may refuse the catalog
-  or, worse, upgrade it.
+  its DuckDB version matches the plugin's (see the `extra/duckdb`
+  submodules). A different version may refuse the file or, worse, upgrade
+  it.
 
 ### Status variables
 
@@ -1166,7 +1198,7 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | Variable | Scope | Dynamic | Default | Range / values | Description |
 |---|---|---|---|---|---|
 | `duckdb_enable` | global | yes | ON | ON, OFF | Opens or closes the lake and starts or stops the applier. OFF behaves as if the plugin were not loaded; no data is deleted. |
-| `duckdb_lake_relocate` | global | yes | ON | ON, OFF | When the lake catalog stores another data path (lake moved or restored elsewhere): ON accepts it if all its files are under `duckdb_data_path` and updates the stored path; OFF refuses to open the lake. Used when the lake opens. |
+| `duckdb_lake_relocate` | global | yes | ON | ON, OFF | Only when a DuckLake lake of an earlier version is migrated at startup and its catalog stores another data path (moved or restored elsewhere): ON reads its files from `duckdb_data_path`, OFF refuses. The native lake file stores no path: a moved lake always opens. |
 | `duckdb_data_path` | global | no | `""` | path | Lake directory. Empty: `<datadir>/duckdb_data`; a relative path is resolved against the datadir. Must not be the datadir or inside a schema directory, must not be world-writable. |
 | `duckdb_memory_limit` | global | yes | none (mandatory) | ≥ 256 MiB | Memory limit of DuckDB, applied at once. |
 | `duckdb_threads` | global | yes | none (mandatory) | 1 .. cores | DuckDB worker threads, applied at once. |
@@ -1238,6 +1270,15 @@ Counters restart at 0 when the server starts.
 
 ## 12. Limitations of this version
 
+Upgrade note (2026-11-26): CHAR columns are compared without `rtrim()`,
+which needs CHAR values stored without trailing spaces. A table loaded by
+an earlier version from a session with `sql_mode` containing
+`PAD_CHAR_TO_FULL_LENGTH` may hold padded CHAR values: reload it (`ALTER TABLE ... SECONDARY_UNLOAD;
+... SECONDARY_LOAD`). For a history table, SECONDARY_LOAD again resyncs the
+live rows; archived rows loaded that way keep their padding (equality on
+such a CHAR value then misses them).
+
+
 - Offload covers the queries and constructs in section 6 (DWL#6 steps 6a
   to 6d, T1 to T3 step 3, weight strings, the types of section 6, the
   reviewed date, number and string functions); everything else runs on
@@ -1256,8 +1297,8 @@ Counters restart at 0 when the server starts.
   the copy is refreshed and the partition's rows are gone. Purge the
   partition first (`DELETE ... PARTITION (p)` in a tagged transaction), then
   drop it (TUTORIAL.md section 8).
-- Space of dropped copies and old versions is not reclaimed yet (snapshot
-  expiry, Phase 3).
+- The lake file does not shrink by itself: DuckDB reuses the space of
+  deleted rows at checkpoints.
 - A refresh after DDL reloads the whole table and pauses the applier for all
   tables while it runs.
 - The MTR suite (`storage/duckdb/mysql-test/duckdb`, 37 tests) covers the

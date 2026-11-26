@@ -52,7 +52,7 @@ using TableKey = std::pair<std::string, std::string>;
 using TableBatches = std::map<TableKey, BatchTable>;
 
 /**
-  Committed source transactions applied together in one DuckLake transaction
+  Committed source transactions applied together in one DuckDB transaction
   (DWL#4 step 4c-1).
 */
 struct Batch {
@@ -94,7 +94,7 @@ const char *applied_position_create_sql();
 
 
 /**
-  A DuckLake transaction that may stay open across several writes: one batch
+  A DuckDB transaction that may stay open across several writes: one batch
   (4c-1), or the pieces of one large source transaction (4c-2). It holds
   Lake::apply_mutex() while open, so no table is unloaded meanwhile. Any
   error rolls it back and releases the mutex: nothing is written and the
@@ -132,7 +132,7 @@ class OpenTransaction {
 };
 
 /**
-  Writes the batch and the applied position in one DuckLake transaction. On
+  Writes the batch and the applied position in one DuckDB transaction. On
   error the transaction is rolled back and nothing changes. Tables unloaded,
   stale or loaded again since their changes were read are skipped.
 */

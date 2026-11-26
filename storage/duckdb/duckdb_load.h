@@ -30,7 +30,7 @@ namespace duckdb_se {
 
 /**
   Makes the next SECONDARY_LOAD of a table already in the lake a refresh
-  (DWL#4 step 4d): the copy is rebuilt from InnoDB in one DuckLake
+  (DWL#4 step 4d): the copy is rebuilt from InnoDB in one DuckDB
   transaction, archived rows of history tables are kept (converted to the new
   column types, renamed columns followed), and the registry gets the new load
   position. Set by the binlog reader before it runs the internal
@@ -81,7 +81,7 @@ bool discard_stale_copy(THD *thd, const std::string &spec);
 
 /**
   Loads a table, opened and locked by the server for SECONDARY_LOAD, into the
-  lake in one DuckLake transaction. Reports errors with my_error.
+  lake in one DuckDB transaction. Reports errors with my_error.
   @retval true on error
 */
 bool load_table_into_lake(THD *thd, const TABLE &table);

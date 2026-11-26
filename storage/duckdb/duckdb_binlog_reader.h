@@ -49,7 +49,7 @@ namespace duckdb_se {
   DWL#4 steps 4a to 4c-1: follows the binary log after each sync, assembles
   the transactions that touch loaded tables, decodes their rows and collapses
   them per primary key, then merges committed transactions into batches and
-  commits each batch to DuckDB in one DuckLake transaction, together with the
+  commits each batch to DuckDB in one DuckDB transaction, together with the
   applied position. It runs on one plugin-owned thread without THD and uses
   only the binlog file reader and the standalone event library; DuckDB calls
   run on the executor through the reader's own connection.
@@ -231,7 +231,7 @@ class BinlogReader {
   /**
     Writes the changes of the current transaction collected so far as one
     piece (4c-2). The first piece commits the pending batch and opens the
-    DuckLake transaction, which stays open until the transaction ends.
+    DuckDB transaction, which stays open until the transaction ends.
   */
   bool write_piece(std::string *err);
   /** Ends the large transaction: last piece, applied position, COMMIT. */

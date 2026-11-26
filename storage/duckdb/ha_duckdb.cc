@@ -451,12 +451,12 @@ MYSQL_SYSVAR_BOOL(enable, srv_enable, PLUGIN_VAR_OPCMDARG,
                   check_enable, nullptr, true);
 
 MYSQL_SYSVAR_BOOL(lake_relocate, srv_lake_relocate, PLUGIN_VAR_OPCMDARG,
-                  "When the lake catalog stores another data path than "
-                  "duckdb_data_path (the lake was moved or restored "
-                  "elsewhere): ON accepts it if every data file the catalog "
-                  "uses is under duckdb_data_path and updates the stored "
-                  "path; OFF refuses to open the lake. Used when the lake "
-                  "opens (startup, duckdb_enable=ON).",
+                  "Only when a DuckLake lake of an earlier version is "
+                  "migrated to the native lake file at startup and its "
+                  "catalog stores another data path than duckdb_data_path "
+                  "(moved or restored elsewhere): ON reads its files from "
+                  "duckdb_data_path, OFF refuses. The native lake file "
+                  "stores no path: a moved lake always opens.",
                   nullptr, nullptr, true);
 
 MYSQL_SYSVAR_STR(data_path, srv_data_path,

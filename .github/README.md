@@ -7,8 +7,8 @@
 > **Status: proof of concept.** Not for production use.
 
 InnoDB stays the source of truth. A loadable plugin keeps a columnar copy of
-selected tables in [DuckDB](https://duckdb.org) /
-[DuckLake](https://ducklake.select), fed from the binary log, and the
+selected tables in [DuckDB](https://duckdb.org) (one native DuckDB
+database file, `lake.duckdb`), fed from the binary log, and the
 optimizer sends analytical queries to it automatically. Every query that
 runs in DuckDB returns exactly what InnoDB would return, or it is not sent
 there.
@@ -21,7 +21,7 @@ the same table names.
 flowchart LR
     App[Application] -->|SQL| Opt[MySQL optimizer]
     Opt -->|OLTP, point reads| InnoDB[(InnoDB<br/>live data)]
-    Opt -->|analytical queries<br/>translated to DuckDB SQL| Duck[(DuckDB / DuckLake<br/>live + history)]
+    Opt -->|analytical queries<br/>translated to DuckDB SQL| Duck[(DuckDB lake.duckdb<br/>live + history)]
     InnoDB -->|binary log| Applier[Plugin applier] --> Duck
 ```
 
@@ -31,7 +31,7 @@ flowchart LR
   on the existing secondary engine and external executor interfaces. No server
   code changes outside `storage/duckdb`, apart from build integration (DuckDB,
   DuckLake and CRoaring as submodules, `cmake/duckdb.cmake`, one line in
-  `plugin.defs`).
+  `plugin.defs`; DuckLake only migrates a lake of an earlier version).
 - **Results identical to InnoDB.** The translator either produces DuckDB SQL
   with exactly MySQL's semantics or refuses the query with a named reason, and
   the query then runs on InnoDB. MySQL semantics covered include:
@@ -49,7 +49,7 @@ flowchart LR
   the `DUCKDB_HISTORY_READER` privilege.
 - **Consistent with InnoDB.** A transaction becomes visible in DuckDB only
   after its InnoDB commit. The applied position is committed in the same
-  DuckLake transaction as the data. `duckdb_offload_wait_applied` gives
+  DuckDB transaction as the data. `duckdb_offload_wait_applied` gives
   read-your-own-writes.
 - **Replicas.** It works on a replica of a source that doesn't have the
   plugin, including the multi-threaded applier, restarts, tagged purges and
@@ -67,7 +67,7 @@ flowchart LR
     RD --> DC[Decode rows<br/>UTF-8 text + collation weights]
     DC --> CL[Collapse per primary key<br/>tagged purges = archive marks]
     CL --> BT[Batch: deletes, archive marks,<br/>inserts + applied position]
-    BT -->|one DuckLake commit| DL[(DuckDB / DuckLake)]
+    BT -->|one DuckDB commit| DL[(DuckDB lake.duckdb)]
     RD -->|DDL on a loaded table| RF[Rename or refresh the copy]
     RF --> DL
 ```

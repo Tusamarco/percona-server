@@ -17,6 +17,7 @@ ALTER TABLE od SECONDARY_LOAD;
 cross product in DuckDB plan: no
 DISTINCT derived table: no
 NOT EXISTS: yes
+LATERAL: no
 # Without GROUP BY, and the rows themselves
 # SELECT l1.ok, l1.sk FROM li l1 WHERE EXISTS (SELECT * FROM li l2 WHERE l2.ok = l1.ok AND l2.sk <> l1.sk) AND NOT EXISTS (SELECT * FROM li l3 WHERE l3.ok = l1.ok AND l3.sk <> l1.sk AND l3.rd > l3.cd) ORDER BY l1.ok, l1.sk
 # NOT EXISTS first, EXISTS second; and EXISTS + EXISTS
@@ -28,11 +29,13 @@ NOT EXISTS: yes
 cross product in DuckDB plan: no
 DISTINCT derived table: no
 NOT EXISTS: yes
+LATERAL: no
 # SELECT od.ok FROM od WHERE od.ok NOT IN (SELECT li.ok FROM li WHERE li.sk = 2) ORDER BY 1
 # plan shape: SELECT od.ok FROM od WHERE od.ok NOT IN (SELECT li.ok FROM li WHERE li.sk = 2) ORDER BY 1
 cross product in DuckDB plan: no
 DISTINCT derived table: no
 NOT EXISTS: yes
+LATERAL: no
 # SELECT su.sk FROM su WHERE su.sk NOT IN (SELECT li.sk FROM li WHERE li.ok = 14) ORDER BY 1
 INSERT INTO li VALUES (15, 1, NULL, NULL, NULL);
 # SELECT su.sk FROM su WHERE su.sk NOT IN (SELECT li.sk FROM li) ORDER BY 1

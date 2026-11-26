@@ -41,14 +41,17 @@ struct LakeSettings {
   unsigned int threads;
   unsigned int executor_threads;
   unsigned long long executor_stack_size;
-  /** duckdb_lake_relocate: accept a lake whose catalog stores another data
-      path (moved or restored elsewhere) when all its files are here. */
+  /** duckdb_lake_relocate: when an earlier version's DuckLake lake is
+      migrated and its catalog stores another data path (moved or restored
+      elsewhere), read its files from duckdb_data_path. The native lake
+      file stores no path: a moved lake always opens. */
   bool relocate;
 };
 
 /**
-  The DuckDB instance of this server, in memory, with the DuckLake attached as
-  "lake". There is one per process. Callers hold mutex() around open(), close()
+  The DuckDB instance of this server, in memory, with the lake attached as
+  "lake": a native DuckDB database file, lake.duckdb (2026-11-25; DuckLake
+  before, migrated at the first start). There is one per process. Callers hold mutex() around open(), close()
   and the setters. Every DuckDB call runs on an executor thread. All functions
   follow the server convention: true means error, with the message in *err.
 */
@@ -135,13 +138,14 @@ class Lake {
   bool run_all(const char *const *statements, std::string *err);
   /** DuckDB part of open(): runs on an executor thread. */
   bool open_duckdb(const std::string &lake, const LakeSettings &settings,
-                   std::string *err);
+                   bool migrate, std::string *err);
   /** Closes DuckDB: runs on an executor thread. */
   void close_duckdb();
   /** Drops build tables left by a load interrupted before its swap. */
   void drop_build_leftovers();
-  bool relocate(const std::string &catalog, const std::string &data,
-                std::string *err);
+  /** Copies a DuckLake lake of an earlier version into the native file. */
+  bool migrate_from_ducklake(const std::string &lake,
+                             const LakeSettings &settings, std::string *err);
 
   std::mutex m_mutex;
   std::mutex m_apply_mutex;

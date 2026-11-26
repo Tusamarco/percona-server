@@ -1,0 +1,51 @@
+CREATE TABLE pc (id INT PRIMARY KEY, c CHAR(8) COLLATE utf8mb4_bin, v VARCHAR(8) COLLATE utf8mb4_bin, s VARCHAR(20) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO pc VALUES (1, 'MED BOX', 'MED BOX', '13-abc'), (2, 'MED', 'MED ', '31-x'), (3, '', '', ''),
+(4, NULL, NULL, NULL), (5, 'a b', 'a b  ', '7'), (6, 'MED  BOX', 'MED BOX ', '13');
+CREATE TABLE od (ok INT PRIMARY KEY, pr CHAR(8) COLLATE utf8mb4_bin, ck INT) SECONDARY_ENGINE = duckdb;
+CREATE TABLE li (id INT PRIMARY KEY, ok INT, qty INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO od VALUES (1, 'URGENT', 1), (2, 'LOW', 2), (3, 'LOW', 3), (4, 'URGENT', NULL), (5, 'LOW', 1);
+INSERT INTO li VALUES (1, 1, 50), (2, 2, 10), (3, 2, 60), (4, 3, 5), (5, 9, 70), (6, 3, 51);
+ALTER TABLE pc SECONDARY_LOAD;
+ALTER TABLE od SECONDARY_LOAD;
+ALTER TABLE li SECONDARY_LOAD;
+# CHAR equality without rtrim (padded constants as in MySQL)
+# SELECT id FROM pc WHERE c = 'MED BOX   ' ORDER BY id
+# SELECT id FROM pc WHERE c <> 'MED' AND c IN ('MED BOX', 'a b  ', '') ORDER BY id
+# SELECT a.id, b.id FROM pc a JOIN pc b ON a.c = b.v ORDER BY 1, 2
+# SELECT c, COUNT(*) FROM pc GROUP BY c ORDER BY c
+# A derived table's CHAR column holding a value with trailing spaces
+# (UNION ALL with a padded literal): compared with rtrim, as MySQL
+# SELECT id FROM (SELECT id, c AS x FROM pc UNION ALL SELECT 99, 'MED   ') d WHERE x = 'MED' ORDER BY id
+# SELECT id, x FROM (SELECT id, c AS x FROM pc UNION ALL SELECT 99, 'MED   ') d WHERE x IN ('MED ', 'a b') ORDER BY id
+# Loaded under PAD_CHAR_TO_FULL_LENGTH: stored without the padding
+ALTER TABLE pc SECONDARY_UNLOAD;
+SET SESSION sql_mode = 'PAD_CHAR_TO_FULL_LENGTH';
+ALTER TABLE pc SECONDARY_LOAD;
+SET SESSION sql_mode = DEFAULT;
+# SELECT id FROM pc WHERE c = 'MED' OR c = 'a b' ORDER BY id
+# SELECT id, CHAR_LENGTH(c) FROM pc ORDER BY id
+# SUBSTRING / LEFT / RIGHT with constant positions
+# SELECT id, SUBSTRING(s, 1, 2), SUBSTRING(s, 0, 2), SUBSTRING(s, 2), SUBSTRING(s, 3, 0), SUBSTRING(s, 10, 2), SUBSTRING(s, -2), SUBSTRING(s, -9, 2) FROM pc ORDER BY id
+# SELECT id, LEFT(s, 2), LEFT(s, 0), RIGHT(s, 3), RIGHT(s, -1) FROM pc ORDER BY id
+# SELECT SUBSTRING(s, 1, 2) AS cc, COUNT(*) FROM pc WHERE SUBSTRING(s, 1, 2) IN ('13', '31') GROUP BY cc ORDER BY cc
+# EXISTS / IN / NOT EXISTS inside OR
+# SELECT ok FROM od WHERE pr = 'URGENT' OR EXISTS (SELECT 1 FROM li WHERE li.ok = od.ok AND li.qty > 49) ORDER BY ok
+# plan shape: SELECT ok FROM od WHERE pr = 'URGENT' OR EXISTS (SELECT 1 FROM li WHERE li.ok = od.ok AND li.qty > 49) ORDER BY ok
+cross product in DuckDB plan: no
+DISTINCT derived table: no
+NOT EXISTS: no
+LATERAL: no
+# SELECT ok FROM od WHERE ok IN (SELECT li.ok FROM li WHERE li.qty > 55) OR ck IS NULL ORDER BY ok
+# plan shape: SELECT ok FROM od WHERE ok IN (SELECT li.ok FROM li WHERE li.qty > 55) OR ck IS NULL ORDER BY ok
+cross product in DuckDB plan: no
+DISTINCT derived table: no
+NOT EXISTS: no
+LATERAL: no
+# SELECT ok FROM od WHERE ck = 1 OR NOT EXISTS (SELECT 1 FROM li WHERE li.ok = od.ok) ORDER BY ok
+# plan shape: SELECT ok FROM od WHERE ck = 1 OR NOT EXISTS (SELECT 1 FROM li WHERE li.ok = od.ok) ORDER BY ok
+cross product in DuckDB plan: no
+DISTINCT derived table: no
+NOT EXISTS: yes
+LATERAL: no
+# SELECT COUNT(*) FROM od WHERE (pr = 'LOW' AND EXISTS (SELECT 1 FROM li WHERE li.ok = od.ok AND li.qty < 20)) OR ok = 4
+DROP TABLE pc, od, li;

@@ -1,0 +1,90 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# 2026-11-26, the translation costs found in the review against AliSQL and
+# MariaDB:
+# - CHAR columns are stored without trailing spaces (the binary log strips
+#   them; the load too, also under PAD_CHAR_TO_FULL_LENGTH), so under PAD
+#   SPACE their equality key is the column itself, not rtrim(col): DuckDB
+#   can push the filter and use its statistics.
+# - SUBSTRING / LEFT / RIGHT with constant positions: edge cases decided
+#   when the SQL is generated.
+# - EXISTS / IN / NOT EXISTS inside OR (MySQL: LEFT JOIN (SELECT DISTINCT
+#   ...) ... IS [NOT] NULL): printed as [NOT] EXISTS in place when each
+#   outer row matches at most one row of the derived table.
+--source ../include/have_duckdb.inc
+CREATE TABLE pc (id INT PRIMARY KEY, c CHAR(8) COLLATE utf8mb4_bin, v VARCHAR(8) COLLATE utf8mb4_bin, s VARCHAR(20) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO pc VALUES (1, 'MED BOX', 'MED BOX', '13-abc'), (2, 'MED', 'MED ', '31-x'), (3, '', '', ''),
+  (4, NULL, NULL, NULL), (5, 'a b', 'a b  ', '7'), (6, 'MED  BOX', 'MED BOX ', '13');
+CREATE TABLE od (ok INT PRIMARY KEY, pr CHAR(8) COLLATE utf8mb4_bin, ck INT) SECONDARY_ENGINE = duckdb;
+CREATE TABLE li (id INT PRIMARY KEY, ok INT, qty INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO od VALUES (1, 'URGENT', 1), (2, 'LOW', 2), (3, 'LOW', 3), (4, 'URGENT', NULL), (5, 'LOW', 1);
+INSERT INTO li VALUES (1, 1, 50), (2, 2, 10), (3, 2, 60), (4, 3, 5), (5, 9, 70), (6, 3, 51);
+ALTER TABLE pc SECONDARY_LOAD;
+ALTER TABLE od SECONDARY_LOAD;
+ALTER TABLE li SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+--echo # CHAR equality without rtrim (padded constants as in MySQL)
+--let $query= SELECT id FROM pc WHERE c = 'MED BOX   ' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM pc WHERE c <> 'MED' AND c IN ('MED BOX', 'a b  ', '') ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT a.id, b.id FROM pc a JOIN pc b ON a.c = b.v ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+--let $query= SELECT c, COUNT(*) FROM pc GROUP BY c ORDER BY c
+--source ../include/duckdb_compare.inc
+--echo # A derived table's CHAR column holding a value with trailing spaces
+--echo # (UNION ALL with a padded literal): compared with rtrim, as MySQL
+--let $query= SELECT id FROM (SELECT id, c AS x FROM pc UNION ALL SELECT 99, 'MED   ') d WHERE x = 'MED' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, x FROM (SELECT id, c AS x FROM pc UNION ALL SELECT 99, 'MED   ') d WHERE x IN ('MED ', 'a b') ORDER BY id
+--source ../include/duckdb_compare.inc
+--echo # Loaded under PAD_CHAR_TO_FULL_LENGTH: stored without the padding
+ALTER TABLE pc SECONDARY_UNLOAD;
+--disable_warnings
+SET SESSION sql_mode = 'PAD_CHAR_TO_FULL_LENGTH';
+ALTER TABLE pc SECONDARY_LOAD;
+SET SESSION sql_mode = DEFAULT;
+--enable_warnings
+--source ../include/wait_applier.inc
+--let $query= SELECT id FROM pc WHERE c = 'MED' OR c = 'a b' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, CHAR_LENGTH(c) FROM pc ORDER BY id
+--source ../include/duckdb_compare.inc
+
+--echo # SUBSTRING / LEFT / RIGHT with constant positions
+--let $query= SELECT id, SUBSTRING(s, 1, 2), SUBSTRING(s, 0, 2), SUBSTRING(s, 2), SUBSTRING(s, 3, 0), SUBSTRING(s, 10, 2), SUBSTRING(s, -2), SUBSTRING(s, -9, 2) FROM pc ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, LEFT(s, 2), LEFT(s, 0), RIGHT(s, 3), RIGHT(s, -1) FROM pc ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT SUBSTRING(s, 1, 2) AS cc, COUNT(*) FROM pc WHERE SUBSTRING(s, 1, 2) IN ('13', '31') GROUP BY cc ORDER BY cc
+--source ../include/duckdb_compare.inc
+
+--echo # EXISTS / IN / NOT EXISTS inside OR
+--let $query= SELECT ok FROM od WHERE pr = 'URGENT' OR EXISTS (SELECT 1 FROM li WHERE li.ok = od.ok AND li.qty > 49) ORDER BY ok
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--let $query= SELECT ok FROM od WHERE ok IN (SELECT li.ok FROM li WHERE li.qty > 55) OR ck IS NULL ORDER BY ok
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--let $query= SELECT ok FROM od WHERE ck = 1 OR NOT EXISTS (SELECT 1 FROM li WHERE li.ok = od.ok) ORDER BY ok
+--source ../include/duckdb_compare.inc
+--source ../include/duckdb_plan_shape.inc
+--let $query= SELECT COUNT(*) FROM od WHERE (pr = 'LOW' AND EXISTS (SELECT 1 FROM li WHERE li.ok = od.ok AND li.qty < 20)) OR ok = 4
+--source ../include/duckdb_compare.inc
+
+DROP TABLE pc, od, li;
+--source ../include/cleanup.inc

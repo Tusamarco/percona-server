@@ -213,8 +213,8 @@ The three plugins in the library:
 | `DUCKDB_TABLES` | The table `INFORMATION_SCHEMA.DUCKDB_TABLES` (section 11). |
 
 The lake (where DuckDB keeps the copies) is the directory
-`duckdb_data_path`: a DuckLake catalog `catalog.ducklake` and Parquet files
-under `data/`.
+`duckdb_data_path`: one native DuckDB database file, `lake.duckdb` (with its
+WAL `lake.duckdb.wal`), and `tmp/` for spills.
 
 Create the tutorial database:
 
@@ -825,10 +825,11 @@ SET GLOBAL duckdb_enable = ON;
 `<datadir>/duckdb_data`). The lake directory. Not the datadir itself, not
 inside a schema directory, not world-writable.
 
-**`duckdb_lake_relocate`** (global, dynamic, default ON). When the lake was
-moved or restored to another path: ON checks that every file is under the
-new `duckdb_data_path` and updates the path stored in the catalog (warning
-in the error log); OFF refuses to open the lake. Used when the lake opens.
+**`duckdb_lake_relocate`** (global, dynamic, default ON). The lake file
+stores no path, so a moved or restored lake simply opens. The variable
+matters only when a DuckLake lake of an earlier version is migrated at
+startup and its catalog stores another data path: ON reads its files from
+`duckdb_data_path`, OFF refuses (HOWTO.md section 2).
 
 **`duckdb_memory_limit`** (global, dynamic, mandatory, at least 256M).
 Memory DuckDB may use. Changes apply at once.
@@ -1096,8 +1097,8 @@ grep -i -E "duckdb|plugin" "$BASE/error.log" | tail -20
 Common causes: `duckdb_memory_limit` or `duckdb_threads` missing ("is not
 set ... Plugin not loaded"); `plugin-dir` or the `.so` link wrong; a
 `duckdb_*` option without `loose-` while the plugin is missing (the server
-does not start); `duckdb_encryption=ON`; a lake moved with
-`duckdb_lake_relocate=OFF`.
+does not start); `duckdb_encryption=ON`; a DuckLake lake of an earlier version, moved, and
+migrated with `duckdb_lake_relocate=OFF`.
 
 ### 12.2 SECONDARY_LOAD is refused
 
@@ -1196,10 +1197,10 @@ replica.
 
 ## 13. Read the lake when MySQL is down
 
-The copies are an ordinary DuckLake lake: with MySQL stopped, DuckDB reads
-them directly, for example to get data out while the server cannot start.
-The tool `duckq` (`project_duckdb/tools/duckq.c`) is built from the same
-DuckDB and DuckLake libraries as the plugin, so the versions match.
+The copies are an ordinary DuckDB database file, `lake.duckdb`: with MySQL
+stopped, DuckDB reads it directly, for example to get data out while the
+server cannot start. The tool `duckq` (`project_duckdb/tools/duckq.c`) is
+built from the same DuckDB libraries as the plugin, so the versions match.
 
 ### 13.1 Build duckq (once)
 
@@ -1212,13 +1213,13 @@ clang++-21 -x c "$SRC/project_duckdb/tools/duckq.c" -x none \
 
 ### 13.2 Stop MySQL and read
 
-While mysqld runs it holds a lock on the catalog, and the attach fails with
+While mysqld runs it holds a lock on the lake file, and the attach fails with
 `Could not set lock on file ... Conflicting lock is held in .../mysqld`.
 
 ```bash
 "$BASE/stop"
 LAKE="$BASE/duckdb_data"
-A="ATTACH 'ducklake:$LAKE/catalog.ducklake' AS lake (DATA_PATH '$LAKE/data/', READ_ONLY)"
+A="ATTACH '$LAKE/lake.duckdb' AS lake (READ_ONLY)"
 
 # the tables in the lake and their state
 "$BASE/duckq" :memory: "$A" \

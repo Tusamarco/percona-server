@@ -14,6 +14,7 @@ Changes from v0.4 (2026-11-18 to 2026-11-25):
 - T3 (part): NOW() and the other clock functions, CAST / CONVERT of numbers and dates, DATE_FORMAT.
 - Monitoring: lag, state, memory, spill and query time status variables, PMM / Grafana dashboard (`monitoring/`); plugin version and commit in `INFORMATION_SCHEMA.PLUGINS` and `duckdb_version`; binary log reset handled.
 - Diagrams of the write and query paths ("Paths through the code"); data type mapping section; TODO list T0-T5 ("TODO from 2026-11-18"). MTR suite: 37 tests; 41 unit tests.
+- Storage moved from DuckLake to a native DuckDB database file, `lake.duckdb` (2026-11-25, Storage); a DuckLake lake of an earlier version is migrated at the first start.
 
 Changes from v0.3 (what the implementation added or changed, 2026-11-07 to 2026-11-17):
 
@@ -43,7 +44,7 @@ Changes from v0.2:
 
 ## Summary
 
-We propose to build a secondary engine plugin that embeds DuckDB inside mysqld. InnoDB stays the primary store for writes and keeps only live data; selected tables get a columnar copy in DuckDB, stored as a DuckLake, that also retains the full history, and the optimizer offloads eligible analytical queries to it. Analysts keep using the MySQL protocol, accounts and SQL, while large scans, aggregations and joins run vectorized on columnar data instead of row by row in InnoDB.
+We propose to build a secondary engine plugin that embeds DuckDB inside mysqld. InnoDB stays the primary store for writes and keeps only live data; selected tables get a columnar copy in DuckDB, stored in a native DuckDB database file, that also retains the full history, and the optimizer offloads eligible analytical queries to it. Analysts keep using the MySQL protocol, accounts and SQL, while large scans, aggregations and joins run vectorized on columnar data instead of row by row in InnoDB.
 
 Purge deletes on InnoDB (removing old rows to keep the table small) are not applied to DuckDB as deletes: they are recorded as archive marks, so DuckDB can answer both "live data" and "full history" queries. Which of the two a query on the base table name sees is driven by a parameter at global, session and statement level.
 
@@ -65,7 +66,7 @@ DuckDB is an embedded analytical database. It has no server process: it runs as 
 
 ### DuckLake in brief
 
-DuckLake is a DuckDB extension that splits storage into two parts: a catalog (metadata, snapshots, table definitions) kept in an SQL database, and the table data kept as Parquet files in a data path. Every commit creates a snapshot; small changes can be kept in the catalog (data inlining, on by default with a threshold of 10 rows) until they are flushed to Parquet. DuckLake supports DuckDB, SQLite and PostgreSQL as catalog backends; we use a DuckDB file.
+DuckLake is a DuckDB extension that splits storage into two parts: a catalog (metadata, snapshots, table definitions) kept in an SQL database, and the table data kept as Parquet files in a data path. Every commit creates a snapshot; small changes can be kept in the catalog (data inlining, on by default with a threshold of 10 rows) until they are flushed to Parquet. DuckLake supports DuckDB, SQLite and PostgreSQL as catalog backends; we used a DuckDB file. The plugin stored the lake in DuckLake until 2026-11-25; it now uses a native DuckDB file (Storage), and DuckLake is used only to migrate a lake of an earlier version.
 
 ### Three ways to put DuckDB inside MySQL
 
@@ -97,17 +98,17 @@ The secondary engine is the approach that best matches how DuckDB works and the 
  |              |                     |  (external executor)     |
  |              |                     v                          |
  |  InnoDB --commit--> binlog   DuckDB engine (in memory)        |
- |  (live data)          |        |  ATTACH ducklake             |
+ |  (live data)          |        |  ATTACH lake.duckdb          |
  |                       v        v                              |
  |        plugin applier (reader -> workers -> committer)        |
  |        purge-tagged deletes = archive marks                   |
  |                                |                              |
- |          <datadir>/duckdb_data: catalog.ducklake + Parquet    |
+ |          <datadir>/duckdb_data: lake.duckdb (+ WAL), tmp/     |
  |          (full history)                                       |
  +---------------------------------------------------------------+
 ```
 
-One DuckDB instance lives inside mysqld, in memory, with one DuckLake attached as `lake`. Each MySQL session that touches DuckDB gets its own DuckDB connection. No DuckDB call runs on a MySQL thread: DuckDB plans statements recursively and overflows the small stack of connection threads, so every DuckDB call runs on a plugin-owned executor pool (`duckdb_executor_threads`, `duckdb_executor_stack_size`) while MySQL work stays on the session thread (DWL#2, DuckDB executor threads). DuckDB, its extensions, DuckLake and CRoaring are linked statically into the plugin library; DuckDB and DuckLake are MIT licensed, compatible with GPL-2.0 (third-party licenses to be confirmed for the SBOM).
+One DuckDB instance lives inside mysqld, in memory, with one native DuckDB database file, `lake.duckdb`, attached as `lake`. Each MySQL session that touches DuckDB gets its own DuckDB connection. No DuckDB call runs on a MySQL thread: DuckDB plans statements recursively and overflows the small stack of connection threads, so every DuckDB call runs on a plugin-owned executor pool (`duckdb_executor_threads`, `duckdb_executor_stack_size`) while MySQL work stays on the session thread (DWL#2, DuckDB executor threads). DuckDB, its extensions, DuckLake and CRoaring are linked statically into the plugin library; DuckDB and DuckLake are MIT licensed, compatible with GPL-2.0 (third-party licenses to be confirmed for the SBOM).
 
 The library `ha_duckdb.so` contains three plugins:
 
@@ -133,7 +134,7 @@ sequenceDiagram
     participant D as Row decoder<br/>duckdb_row_decoder.cc
     participant B as Batch / TableChanges<br/>duckdb_applier.cc, duckdb_changes.cc
     participant X as Executor thread<br/>Lake::Connection::execute
-    participant L as DuckDB / DuckLake
+    participant L as DuckDB lake<br/>lake.duckdb
 
     S->>M: COMMIT
     M->>M: ordered_commit: binary log write, InnoDB commit
@@ -171,7 +172,7 @@ sequenceDiagram
         X->>L: Appender: new rows, with __w_ weights and __n_ indexes
     end
     X->>L: write_position(): lake.__mysql.applied_position (position, GTID)
-    X->>L: COMMIT (one DuckLake snapshot per batch)
+    X->>L: COMMIT (one DuckDB transaction per batch)
     X-->>R: done
     R->>R: m_applied = batch end, wake wait_applied() waiters
 ```
@@ -221,7 +222,7 @@ sequenceDiagram
     participant T as Generator (SQL translation)<br/>duckdb_offload.cc
     participant R as BinlogReader
     participant X as Executor thread
-    participant L as DuckDB / DuckLake
+    participant L as DuckDB lake<br/>lake.duckdb
 
     C->>P: COM_QUERY / COM_STMT_EXECUTE
     P->>G: PARSE PREPARSE event
@@ -352,11 +353,11 @@ All variables are plugin variables of the `duckdb` plugin, so the server adds th
 | `duckdb_data_path` | string | empty = `<datadir>/duckdb_data` | global | no | Relative values are resolved against the datadir |
 | `duckdb_memory_limit` | size | none, mandatory | global | yes | Plugin init fails if not set; minimum 256 MiB |
 | `duckdb_threads` | int | none, mandatory | global | yes | Plugin init fails if not set; range 1 to the number of cores |
-| `duckdb_encryption` | BOOL | OFF | global | no | Fixed when the catalog is created; not in the POC |
+| `duckdb_encryption` | BOOL | OFF | global | no | Fixed when the lake file is created; not in the POC |
 | `duckdb_executor_threads` | int | 4 | global | yes | Threads that run DuckDB calls; 1 to the number of cores; above the cores at startup it is lowered with a warning |
 | `duckdb_executor_stack_size` | size | 8 MiB | global | no | Stack of the executor threads; 2 to 64 MiB |
 | `duckdb_history_scope` | enum LIVE, FULL | LIVE | global, session, SET_VAR hint | yes | Affects only tables with retain_history |
-| `duckdb_lake_relocate` | BOOL | ON | global | yes | A lake moved to another path: ON accepts it after checking every file, OFF refuses to open it |
+| `duckdb_lake_relocate` | BOOL | ON | global | yes | Only when a DuckLake lake of an earlier version is migrated and its catalog stores another data path: ON reads its files from `duckdb_data_path`, OFF refuses (2026-11-25: the native lake file stores no path, a moved lake always opens) |
 | `duckdb_apply_batch_max_trx` | int | 1000 | global | yes | Batch closes at this many source transactions |
 | `duckdb_apply_batch_max_rows` | int | 100000 | global | yes | Batch closes at this many row changes; larger transactions are applied in pieces inside one DuckDB transaction |
 | `duckdb_apply_batch_max_delay_ms` | int | 1000 | global | yes | Maximum wait before a batch closes; bounds lag under light load |
@@ -397,11 +398,11 @@ The update callback of a plugin variable runs under `LOCK_global_system_variable
 - Requires `SYSTEM_VARIABLES_ADMIN`.
 - Changes on InnoDB while disabled are caught up from the stored applied position when it is enabled again (the applier resumes there; Phased plan, phase 3).
 
-## Storage: DuckLake
+## Storage: native DuckDB file
 
 ```
 DuckDB instance (in memory, one per mysqld)
-  └─ ATTACH 'ducklake:<path>/catalog.ducklake' AS lake (DATA_PATH '<path>/data/')
+  └─ ATTACH '<path>/lake.duckdb' AS lake     native DuckDB file, WAL in lake.duckdb.wal
        ├─ lake.<mysql_schema>.<table>       one per loaded table
        ├─ lake.__mysql.tables               registry: state, history flag, load position,
        │                                    primary key, weight columns
@@ -409,24 +410,35 @@ DuckDB instance (in memory, one per mysqld)
   temp_directory = <path>/tmp/              spills from large queries
 ```
 
-- Catalog backend: a local DuckDB file. mysqld is the only writer, so the single-writer limit does not matter, and it adds no external dependency.
-- Each MySQL database maps to a DuckLake schema with the same name, each table to a table with the same name, plus hidden columns: `__archived_at TIMESTAMP` on retain_history tables, `__w_<col>` (BLOB, MySQL's sort weight) for string columns of collations DuckDB cannot compare, `__n_<col>` (ENUM index / SET bitmask).
-- The lake can be read by DuckDB itself while mysqld is stopped (`duckq`, HOWTO "Reading the lake while MySQL is down"); a moved lake is accepted with `duckdb_lake_relocate=ON`.
+Decided 2026-11-25 (Marco; replaces the DuckLake decision of 2026-11-04): the lake is one native DuckDB database file. Measured on 30M LINEITEM-like rows, DuckLake (Parquet) scans were 2-3x slower than native storage (TPC-H Q6 shape: 61 ms native, 157-174 ms DuckLake; Q1 shape: 214 ms against 408 ms); Parquet codecs and DuckDB's file caches made no difference. DuckLake's own features (snapshots and time travel, open Parquet files for other tools) were not used. AliSQL's and MariaDB's DuckDB engines also use native storage. The SQL inside the plugin still names the attached database `lake` (`lake.<schema>.<table>`), so load, applier and offload are unchanged.
+
+- One file: mysqld is the only writer, so DuckDB's single-writer limit does not matter, and it adds no external dependency.
+- Each MySQL database maps to a DuckDB schema with the same name, each table to a table with the same name, plus hidden columns: `__archived_at TIMESTAMP` on retain_history tables, `__w_<col>` (BLOB, MySQL's sort weight) for string columns of collations DuckDB cannot compare, `__n_<col>` (ENUM index / SET bitmask).
+- The lake can be read by DuckDB itself while mysqld is stopped (`duckq`, HOWTO "Reading the lake while MySQL is down"). A native file stores no path: a moved or restored lake directory opens as it is.
 - Default location `<datadir>/duckdb_data`. The name `duckdb_data` is reserved in the datadir when the default is used; a MySQL database with that name would fail with "database directory exists".
-- Hardening after attach: `autoload_known_extensions=false`, `autoinstall_known_extensions=false` (runtime settings in DuckDB 2.0), `enable_external_access=false` so DuckDB SQL cannot read arbitrary files or reach the network (implemented: set at open, before the attach the extension settings, after it `enable_external_access`; DuckLake keeps reading and writing DATA_PATH, as every test since DWL#2 shows). `lock_configuration` is not used, because we change `memory_limit` and `threads` at runtime; users never send SQL to DuckDB directly and our translator never emits SET.
-- Unload: `DROP TABLE` in DuckLake, then a cleanup call so the Parquet files are removed from disk.
-- Updates in DuckLake are written as a delete file plus a new Parquet file (seen in the smoke test), so the applier collapses changes per key before writing.
-- Snapshot expiry and file compaction (merge adjacent files, expire snapshots, clean up old files) are needed under continuous propagation; scheduling and variables are Phase 3 work. History is never tied to DuckLake time travel, so snapshot expiry cannot delete history.
+- Hardening after attach: `autoload_known_extensions=false`, `autoinstall_known_extensions=false` (runtime settings in DuckDB 2.0), `enable_external_access=false` so DuckDB SQL cannot read arbitrary files or reach the network (implemented: set at open, before the attach the extension settings, after it `allowed_directories` = the lake directory and `enable_external_access`). `lock_configuration` is not used, because we change `memory_limit` and `threads` at runtime; users never send SQL to DuckDB directly and our translator never emits SET.
+- Unload: `DROP TABLE` in the lake.
+- Native storage updates and deletes rows in place, so DuckLake's delete file plus new data file per change, its small files and their compaction no longer apply. DuckDB reuses the space of deleted rows at checkpoints; the file does not shrink by itself. The applier still collapses changes per key before writing. History never depended on time travel.
+
+### Migration from DuckLake (2026-11-25)
+
+At the first start of the new version, if `lake.duckdb` does not exist and `catalog.ducklake` does, the plugin migrates the old lake once:
+
+1. Attach the DuckLake lake read-only and copy everything with `COPY FROM DATABASE` into `lake.duckdb.migrating`.
+2. Compare every table's row count in both; any difference fails the start and keeps the DuckLake files.
+3. Rename the copy to `lake.duckdb`, and `catalog.ducklake` (and its `.wal`) to `catalog.ducklake.migrated`. The old `data/` directory is left in place; the DBA removes it after a check.
+
+The error log shows an info line "DuckDB lake: migrating the DuckLake lake ..." and a warning "DuckDB lake migrated from DuckLake to ...: N tables, M rows checked ...". A crash during the copy leaves only `lake.duckdb.migrating`, which the next start removes before migrating again; nothing old is deleted. A DuckLake catalog that stores another data path (lake moved or restored elsewhere) is read from `duckdb_data_path` with `duckdb_lake_relocate=ON` (`OVERRIDE_DATA_PATH`); with OFF the start is refused. Tested on a TPC-H lake: 11 tables, identical counts, TPC-H 22 of 22 identical afterwards; the copy of 30M rows took about 3 s on the release build. The DuckLake extension is still built, only for this migration.
 
 ### Startup sequence
 
 1. Resolve the path: `duckdb_data_path` or `<datadir>/duckdb_data`; relative values against the datadir; then `realpath`, so checks apply to the real location.
 2. Run the location checks (below).
-3. Create what is missing: `duckdb_data/`, `data/`, `tmp/` with mode 0750 (DuckLake does not create the parent directory, verified), and `catalog.ducklake`, which the ATTACH creates when the file does not exist.
-4. Refuse to start if `data/` contains files but `catalog.ducklake` is missing: the catalog was lost, and creating an empty one would orphan the only copy of archived rows. The DBA must restore the catalog.
-5. Register the static extensions, open DuckDB, attach the lake, set `temp_directory`, `memory_limit`, `threads` and the hardening settings. A catalog locked by another process gives a readable error.
+3. Create what is missing: `duckdb_data/` and `tmp/` with mode 0750, and `lake.duckdb`, which the ATTACH creates when the file does not exist.
+4. Refuse to start if `lake.duckdb` and `catalog.ducklake` are both missing but `data/` contains files: a DuckLake catalog of an earlier version was lost, and creating an empty lake would hide the only copy of archived rows. The DBA must restore the catalog. A leftover `lake.duckdb.migrating` (crash during a migration) is removed.
+5. Register the static extensions, open DuckDB, migrate a DuckLake lake when `lake.duckdb` is missing and `catalog.ducklake` exists (Migration from DuckLake), attach the lake, set `temp_directory`, `memory_limit`, `threads` and the hardening settings. A lake file locked by another process gives a readable error.
 6. Reconcile with the data dictionary: tables the DD marks as loaded but missing from the lake are treated as unloaded, with a warning in the error log.
-7. Start the applier (Change propagation) and log `DuckDB lake: catalog=..., data=..., created=yes|no`.
+7. Start the applier (Change propagation) and log `DuckDB lake: file=..., created=yes|no|migrated from DuckLake, executor threads=N`.
 
 ### Location and permission checks
 
@@ -442,24 +454,24 @@ Not too rigid: we refuse only clear mistakes and warn otherwise.
 
 ### Encryption (designed now, outside the POC)
 
-- DuckLake encryption of Parquet files keeps per-file keys in the catalog, so the catalog DuckDB file must also be encrypted (DuckDB database encryption, `ENCRYPTION_KEY` on attach).
-- The master key comes from the server keyring component through the existing services (`include/mysql/components/services/keyring_generator.h`, `keyring_reader_with_status.h`, `keyring_writer.h`), acquired with `mysql_plugin_registry_acquire()`. It is generated at catalog creation and never appears in a file or a variable.
-- `duckdb_encryption` (default OFF) takes effect only when the catalog is created. A mismatch with an existing catalog, or ON without a keyring, makes startup fail; there is no fallback to unencrypted.
-- To verify before implementing: DuckLake encryption support in the pinned version (the 1.0 announcement does not mention it), encryption of spill files, exact ATTACH option names, key rotation, and the crypto library (mbedtls bundled in DuckDB; we do not patch DuckDB to use OpenSSL).
+- DuckDB database encryption (`ENCRYPTION_KEY` on ATTACH) encrypts the lake file. Since 2026-11-25 (native storage) it replaces the earlier design, DuckLake encryption of the Parquet files plus an encrypted catalog.
+- The master key comes from the server keyring component through the existing services (`include/mysql/components/services/keyring_generator.h`, `keyring_reader_with_status.h`, `keyring_writer.h`), acquired with `mysql_plugin_registry_acquire()`. It is generated when the lake file is created and never appears in a file or a variable.
+- `duckdb_encryption` (default OFF) takes effect only when the lake file is created. A mismatch with an existing lake file, or ON without a keyring, makes startup fail; there is no fallback to unencrypted.
+- To verify before implementing: encryption of the WAL and of spill files, exact ATTACH option names, key rotation, and the crypto library (mbedtls bundled in DuckDB; we do not patch DuckDB to use OpenSSL).
 
 ## Components
 
 ### Plugin skeleton
 
-We start from a copy of storage/secondary_engine_mock into `storage/duckdb/`. We keep from the mock: handlerton registration, `FakePartitionHandler`, `info()` and `records_in_range()` from the primary, `index_flags()`, `store_lock()`, `HA_NO_INDEX_ACCESS`, the cost-threshold pre-prepare hook with its optimizer trace, and the `DBUG_EXECUTE_IF` error injection points. We replace the in-memory `LoadedTables` map with the DuckLake catalog, and add per-THD DuckDB connections stored in the handlerton THD slot, freed in `close_connection`. Hook names and signatures are those of the 9.7 tree.
+We start from a copy of storage/secondary_engine_mock into `storage/duckdb/`. We keep from the mock: handlerton registration, `FakePartitionHandler`, `info()` and `records_in_range()` from the primary, `index_flags()`, `store_lock()`, `HA_NO_INDEX_ACCESS`, the cost-threshold pre-prepare hook with its optimizer trace, and the `DBUG_EXECUTE_IF` error injection points. We replace the in-memory `LoadedTables` map with the lake's registry (`lake.__mysql.tables`), and add per-THD DuckDB connections stored in the handlerton THD slot, freed in `close_connection`. Hook names and signatures are those of the 9.7 tree.
 
 ### Initial load
 
-`load_table()` scans the InnoDB table through the primary handler and writes it into DuckLake through the DuckDB Appender, which works directly on a DuckLake table (verified in the smoke test; no staging table needed). One SECONDARY_LOAD is one DuckLake transaction and one snapshot. The server holds `MDL_SHARED_NO_WRITE` during the load (sql/sql_table.cc), so writes on the table are blocked and the scan is consistent.
+`load_table()` scans the InnoDB table through the primary handler and writes it into the lake through the DuckDB Appender (no staging table needed). The server holds `MDL_SHARED_NO_WRITE` during the load (sql/sql_table.cc), so writes on the table are blocked and the scan is consistent.
 
 - Preconditions, checked at load; the load is refused otherwise: a primary key, supported column types, `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `gtid_mode=ON`, `binlog_row_metadata=FULL`, `binlog_order_commits=ON`, `sync_binlog=1` for history tables. Foreign keys (2026-11-17): allowed, cascading ones too, with `innodb_native_foreign_keys=OFF` (the 9.7 default: MySQL runs cascades in the SQL layer and writes the cascaded rows to the binary log, verified); with ON a child of a cascading key is refused, because InnoDB's own cascades are not logged.
 - Types: signed and unsigned integers, DECIMAL up to 38 digits, FLOAT and DOUBLE, CHAR, VARCHAR, TEXT, BINARY, VARBINARY, BLOB in any character set (text stored as UTF-8), DATE, DATETIME, TIMESTAMP (UTC), YEAR, BIT, TIME (signed microseconds), ENUM and SET (value plus `__n_<col>`), JSON (DuckDB JSON type, MySQL's text) and spatial types (BLOB, SRID + WKB) since 2026-11-23 (Data type mapping). VECTOR and DECIMAL above 38 digits fail the load with an error naming the column.
-- The load runs in two DuckLake transactions: the data under a build name, then the rename and the registry row under the apply mutex (a long transaction writing the registry would conflict with the applier). DuckDB work runs on the executor pool.
+- The load runs in two DuckDB transactions: the data under a build name, then the rename and the registry row under the apply mutex (a long transaction writing the registry would conflict with the applier). DuckDB work runs on the executor pool.
 - `NOT SECONDARY` columns are honored through the table read set.
 - The load records the binlog position and GTID set it represents; the applier skips events for that table up to that point.
 - For a retain_history table that already has a copy, SECONDARY_LOAD never discards it: it reattaches a stale copy, resyncs a current one (live rows replaced from InnoDB, archived rows kept) or adopts another table's stale copy (`adopt_history_from`), after a strict structure check (DWL#3 step 3b).
@@ -472,8 +484,8 @@ Because core code must not change, the plugin reads the binary log. It uses only
 - Parsing: the in-tree event library (`libs/mysql/binlog/event`): `Gtid` events (transaction id and tag), `Table_map`, `Write_rows`, `Update_rows`, `Delete_rows`. Compressed transaction payloads are decoded by the same library. Events for tables that are not loaded are ignored.
 
 ```
-binlog files ──► [reader] ──► [prepare worker 1..N] ──► [committer] ──► DuckLake
-                 decode,       convert to DuckDB         one DuckLake
+binlog files ──► [reader] ──► [prepare worker 1..N] ──► [committer] ──► lake
+                 decode,       convert to DuckDB         one DuckDB  
                  filter,       vectors, collapse         transaction per batch
                  detect tag    per primary key           + applied GTID
 ```
@@ -482,12 +494,12 @@ binlog files ──► [reader] ──► [prepare worker 1..N] ──► [commi
 - Prepare workers (`duckdb_apply_workers`, deferred): would convert values and collapse changes per primary key inside the batch, split by table or by hash of the primary key.
 - Collapse rules within a batch: insert then updates becomes one insert of the final row; insert then a real delete becomes nothing; insert then a purge-tagged delete becomes an insert with `__archived_at` set; several updates become one update with the final image.
 - Batch boundaries are always at transaction boundaries; a batch closes at the first of `duckdb_apply_batch_max_trx`, `duckdb_apply_batch_max_rows`, `duckdb_apply_batch_max_delay_ms`.
-- Crash safety: each batch stores its last GTID in `lake.__mysql.applied_position` in the same DuckLake transaction as the data; on restart the reader resumes from there.
+- Crash safety: each batch stores its last GTID in `lake.__mysql.applied_position` in the same DuckDB transaction as the data; on restart the reader resumes from there.
 - DDL on a loaded table never blocks replication (DWL#4 step 4d, `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`): after a column change, TRUNCATE or partition DDL the applier refreshes the copy from InnoDB (an internal `SECONDARY_LOAD`, archived rows kept and converted); it follows RENAME TABLE; a refresh waiting for a later rename is deferred; a copy that cannot follow is marked stale. The internal session passes `super_read_only` through the guard (replicas).
 - Replicas (tested 2026-11-15): the reader reads the replica's own binary log (`log_replica_updates=ON`); the source does not need the plugin. Loads and the history privilege on a replica need `sql_log_bin=0` (HOWTO, Replicas).
 - Transactions larger than `duckdb_apply_batch_max_rows` are applied in pieces inside one DuckDB transaction. Binary logs purged before the applier read them: `duckdb_apply_gap_action` (STOP or FIRST_AVAILABLE, the tables that miss changes are named).
 
-Why not the replica model (`replica_parallel_workers`): its gain comes from many small commits in parallel, which suits InnoDB, where a commit is cheap and row operations dominate. In DuckLake each commit writes new files and a catalog snapshot, commits serialize on the catalog, and concurrency control is optimistic, so parallel small commits would multiply the most expensive step and create many small files. We keep its principle (independent work in parallel, order where it matters) in the prepare workers. The dependency information (`last_committed`, `sequence_number`) in the Gtid events stays available if a future per-table commit mode is ever needed.
+Why not the replica model (`replica_parallel_workers`): its gain comes from many small commits in parallel, which suits InnoDB, where a commit is cheap and row operations dominate. In DuckLake each commit writes new files and a catalog snapshot, commits serialize on the catalog, and concurrency control is optimistic, so parallel small commits would multiply the most expensive step and create many small files (written for DuckLake; with the native file since 2026-11-25 a commit writes the WAL, not new files, and the one-committer design is unchanged). We keep its principle (independent work in parallel, order where it matters) in the prepare workers. The dependency information (`last_committed`, `sequence_number`) in the Gtid events stays available if a future per-table commit mode is ever needed.
 
 Lag is visible through status variables; queries see data up to the last applied transaction (Freshness and consistency).
 
@@ -577,7 +589,7 @@ With this, both models coexist: LIVE gives the separate-name model and FULL give
 
 With history retention, DuckDB is no longer a disposable copy: it holds the only copy of archived rows, so it must be treated as primary storage for that data.
 
-- Backup: Percona XtraBackup must capture `catalog.ducklake`, the Parquet files it references and the applied position consistently with InnoDB. Parquet files are immutable, which simplifies copying.
+- Backup: Percona XtraBackup must capture the lake file `lake.duckdb` with its WAL (the applied position is inside it) consistently with InnoDB. Today: copy both with mysqld stopped, or with `duckdb_enable = OFF` (the plugin closes the lake, DuckDB checkpoints it), then ON again (the applier resumes from the applied position stored in the file).
 - Replicas: a new replica built from a backup needs the DuckDB history too; it cannot be rebuilt from binlogs that have been purged. The avoid-purge tag replicates, so a replica's applier archives the same rows.
 - DDL (since DWL#4 step 4d, `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`): ALTER, TRUNCATE, partition DDL and RENAME TABLE are allowed; the applier refreshes the copy keeping the archived rows (converted to new column types; ENUM / SET indexes recomputed with the new definition) and follows renames. DROP TABLE and `SECONDARY_ENGINE = NULL` keep the history in the lake and mark it stale. SECONDARY_LOAD reattaches a stale copy (strict structure check, every difference reported); `adopt_history_from` gives it to a table with another name (DWL#3).
 - Unload: discarding history (SECONDARY_UNLOAD of a history table, or removing a stale copy) requires `SET SESSION duckdb_unload_history_confirm = ON`, because it destroys data that exists nowhere else. Lake data is never deleted implicitly.
@@ -599,7 +611,7 @@ The whole feature builds in one CMake run together with the server, with the sam
 | Path | Repository | Pin |
 |---|---|---|
 | `extra/duckdb/duckdb` | https://github.com/duckdb/duckdb.git | tag v2.0.0 (d54cbbe3df17), released 2026-10-21 |
-| `extra/duckdb/ducklake` | https://github.com/duckdb/ducklake.git | commit 55cc50cf080f; its `.github/duckdb-version` names d54cbbe (v2.0.0). The repo has no release tags |
+| `extra/duckdb/ducklake` | https://github.com/duckdb/ducklake.git | commit 55cc50cf080f; its `.github/duckdb-version` names d54cbbe (v2.0.0). The repo has no release tags. Since 2026-11-25 used only to migrate a DuckLake lake of an earlier version |
 | `extra/duckdb/croaring` | https://github.com/RoaringBitmap/CRoaring.git | tag v5.5.5. DuckLake needs it for deletion vectors; upstream gets it through vcpkg |
 
 - Code comes from the original upstream repositories. We do not patch DuckDB or DuckLake unless a bug is a hard stopper; then the preferred path is an upstream fix and a pin move, with a patch file applied at build time only as a last resort.
@@ -641,7 +653,7 @@ The whole feature builds in one CMake run together with the server, with the sam
 Features:
 
 1. Create a table with a secondary engine: `SECONDARY_ENGINE=duckdb`, `retain_history` attribute, preconditions checked at load.
-2. Load from the primary: SECONDARY_LOAD through the Appender into DuckLake, binlog position recorded.
+2. Load from the primary: SECONDARY_LOAD through the Appender into the lake, binlog position recorded.
 3. DML on InnoDB applied to DuckDB: binlog observer, reader, prepare workers, committer, crash-safe applied position.
 4. Purge on InnoDB without affecting DuckDB: tagged GTID `duckdb_avoid_purge` becomes archive marks.
 5. Reporting reads from DuckDB: offload through the external executor, SQL generated from the query block, single-table and join queries, LIVE and FULL scope, FULL guarded by `duckdb_guard`.
@@ -656,7 +668,7 @@ No core code changes: everything lives in `storage/duckdb/`, `extra/duckdb/` and
 
 POC tests (MTR suite `duckdb`):
 
-- Startup: default and custom `duckdb_data_path`, creation of directory and catalog, refusal when data files exist without catalog, permission refusals and warnings, missing mandatory variables, `loose-` options without the plugin.
+- Startup: default and custom `duckdb_data_path`, creation of directory and lake file, refusal when DuckLake data files exist without catalog, permission refusals and warnings, missing mandatory variables, `loose-` options without the plugin.
 - `duckdb_enable`: same output as without the plugin; runtime OFF and ON.
 - Load: preconditions (PK, FK, types, binlog settings), retain_history load once.
 - Propagation: INSERT, UPDATE, DELETE, REPLACE, INSERT ... ON DUPLICATE KEY UPDATE, LOAD DATA; collapse cases; restart and crash recovery from the applied position.
@@ -762,8 +774,9 @@ DATE_FORMAT; NOT EXISTS as anti join; TPC-H 22/22, `tpch/README.md`).
 | LATERAL derived tables | missing | |
 | Derived tables, views, non-recursive CTEs | done | 6c-1 |
 | Recursive CTEs | missing | |
+| EXISTS / IN / NOT EXISTS inside OR | done | 2026-11-26: printed in place as [NOT] EXISTS when each outer row matches at most one row of MySQL's DISTINCT derived table (`offload_char_or`) |
 | UNION / INTERSECT / EXCEPT, DISTINCT and ALL, nested | partial | DISTINCT forms need binary or `_0900_bin` strings; a YEAR column refused |
-| Subqueries: scalar, IN, NOT IN, EXISTS, NOT EXISTS, ANY / ALL, correlated | partial | 6c-3; IN on `_bin` / `_ci` strings; a correlated scalar subquery without aggregate; equalities propagated between EXISTS and NOT EXISTS nests (TPC-H Q21): done 2026-11-23; NOT EXISTS / NOT IN sent as NOT EXISTS (DuckDB anti join) instead of MySQL's DISTINCT derived table, and the join key MySQL anchors on an EXISTS table kept outside it (2026-11-24, Q21 at SF100, MTR `offload_exists_pair` checks the plan) |
+| Subqueries: scalar, IN, NOT IN, EXISTS, NOT EXISTS, ANY / ALL, correlated | partial | 6c-3; IN on `_bin` / `_ci` strings; a correlated scalar subquery without aggregate; equalities propagated between EXISTS and NOT EXISTS nests (TPC-H Q21): done 2026-11-23; NOT EXISTS / NOT IN sent as NOT EXISTS (DuckDB anti join) instead of MySQL's DISTINCT derived table, and the join key MySQL anchors on an EXISTS table kept outside it (2026-11-24, Q21 at SF100, MTR `offload_exists_pair` checks the plan); correlated scalar, ALL and ANY subqueries (planned by MySQL as grouped derived tables) printed as LATERAL with the correlation (2026-11-25, Q17 / Q2 / Q20, MTR `offload_lateral`) |
 | Row value constructors `(a, b) IN (...)`, `(a, b) = (...)` | missing | |
 | Prepared statement parameters (`?`), stored program variables and parameters, user variables (`@x`) | done | their value as a constant at every execution (2026-11-23, T1, MTR `offload_params`); `@x := ...` in the statement refused |
 | GROUP BY ROLLUP, CUBE, GROUPING SETS, GROUPING() | missing | refused `rollup` |
@@ -851,7 +864,7 @@ reference instance; the SQL coverage tracker is updated).
 | 1. POC | See POC scope | **done** (2026-11-15) | Features work end to end in MTR; measured speedup versus InnoDB: met (54x-584x) |
 | 2. Correctness | Type mapping, collation weight columns, function allow list, rejection and fallback, MTR result comparison, Clang build | **mostly done**: weights, every type but VECTOR and DECIMAL above 38 digits (JSON and spatial loaded 2026-11-23), exact decimal division, rejection rules, MTR suite. Open: the translation items of phase 2b | Identical results with use_secondary_engine OFF and FORCED across the test suite: met for everything that is offloaded |
 | 2b. Translation coverage and the TPC-H proof | See "Next steps" 1-3 | **in progress** (TPC-H check: 22 of 22 since 2026-11-23; HammerDB TPROC-H at scale factor 100 runs offloaded on the release build, 2026-11-24) | HammerDB TPROC-H runs with all 22 queries giving InnoDB's results, offloaded where translated; measured speedup at scale factor 1 and 10 |
-| 3. Propagation hardening | Crash tests, binlog gap detection (done), catch-up after duckdb_enable=FALSE (done: the applier resumes from the applied position), compaction and snapshot expiry, incremental refresh after DDL, batch tuning, freshness policy (read your own writes done), apply lag metrics | partly done | Copy stays consistent through crash tests; measured apply lag under write load; disk space stable under continuous changes |
+| 3. Propagation hardening | Crash tests, binlog gap detection (done), catch-up after duckdb_enable=FALSE (done: the applier resumes from the applied position), space reuse under continuous changes (2026-11-25: native storage, no DuckLake compaction or snapshot expiry), incremental refresh after DDL, batch tuning, freshness policy (read your own writes done), apply lag metrics | partly done | Copy stays consistent through crash tests; measured apply lag under write load; disk space stable under continuous changes |
 | 4. History retention complete | DROP PARTITION as archiving (tagged), DUCKDB_HISTORY_READER privilege (done), DDL on history tables (done), confirmed SECONDARY_UNLOAD (done), backup integration, encryption | partly done | Purged rows remain queryable in FULL scope; LIVE results identical to InnoDB; backup and restore preserve history |
 | 5. Production readiness | Target release (9.7 or 8.4), consistency check, resource governance, backup, observability, packaging, CI, upgrade policy, wider translation by real usage (see "Production readiness" and "SQL gaps by priority" below) | not started | Agreed workload runs on a staging environment within lag and memory targets; crash and consistency tests pass; lake size stable under continuous changes |
 
@@ -894,7 +907,8 @@ reference instance; the SQL coverage tracker is updated).
    used by the guard.
 6. **Production hardening, must-have** (phases 3 and 5; detail in
    "Production readiness" below): crash tests and a built-in consistency
-   check, snapshot expiry and compaction, apply lag under write load,
+   check, snapshot expiry and compaction (2026-11-25: obsolete with native
+   storage; disk space under updates stays to check), apply lag under write load,
    resource governance, backup and restore, refresh after DDL that does not
    block the other tables.
 7. **Translation by real usage** (phase 5; order in "SQL gaps by priority"
@@ -1041,9 +1055,9 @@ Must-have before any customer use:
 
 | Item | What | Why | Status |
 |---|---|---|---|
-| Crash safety | Kill mysqld at every applier stage (mid batch, mid DuckLake commit, during a refresh after DDL, during SECONDARY_LOAD); compare the copy with InnoDB row by row after restart | The copy must never silently diverge | missing |
+| Crash safety | Kill mysqld at every applier stage (mid batch, mid DuckDB commit, during a refresh after DDL, during SECONDARY_LOAD); compare the copy with InnoDB row by row after restart | The copy must never silently diverge | missing |
 | Consistency check | An operator command (checksum per table or per range, InnoDB vs DuckDB, at the applied position) | Proof for operators and support; detects divergence after incidents | missing |
-| Disk space | DuckLake snapshot expiry, compaction of small files, removal of dropped copies and old versions (scheduled, with variables) | Today the lake grows forever under updates: the risk most likely to hit a user within weeks | missing |
+| Disk space | Lake file size under continuous updates and after dropped copies (since 2026-11-25 native storage: DuckDB reuses freed space at checkpoints, the file does not shrink; DuckLake snapshot expiry and compaction no longer apply) | A lake that keeps growing is the risk most likely to hit a user within weeks | to measure |
 | Apply lag under write load | Sustained OLTP load (sysbench or HammerDB TPROC-C) next to the analytics; batch tuning; decide on the deferred parallel prepare workers | Freshness target and capacity planning | missing |
 | Resource governance | Memory and thread limit per offloaded query, a cap on concurrent offloaded queries, DuckDB out-of-memory becomes an error or an InnoDB fallback, never a crash | DuckDB runs inside mysqld: a runaway query affects OLTP | partial (`duckdb_memory_limit`, `duckdb_threads`, KILL, `max_execution_time`) |
 | Backup and restore | XtraBackup integration, or a documented procedure that keeps the lake, its applied position and the InnoDB backup consistent | For history tables the lake is the only copy of purged rows | missing |
@@ -1057,7 +1071,7 @@ Needed for general availability:
 | Observability | Apply lag per table, refusal reasons aggregated (not only the last), lake size | partial: lag in seconds and bytes, state code, memory and spill, offloaded query time (status variables), Performance Schema stages with progress, PMM / Grafana dashboard and custom queries (`monitoring/`, 2026-11-20) |
 | Packaging | One tarball; plugin size (about 1.5 GB with debug info, stripped release); ICU symbol clash between the server (ICU 77) and DuckDB's icu extension (hidden visibility, to test) | missing |
 | Security and compliance | Encryption (designed, keyring component), erasure requests against history copies (a purge keeps the personal data), privileges reviewed | designed |
-| Upgrade policy | DuckDB / DuckLake version upgrades and lake format migration (DuckLake has no release tags) | missing |
+| Upgrade policy | DuckDB version upgrades and the storage format of the lake file (the one-time DuckLake migration exists since 2026-11-25) | missing |
 | CI | MTR suite in CI, Clang build, ASAN / UBSAN runs of the applier and the offload | missing (MTR suite exists, 37 tests; 41 unit tests) |
 | Documentation | Operations guide (sizing, monitoring, failure scenarios), beyond HOWTO and TUTORIAL | partial |
 
@@ -1087,13 +1101,13 @@ reporting and BI queries. Each one today sends the query to InnoDB.
 - The secondary engine API, the external executor hook and the LEX methods used by the guard have no open-source production user in upstream MySQL and may change between releases without notice. Not changing core code means we depend on these internal interfaces from the plugin.
 - Silent wrong results from semantic gaps, mainly collations, are worse than slow results. Rejection must be the default. Mitigated: weight columns, the exactness rule for every translated construct, OFF / FORCED comparison of every test query (no wrong result found in the TPC-H check, 2026-11-17).
 - A DuckDB fault or memory blowup inside mysqld affects the whole server, not only analytical sessions.
-- Change propagation under heavy update or delete load may not keep up, given the DuckDB cost for single-row changes; DuckLake writes a delete file and a new data file per update, and many small commits create many small files. Space of old versions and dropped copies is not reclaimed yet (phase 3).
+- Change propagation under heavy update or delete load may not keep up, given the DuckDB cost for single-row changes. Since 2026-11-25 (native storage) updates and deletes are in place; DuckDB reuses freed space at checkpoints but the file does not shrink (phase 3).
 - A refresh after DDL reloads the whole table, and the applier waits for it: on large tables DDL means minutes of lag for all tables.
 - Benchmarks and tools that run with `autocommit=0` (HammerDB does for MySQL) get no offload: MySQL never uses a secondary engine inside a multi-statement transaction.
 - Binlog dependency: propagation needs binlog with ROW format, FULL image and GTIDs; binlog files purged before the applier reads them leave a gap.
 - History loss: a lake directory lost without backup, or an accidental SECONDARY_UNLOAD, destroys archived data permanently.
 - Compliance: an erasure request executed in a purge-tagged transaction keeps personal data in DuckDB.
-- DuckDB v2.0.0 is a recent major release (2026-10-21); DuckLake has no release tags.
+- DuckDB v2.0.0 is a recent major release (2026-10-21). DuckLake has no release tags; since 2026-11-25 it only migrates earlier lakes.
 - Plugin size (about 1.5 GB with debug info) and duplicated libraries: ICU is bundled by both the server (ICU 77) and DuckDB's icu extension; hidden visibility must keep them apart (to test).
 
 ## Open questions
@@ -1113,7 +1127,7 @@ Open:
 - How to expose the separate history name (orders_history) without core changes, if at all.
 - Which release we target in the end: 9.7 (current POC base) or 8.4 LTS, where the external executor hook, `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`, the SQL-layer foreign keys and the secondary-only statement mechanism must be confirmed.
 - How to handle tables without a primary key (excluded for now).
-- DuckLake encryption support and the crypto library before implementing encryption.
+- DuckDB database encryption of the lake file (WAL, spill files, key rotation) and the crypto library before implementing encryption.
 - Packaging: separate package or part of the server packages (everything in one tarball either way).
 
 ## Appendix A: How AliSQL solved the storage engine problems

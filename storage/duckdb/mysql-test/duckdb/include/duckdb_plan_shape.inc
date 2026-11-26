@@ -14,7 +14,8 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 # The shape of the DuckDB statement for $query (EXPLAIN notes): whether the
 # DuckDB plan has a cross product, whether the SQL has a DISTINCT derived
-# table, and whether it has NOT EXISTS. On small test tables a bad plan
+# table, whether it has NOT EXISTS, and whether a derived table is LATERAL
+# (a correlated scalar / ALL / ANY subquery with its correlation, 2026-11-25). On small test tables a bad plan
 # still gives the right rows quickly; this catches it (TPC-H Q21 at SF100,
 # 2026-11-24).
 # Usage: --let $query= SELECT ...
@@ -45,5 +46,6 @@ my $plan = join('', $text =~ /DuckDB plan(?: \(\d+\/\d+\))?:(.*?)(?=\n\S+\t\d+\t
 print "cross product in DuckDB plan: ", ($plan =~ /CROSS_PRODUCT|Cross Product/ ? "yes" : "no"), "\n";
 print "DISTINCT derived table: ", ($sql =~ /\(SELECT DISTINCT/ ? "yes" : "no"), "\n";
 print "NOT EXISTS: ", ($sql =~ /NOT EXISTS/ ? "yes" : "no"), "\n";
+print "LATERAL: ", ($sql =~ /JOIN LATERAL/ ? "yes" : "no"), "\n";
 EOF
 --remove_file $duckdb_plan_file
