@@ -105,8 +105,8 @@ nm -D --defined-only plugin_output_directory/ha_duckdb.so | grep -ci duckdb_   #
 
 ```bash
 grep -i duckdb $ERRLOG | tail -5
-# expect: DuckDB lake: file=.../duckdb_data/lake.duckdb, created=yes|no, executor threads=4
-ls -la $DATADIR/duckdb_data/        # lake.duckdb  (lake.duckdb.wal)  tmp/   (mode drwxr-x---)
+# expect: DuckDB repository: file=.../duckdb_data/repository.duckdb, created=yes|no, executor threads=4
+ls -la $DATADIR/duckdb_data/        # repository.duckdb  (repository.duckdb.wal)  tmp/   (mode drwxr-x---)
 ```
 
 ```sql
@@ -166,7 +166,7 @@ SELECT COUNT(*) FROM mill1;                      -- still InnoDB (no offload yet
 ```bash
 grep -E "loaded|unloaded" $ERRLOG | tail -5
 # "loaded windmills_small.mill1 into the lake: N rows in X s"
-# (since 2026-11-25 the copy is a table inside lake.duckdb: no files per table to check)
+# (since 2026-11-25 the copy is a table inside repository.duckdb: no files per table to check)
 ```
 
 ## 6. History table `mill6` (DWL#3)
@@ -268,7 +268,7 @@ ALTER TABLE mill3 SECONDARY_ENGINE = duckdb;     -- accepted (metadata)
 ALTER TABLE mill3 SECONDARY_LOAD;                -- WARNING Unknown storage engine 'duckdb', no change
 SHOW WARNINGS;
 ALTER TABLE mill1 SECONDARY_UNLOAD;              -- no error, lake untouched
-SET GLOBAL duckdb_enable = ON;                   -- log: "DuckDB lake: ... created=no"
+SET GLOBAL duckdb_enable = ON;                   -- log: "DuckDB repository: ... created=no"
 ALTER TABLE mill1 SECONDARY_LOAD;                -- EXPECTED ERROR: already in the lake (not removed while OFF)
 ```
 
@@ -292,7 +292,7 @@ session 2; session 2 returns only after the load ends.
 | Path = datadir | `loose-duckdb_data_path=<datadir>` | `must not be the datadir itself`, not loaded |
 | Inside a schema dir | `loose-duckdb_data_path=<datadir>/windmills_small/x` | `inside a directory of the datadir`, not loaded |
 | World-writable | `chmod o+w $DATADIR/duckdb_data`, restart | `is world-writable`, not loaded (then `chmod o-w`) |
-| Lost catalog (DuckLake lake of an earlier version, since 2026-11-25) | stop server, `lake.duckdb` and `catalog.ducklake` absent, a non-empty `data/` in the lake directory, start | `the DuckDB lake ... does not exist and the DuckLake catalog ... is missing, but .../data contains files`, not loaded |
+| Lost catalog (DuckLake lake of an earlier version, since 2026-11-25) | stop server, `repository.duckdb` and `catalog.ducklake` absent, a non-empty `data/` in the lake directory, start | `the DuckDB lake ... does not exist and the DuckLake catalog ... is missing, but .../data contains files`, not loaded |
 | Restart keeps tables | normal restart | `ALTER TABLE mill1 SECONDARY_LOAD` gives "already in the lake": the registry survived |
 | Startup abort after the binlog opens | a socket path longer than 107 characters (or a port in use) | `Aborting`, then `Shutdown complete`; no `got signal` (the reader stops at `BFN_BINLOG_END`) |
 | Pending batch at shutdown | `duckdb_apply_batch_max_delay_ms=60000`, one INSERT on a loaded table, wait for `transactions_read` to move, `mysqladmin shutdown` | after the start: `duckdb_applied_position` is after the INSERT and `duckdb_apply_transactions_read` stays 0 (committed during the shutdown, not read again) |
@@ -608,7 +608,7 @@ RENAME TABLE mill5x TO mill5;
 ```
 
 With the server stopped, the lake can be read with a small DuckDB program
-(attach `lake.duckdb` read-only; before 2026-11-25 `catalog.ducklake`) to check the column types
+(attach `repository.duckdb` read-only; before 2026-11-25 `catalog.ducklake`) to check the column types
 (`duckdb_columns()`) and the archived rows: on 2026-11-11 this was done on a
 throwaway instance (results log).
 
@@ -1215,7 +1215,7 @@ On a throwaway instance (stop it first; paths are examples):
 mv /path/inst /path/inst_moved
 sed -i "s|/path/inst|/path/inst_moved|g" /path/inst_moved/my.cnf /path/inst_moved/logs/binlog.index
 mysqld --defaults-file=/path/inst_moved/my.cnf &
-# since 2026-11-25 (native lake.duckdb, it stores no path): the lake opens, no move is logged,
+# since 2026-11-25 (native repository.duckdb, it stores no path): the lake opens, no move is logged,
 # queries in DuckDB give the same results, with relocate ON or OFF
 ```
 
@@ -1247,7 +1247,7 @@ Stop the server, then inspect the lake with `tools/duckq` (build line in
 
 ```bash
 L=<datadir or duckdb_data_path>
-./duckq :memory: "ATTACH '$L/lake.duckdb' AS lake (READ_ONLY)" \
+./duckq :memory: "ATTACH '$L/repository.duckdb' AS lake (READ_ONLY)" \
   "SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE database_name='lake' AND table_name='wt'" \
   "SELECT count(DISTINCT __w_c), count(DISTINCT __w_g), count(DISTINCT __w_l) FROM lake.<db>.wt" \
   "SELECT count(*) FILTER (WHERE c IS NOT NULL AND __w_c IS NULL) FROM lake.<db>.wt"
@@ -1311,7 +1311,7 @@ SET SESSION duckdb_history_scope = FULL;  EXECUTE s;            -- 100
 SET SESSION duckdb_history_scope = LIVE;  EXECUTE s;            -- 70
 SET GLOBAL duckdb_enable = OFF;
 SET SESSION duckdb_history_scope = FULL;
-SELECT COUNT(*) FROM hist;        -- EXPECTED ERROR 3877: ... the DuckDB lake is not open
+SELECT COUNT(*) FROM hist;        -- EXPECTED ERROR 3877: ... the DuckDB repository is not open
 SET GLOBAL duckdb_enable = ON;
 SET SESSION duckdb_history_scope = LIVE;
 SHOW GLOBAL STATUS LIKE 'duckdb_guard%';

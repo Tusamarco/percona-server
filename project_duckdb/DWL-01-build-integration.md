@@ -12,7 +12,7 @@ from their upstream sources as part of the normal Percona Server build: one
 standard as the server (C++23, `CMAKE_CXX_STANDARD` in the top-level CMakeLists.txt). The result is a set of static libraries and
 headers that the plugin (DWL#2) links into `ha_duckdb.so`.
 
-(2026-11-25: storage moved to a native DuckDB file, `lake.duckdb`; design
+(2026-11-25: storage moved to a native DuckDB file, `repository.duckdb`; design
 document, Storage. The DuckLake extension and CRoaring are still built, now
 only to migrate a DuckLake lake of an earlier version.)
 

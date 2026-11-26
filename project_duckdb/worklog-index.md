@@ -12,7 +12,7 @@ MySQL WL numbers.
 | ID | Title | Status | Depends on |
 |---|---|---|---|
 | [DWL#1](DWL-01-build-integration.md) | Build integration of DuckDB, DuckLake and CRoaring | Implemented, verified | none |
-| [DWL#2](DWL-02-plugin-infrastructure.md) | Plugin infrastructure, configuration and DuckLake storage | Implemented (2a, executor pool); MTR `duckdb_plugin`; 2026-11-25: storage moved to a native DuckDB file, `lake.duckdb`, with a one-time migration of DuckLake lakes | DWL#1 |
+| [DWL#2](DWL-02-plugin-infrastructure.md) | Plugin infrastructure, configuration and DuckLake storage | Implemented (2a, executor pool); MTR `duckdb_plugin`; 2026-11-25: storage moved to a native DuckDB file, `repository.duckdb`, with a one-time migration of DuckLake lakes | DWL#1 |
 | [DWL#3](DWL-03-secondary-load-unload.md) | Secondary tables: SECONDARY_LOAD and SECONDARY_UNLOAD | 3a implemented, under test; 3b (reattach, resync, adopt_history_from, structure check, confirmed discard, two-transaction load) implemented, verified on a throwaway instance; MTR `duckdb_plugin`, `history`, `foreign_keys`, `json_geometry` | DWL#2 |
 | [DWL#4](DWL-04-binlog-applier.md) | Change propagation: binlog applier | 4a verified; 4b implemented, under test; 4c-1 implemented, under test (gaps and repoint verified); 4c-2 implemented, under test; 4d (DDL refresh, compressed payloads) implemented, verified on a throwaway instance; MTR `applier`, `super_read_only`, `binlog_reset`, `ddl_wait`, `json_geometry` | DWL#3 |
 | [DWL#5](DWL-05-history-retention.md) | History retention: purge marker and archive marks | Implemented (fixed purge tag, counters, `duckdb_history_scope` and `DUCKDB_HISTORY_READER`), verified on a throwaway instance; MTR `history` | DWL#4 |
@@ -52,9 +52,16 @@ build). MTR suite: 37 tests; unit tests `duckdb_apply-t`: 41. Next: functions
 on TIMESTAMP columns (design doc "TODO from 2026-11-18").
 
 Done 2026-11-25: the lake storage moved from DuckLake to a native DuckDB
-database file, `lake.duckdb` (DuckLake scans were 2-3x slower); a DuckLake
+database file, `repository.duckdb` (DuckLake scans were 2-3x slower); a DuckLake
 lake of an earlier version is migrated at the first start (DWL-02, design
 document "Storage"). DuckLake compaction and snapshot expiry no longer apply.
+
+Done 2026-11-25/26 (DWL-06, "Performance review against AliSQL and
+MariaDB"): correlated subqueries as LATERAL, EXISTS / IN / NOT EXISTS inside
+OR, fewer DECIMAL casts, CHAR without rtrim(), constant SUBSTRING; the file
+renamed `repository.duckdb`. HammerDB TPROC-H SF100: within 1.04x of
+AliSQL's total at 1-8 VUsers, ahead of MariaDB, the only engine completing
+16 VUsers (README, Performance). MTR suite: 39 tests; unit tests: 41.
 
 Development order follows the table. DWL#6 must not be enabled before DWL#4:
 without the applier, DML on InnoDB does not reach DuckDB and offloaded queries

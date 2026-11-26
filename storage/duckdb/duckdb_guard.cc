@@ -103,7 +103,7 @@ int on_table_access(THD *thd, const mysql_event_table_access *ev) {
                      "but use_secondary_engine=OFF (" +
                          full + " is a history table)");
   if (!Lake::instance().is_open())
-    return stop(thd, "duckdb_history_scope=FULL: the DuckDB lake is not "
+    return stop(thd, "duckdb_history_scope=FULL: the DuckDB repository is not "
                      "open (duckdb_enable=OFF?): " +
                          full + " cannot be read with its archived rows");
   if (!state.usable())

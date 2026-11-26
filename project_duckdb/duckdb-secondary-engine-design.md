@@ -2,9 +2,9 @@
 
 **Design and Implementation Plan**
 
-Status: v0.5, 2026-11-25: the POC is implemented and the design below describes what was built (decisions taken during development are marked with their date). Owner: Marco. Target: Percona Server for MySQL; the POC is built on the Percona-Server-9.7.2-2 branch (final target release still open, see Open questions). Step by step status: `worklog-index.md`; user guides: `HOWTO.md`, `TUTORIAL.md`.
+Status: v0.5, 2026-11-26: the POC is implemented and the design below describes what was built (decisions taken during development are marked with their date). Owner: Marco. Target: Percona Server for MySQL; the POC is built on the Percona-Server-9.7.2-2 branch (final target release still open, see Open questions). Step by step status: `worklog-index.md`; user guides: `HOWTO.md`, `TUTORIAL.md`.
 
-Changes from v0.4 (2026-11-18 to 2026-11-25):
+Changes from v0.4 (2026-11-18 to 2026-11-26):
 
 - TPC-H 22 of 22 offloaded with identical results (Q16, Q21, Q22); HammerDB TPROC-H at scale factor 100 runs offloaded on the release build (Q21 fixed at that scale 2026-11-24: NOT EXISTS sent as an anti join, join keys kept outside EXISTS).
 - Grouped string values in joins and grouped string expressions checked per group in the query (2026-11-22).
@@ -13,8 +13,9 @@ Changes from v0.4 (2026-11-18 to 2026-11-25):
 - T1: prepared statement parameters, stored program and user variables translated. T2: DuckDB errors at the start of execution (out of memory, temporary disk full) send the query to InnoDB.
 - T3 (part): NOW() and the other clock functions, CAST / CONVERT of numbers and dates, DATE_FORMAT.
 - Monitoring: lag, state, memory, spill and query time status variables, PMM / Grafana dashboard (`monitoring/`); plugin version and commit in `INFORMATION_SCHEMA.PLUGINS` and `duckdb_version`; binary log reset handled.
-- Diagrams of the write and query paths ("Paths through the code"); data type mapping section; TODO list T0-T5 ("TODO from 2026-11-18"). MTR suite: 37 tests; 41 unit tests.
-- Storage moved from DuckLake to a native DuckDB database file, `lake.duckdb` (2026-11-25, Storage); a DuckLake lake of an earlier version is migrated at the first start.
+- Diagrams of the write and query paths ("Paths through the code"); data type mapping section; TODO list T0-T5 ("TODO from 2026-11-18"). MTR suite: 39 tests; 41 unit tests.
+- Storage moved from DuckLake to a native DuckDB database file, `repository.duckdb` (2026-11-25, Storage; named `lake.duckdb` for one day, renamed at startup); a DuckLake lake of an earlier version is migrated at the first start.
+- Performance review against AliSQL and MariaDB (HammerDB TPROC-H SF100, 2026-11-25/26, DWL-06): correlated scalar / ALL / ANY subqueries printed as LATERAL, EXISTS / IN / NOT EXISTS inside OR as [NOT] EXISTS, DECIMAL arithmetic without redundant casts, CHAR columns compared without rtrim(), SUBSTRING with constant positions. Result: within 1.04x of AliSQL's total at 1-8 VUsers, ahead of MariaDB, the only engine completing 16 VUsers (README, Performance).
 
 Changes from v0.3 (what the implementation added or changed, 2026-11-07 to 2026-11-17):
 
@@ -98,17 +99,17 @@ The secondary engine is the approach that best matches how DuckDB works and the 
  |              |                     |  (external executor)     |
  |              |                     v                          |
  |  InnoDB --commit--> binlog   DuckDB engine (in memory)        |
- |  (live data)          |        |  ATTACH lake.duckdb          |
+ |  (live data)          |        |  ATTACH repository.duckdb          |
  |                       v        v                              |
  |        plugin applier (reader -> workers -> committer)        |
  |        purge-tagged deletes = archive marks                   |
  |                                |                              |
- |          <datadir>/duckdb_data: lake.duckdb (+ WAL), tmp/     |
+ |          <datadir>/duckdb_data: repository.duckdb (+ WAL), tmp/     |
  |          (full history)                                       |
  +---------------------------------------------------------------+
 ```
 
-One DuckDB instance lives inside mysqld, in memory, with one native DuckDB database file, `lake.duckdb`, attached as `lake`. Each MySQL session that touches DuckDB gets its own DuckDB connection. No DuckDB call runs on a MySQL thread: DuckDB plans statements recursively and overflows the small stack of connection threads, so every DuckDB call runs on a plugin-owned executor pool (`duckdb_executor_threads`, `duckdb_executor_stack_size`) while MySQL work stays on the session thread (DWL#2, DuckDB executor threads). DuckDB, its extensions, DuckLake and CRoaring are linked statically into the plugin library; DuckDB and DuckLake are MIT licensed, compatible with GPL-2.0 (third-party licenses to be confirmed for the SBOM).
+One DuckDB instance lives inside mysqld, in memory, with one native DuckDB database file, `repository.duckdb`, attached as `lake`. Each MySQL session that touches DuckDB gets its own DuckDB connection. No DuckDB call runs on a MySQL thread: DuckDB plans statements recursively and overflows the small stack of connection threads, so every DuckDB call runs on a plugin-owned executor pool (`duckdb_executor_threads`, `duckdb_executor_stack_size`) while MySQL work stays on the session thread (DWL#2, DuckDB executor threads). DuckDB, its extensions, DuckLake and CRoaring are linked statically into the plugin library; DuckDB and DuckLake are MIT licensed, compatible with GPL-2.0 (third-party licenses to be confirmed for the SBOM).
 
 The library `ha_duckdb.so` contains three plugins:
 
@@ -134,7 +135,7 @@ sequenceDiagram
     participant D as Row decoder<br/>duckdb_row_decoder.cc
     participant B as Batch / TableChanges<br/>duckdb_applier.cc, duckdb_changes.cc
     participant X as Executor thread<br/>Lake::Connection::execute
-    participant L as DuckDB lake<br/>lake.duckdb
+    participant L as DuckDB lake<br/>repository.duckdb
 
     S->>M: COMMIT
     M->>M: ordered_commit: binary log write, InnoDB commit
@@ -222,7 +223,7 @@ sequenceDiagram
     participant T as Generator (SQL translation)<br/>duckdb_offload.cc
     participant R as BinlogReader
     participant X as Executor thread
-    participant L as DuckDB lake<br/>lake.duckdb
+    participant L as DuckDB lake<br/>repository.duckdb
 
     C->>P: COM_QUERY / COM_STMT_EXECUTE
     P->>G: PARSE PREPARSE event
@@ -402,7 +403,7 @@ The update callback of a plugin variable runs under `LOCK_global_system_variable
 
 ```
 DuckDB instance (in memory, one per mysqld)
-  └─ ATTACH '<path>/lake.duckdb' AS lake     native DuckDB file, WAL in lake.duckdb.wal
+  └─ ATTACH '<path>/repository.duckdb' AS lake     native DuckDB file, WAL in repository.duckdb.wal
        ├─ lake.<mysql_schema>.<table>       one per loaded table
        ├─ lake.__mysql.tables               registry: state, history flag, load position,
        │                                    primary key, weight columns
@@ -422,23 +423,23 @@ Decided 2026-11-25 (Marco; replaces the DuckLake decision of 2026-11-04): the la
 
 ### Migration from DuckLake (2026-11-25)
 
-At the first start of the new version, if `lake.duckdb` does not exist and `catalog.ducklake` does, the plugin migrates the old lake once:
+At the first start of the new version, if `repository.duckdb` does not exist and `catalog.ducklake` does, the plugin migrates the old lake once:
 
-1. Attach the DuckLake lake read-only and copy everything with `COPY FROM DATABASE` into `lake.duckdb.migrating`.
+1. Attach the DuckLake lake read-only and copy everything with `COPY FROM DATABASE` into `repository.duckdb.migrating`.
 2. Compare every table's row count in both; any difference fails the start and keeps the DuckLake files.
-3. Rename the copy to `lake.duckdb`, and `catalog.ducklake` (and its `.wal`) to `catalog.ducklake.migrated`. The old `data/` directory is left in place; the DBA removes it after a check.
+3. Rename the copy to `repository.duckdb`, and `catalog.ducklake` (and its `.wal`) to `catalog.ducklake.migrated`. The old `data/` directory is left in place; the DBA removes it after a check.
 
-The error log shows an info line "DuckDB lake: migrating the DuckLake lake ..." and a warning "DuckDB lake migrated from DuckLake to ...: N tables, M rows checked ...". A crash during the copy leaves only `lake.duckdb.migrating`, which the next start removes before migrating again; nothing old is deleted. A DuckLake catalog that stores another data path (lake moved or restored elsewhere) is read from `duckdb_data_path` with `duckdb_lake_relocate=ON` (`OVERRIDE_DATA_PATH`); with OFF the start is refused. Tested on a TPC-H lake: 11 tables, identical counts, TPC-H 22 of 22 identical afterwards; the copy of 30M rows took about 3 s on the release build. The DuckLake extension is still built, only for this migration.
+The error log shows an info line "DuckDB repository: migrating the DuckLake lake ..." and a warning "DuckDB repository migrated from DuckLake to ...: N tables, M rows checked ...". A crash during the copy leaves only `repository.duckdb.migrating`, which the next start removes before migrating again; nothing old is deleted. A DuckLake catalog that stores another data path (lake moved or restored elsewhere) is read from `duckdb_data_path` with `duckdb_lake_relocate=ON` (`OVERRIDE_DATA_PATH`); with OFF the start is refused. Tested on a TPC-H lake: 11 tables, identical counts, TPC-H 22 of 22 identical afterwards; the copy of 30M rows took about 3 s on the release build. The DuckLake extension is still built, only for this migration.
 
 ### Startup sequence
 
 1. Resolve the path: `duckdb_data_path` or `<datadir>/duckdb_data`; relative values against the datadir; then `realpath`, so checks apply to the real location.
 2. Run the location checks (below).
-3. Create what is missing: `duckdb_data/` and `tmp/` with mode 0750, and `lake.duckdb`, which the ATTACH creates when the file does not exist.
-4. Refuse to start if `lake.duckdb` and `catalog.ducklake` are both missing but `data/` contains files: a DuckLake catalog of an earlier version was lost, and creating an empty lake would hide the only copy of archived rows. The DBA must restore the catalog. A leftover `lake.duckdb.migrating` (crash during a migration) is removed.
-5. Register the static extensions, open DuckDB, migrate a DuckLake lake when `lake.duckdb` is missing and `catalog.ducklake` exists (Migration from DuckLake), attach the lake, set `temp_directory`, `memory_limit`, `threads` and the hardening settings. A lake file locked by another process gives a readable error.
+3. Create what is missing: `duckdb_data/` and `tmp/` with mode 0750, and `repository.duckdb`, which the ATTACH creates when the file does not exist.
+4. Refuse to start if `repository.duckdb` and `catalog.ducklake` are both missing but `data/` contains files: a DuckLake catalog of an earlier version was lost, and creating an empty lake would hide the only copy of archived rows. The DBA must restore the catalog. A leftover `repository.duckdb.migrating` (crash during a migration) is removed.
+5. Register the static extensions, open DuckDB, migrate a DuckLake lake when `repository.duckdb` is missing and `catalog.ducklake` exists (Migration from DuckLake), attach the lake, set `temp_directory`, `memory_limit`, `threads` and the hardening settings. A lake file locked by another process gives a readable error.
 6. Reconcile with the data dictionary: tables the DD marks as loaded but missing from the lake are treated as unloaded, with a warning in the error log.
-7. Start the applier (Change propagation) and log `DuckDB lake: file=..., created=yes|no|migrated from DuckLake, executor threads=N`.
+7. Start the applier (Change propagation) and log `DuckDB repository: file=..., created=yes|no|migrated from DuckLake, executor threads=N`.
 
 ### Location and permission checks
 
@@ -551,7 +552,7 @@ On each table access event (READ, and since 2026-11-16 UPDATE and DELETE, so UPD
 The same query must return the same result on both engines. Areas to cover:
 
 - Type mapping: DECIMAL precision and scale, unsigned integers, DATETIME and TIMESTAMP with time zones, BIT, ENUM, SET, JSON.
-- Collations. GROUP BY, DISTINCT, ORDER BY and comparisons on strings must follow the column collation. Under utf8mb4_0900_ai_ci, "José" and "jose" are equal; under the DuckDB default comparison they are not. This is the largest source of silent wrong results. Implemented (DWL#6 step A, 2026-11-14): for each string column whose collation DuckDB cannot compare, a hidden weight column computed with the server's own `strnxfrm` at load and apply time; comparisons, joins, GROUP BY, ORDER BY, MIN/MAX and COUNT(DISTINCT) use it, which gives exactly MySQL's semantics; PAD SPACE binary collations use rtrim keys. Still refused under non-binary collations: LIKE, SELECT DISTINCT, IN subqueries, DISTINCT set operations. A grouped string value shown in a join: exact with the table's primary key in GROUP BY; otherwise each result group is checked in the query to hold one stored value (2026-11-22), and an ambiguous group sends the query to InnoDB (whose value depends on its join order).
+- Collations. GROUP BY, DISTINCT, ORDER BY and comparisons on strings must follow the column collation. Under utf8mb4_0900_ai_ci, "José" and "jose" are equal; under the DuckDB default comparison they are not. This is the largest source of silent wrong results. Implemented (DWL#6 step A, 2026-11-14): for each string column whose collation DuckDB cannot compare, a hidden weight column computed with the server's own `strnxfrm` at load and apply time; comparisons, joins, GROUP BY, ORDER BY, MIN/MAX and COUNT(DISTINCT) use it, which gives exactly MySQL's semantics; PAD SPACE binary collations use rtrim keys (CHAR columns of base tables their own value, 2026-11-26: CHAR is stored without trailing spaces). Still refused under non-binary collations: LIKE, SELECT DISTINCT, IN subqueries, DISTINCT set operations. A grouped string value shown in a join: exact with the table's primary key in GROUP BY; otherwise each result group is checked in the query to hold one stored value (2026-11-22), and an ambiguous group sends the query to InnoDB (whose value depends on its join order).
 - Numbers: exact DECIMAL division and AVG as MySQL computes them (9-digit words, truncation, `div_precision_increment`); unsigned arithmetic only when it cannot leave 0..2^64-1 (MySQL raises error 1690). Columns with a special lake value (TIME, ENUM, SET, YEAR, BIT) are translated only by the functions that know them.
 - NULL handling and MySQL implicit type conversions.
 - Function mapping, one function at a time, with an allow list. Anything not on the list causes rejection.
@@ -589,7 +590,7 @@ With this, both models coexist: LIVE gives the separate-name model and FULL give
 
 With history retention, DuckDB is no longer a disposable copy: it holds the only copy of archived rows, so it must be treated as primary storage for that data.
 
-- Backup: Percona XtraBackup must capture the lake file `lake.duckdb` with its WAL (the applied position is inside it) consistently with InnoDB. Today: copy both with mysqld stopped, or with `duckdb_enable = OFF` (the plugin closes the lake, DuckDB checkpoints it), then ON again (the applier resumes from the applied position stored in the file).
+- Backup: Percona XtraBackup must capture the lake file `repository.duckdb` with its WAL (the applied position is inside it) consistently with InnoDB. Today: copy both with mysqld stopped, or with `duckdb_enable = OFF` (the plugin closes the lake, DuckDB checkpoints it), then ON again (the applier resumes from the applied position stored in the file).
 - Replicas: a new replica built from a backup needs the DuckDB history too; it cannot be rebuilt from binlogs that have been purged. The avoid-purge tag replicates, so a replica's applier archives the same rows.
 - DDL (since DWL#4 step 4d, `HTON_SECONDARY_ENGINE_SUPPORTS_DDL`): ALTER, TRUNCATE, partition DDL and RENAME TABLE are allowed; the applier refreshes the copy keeping the archived rows (converted to new column types; ENUM / SET indexes recomputed with the new definition) and follows renames. DROP TABLE and `SECONDARY_ENGINE = NULL` keep the history in the lake and mark it stale. SECONDARY_LOAD reattaches a stale copy (strict structure check, every difference reported); `adopt_history_from` gives it to a table with another name (DWL#3).
 - Unload: discarding history (SECONDARY_UNLOAD of a history table, or removing a stale copy) requires `SET SESSION duckdb_unload_history_confirm = ON`, because it destroys data that exists nowhere else. Lake data is never deleted implicitly.
@@ -717,7 +718,7 @@ How string comparisons follow the MySQL collation in DuckDB:
 | MySQL collation | In DuckDB | Behaviour |
 |---|---|---|
 | binary strings (`BINARY`, `VARBINARY`, `BLOB`), NO PAD binary (`utf8mb4_0900_bin`) | the bytes | Exact. |
-| PAD SPACE binary (`utf8mb4_bin`, `utf8mb3_bin`) | the value without trailing spaces (`rtrim`), a padded key to sort | `'a' = 'a '` as MySQL. |
+| PAD SPACE binary (`utf8mb4_bin`, `utf8mb3_bin`) | CHAR columns: the value itself (stored without trailing spaces, 2026-11-26); VARCHAR and expressions: the value without trailing spaces (`rtrim`); a padded key to sort | `'a' = 'a '` as MySQL. |
 | `latin1_bin`, `ascii_bin` | the hidden weight column; for expressions (no weight column) the value, as the bytes and their order match | Exact. |
 | every other collation: `_ci`, `_ai_ci`, `_as_cs`, `utf8mb4_general_ci`, `utf8mb4_unicode_ci`, `latin1_swedish_ci` and other non-UTF-8 ones | the hidden weight column `__w_<col>`: MySQL's own sort weight of each value, computed at load and by the applier | Comparisons, GROUP BY, ORDER BY, joins and DISTINCT counts exactly as InnoDB, including accents and non-ASCII text. Not supported on such columns: LIKE and most string functions (refused); an expression has no weight column, so comparing or grouping it is refused. |
 
@@ -1072,7 +1073,7 @@ Needed for general availability:
 | Packaging | One tarball; plugin size (about 1.5 GB with debug info, stripped release); ICU symbol clash between the server (ICU 77) and DuckDB's icu extension (hidden visibility, to test) | missing |
 | Security and compliance | Encryption (designed, keyring component), erasure requests against history copies (a purge keeps the personal data), privileges reviewed | designed |
 | Upgrade policy | DuckDB version upgrades and the storage format of the lake file (the one-time DuckLake migration exists since 2026-11-25) | missing |
-| CI | MTR suite in CI, Clang build, ASAN / UBSAN runs of the applier and the offload | missing (MTR suite exists, 37 tests; 41 unit tests) |
+| CI | MTR suite in CI, Clang build, ASAN / UBSAN runs of the applier and the offload | missing (MTR suite exists, 39 tests; 41 unit tests) |
 | Documentation | Operations guide (sizing, monitoring, failure scenarios), beyond HOWTO and TUTORIAL | partial |
 
 ### SQL gaps by priority

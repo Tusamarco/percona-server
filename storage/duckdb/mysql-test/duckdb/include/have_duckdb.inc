@@ -21,7 +21,7 @@ if (!`SELECT COUNT(*) FROM information_schema.PLUGINS WHERE PLUGIN_NAME = 'duckd
 }
 # Expected plugin warnings in a test server (MTR's secure_file_priv is its
 # var directory, which holds the lake).
-call mtr.add_suppression("Plugin duckdb reported: 'DuckDB lake directory .* is inside secure_file_priv");
+call mtr.add_suppression("Plugin duckdb reported: 'DuckDB repository directory .* is inside secure_file_priv");
 call mtr.add_suppression("Plugin duckdb reported: 'binlog_expire_logs_seconds");
 call mtr.add_suppression("Plugin duckdb reported: 'DuckDB copy of .* kept and marked stale");
 call mtr.add_suppression("Plugin duckdb reported: 'discarded the stale copy");

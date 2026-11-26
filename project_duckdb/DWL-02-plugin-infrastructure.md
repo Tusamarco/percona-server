@@ -54,21 +54,26 @@ fixed, `duckdb_avoid_purge`: no variable.)
 One in-memory DuckDB instance per mysqld with `ATTACH 'ducklake:<path>/catalog.ducklake'
 AS lake (DATA_PATH '<path>/data/')`.
 
+**2026-11-26: the file is named `repository.duckdb`** (it was `lake.duckdb`
+for one day; "lake" read as DuckLake). A `lake.duckdb` with its WAL is
+renamed at startup; user messages say "DuckDB repository". Variable names
+are unchanged.
+
 **2026-11-25: native DuckDB storage replaces DuckLake** (decided by Marco;
 design document, Storage). Measured on 30M LINEITEM-like rows, DuckLake
 (Parquet) scans were 2-3x slower than native (TPC-H Q6 shape 61 ms against
 157-174 ms, Q1 shape 214 ms against 408 ms), and its own features (snapshots,
 time travel, open Parquet files) were not used. The layout under
-`duckdb_data_path` is now `lake.duckdb` (a native DuckDB database file with
+`duckdb_data_path` is now `repository.duckdb` (a native DuckDB database file with
 every copy, the hidden columns and the schema `__mysql`), its WAL
-`lake.duckdb.wal`, and `tmp/`; the plugin attaches it as `lake`, so its SQL is
-unchanged. At the first start, if `lake.duckdb` does not exist and
+`repository.duckdb.wal`, and `tmp/`; the plugin attaches it as `lake`, so its SQL is
+unchanged. At the first start, if `repository.duckdb` does not exist and
 `catalog.ducklake` does, the plugin attaches the DuckLake lake read-only,
-copies it with `COPY FROM DATABASE` into `lake.duckdb.migrating`, compares
-every table's row count, then renames it to `lake.duckdb` and the old catalog
+copies it with `COPY FROM DATABASE` into `repository.duckdb.migrating`, compares
+every table's row count, then renames it to `repository.duckdb` and the old catalog
 to `catalog.ducklake.migrated` (and its `.wal`); `data/` is left for the DBA
 to remove. A crash during the copy leaves only the `.migrating` file, removed
-at the next start, which migrates again. If `lake.duckdb` and
+at the next start, which migrates again. If `repository.duckdb` and
 `catalog.ducklake` are both missing but `data/` contains files, the plugin
 refuses to open the lake. `duckdb_lake_relocate` now matters only for that
 migration (a DuckLake catalog storing another data path); a native file stores

@@ -69,7 +69,7 @@ cd ../percona-server-9.7-build/mysql-test
 MTR_SHUTDOWN_TIMEOUT=120 ./mtr --suite=/opt/mysql_source/percona-server/storage/duckdb/mysql-test/duckdb --parallel=2
 ```
 
-37 tests (about 1.5 hours with a debug build); see
+39 tests (about 1.5 hours with a debug build); see
 `storage/duckdb/mysql-test/duckdb/README.md`.
 
 ### Results and checks
@@ -260,12 +260,12 @@ SHOW GLOBAL STATUS LIKE 'duckdb_lake_path';         -- the lake directory
 SHOW GLOBAL STATUS LIKE 'duckdb_apply_reader_state';  -- idle
 ```
 
-The error log shows `DuckDB lake: file=.../lake.duckdb, created=yes|no, executor
+The error log shows `DuckDB repository: file=.../repository.duckdb, created=yes|no, executor
 threads=N` and `binlog reader started at ...`.
 
-The lake directory (`duckdb_data_path`) holds `lake.duckdb`, a native DuckDB
+The lake directory (`duckdb_data_path`) holds `repository.duckdb`, a native DuckDB
 database file with every copy, the hidden columns and the plugin's schema
-`__mysql` (registry, applied position), its WAL `lake.duckdb.wal`, and `tmp/`
+`__mysql` (registry, applied position), its WAL `repository.duckdb.wal`, and `tmp/`
 for spills.
 
 ### Move the lake (duckdb_data_path)
@@ -279,8 +279,8 @@ instance, fix `my.cnf` and the `*.index` files.
 
 ### Back up the lake
 
-The lake is one file plus its WAL: copy `lake.duckdb` and
-`lake.duckdb.wal` (if present) with mysqld stopped, or while the plugin is
+The lake is one file plus its WAL: copy `repository.duckdb` and
+`repository.duckdb.wal` (if present) with mysqld stopped, or while the plugin is
 disabled: `SET GLOBAL duckdb_enable = OFF` closes the lake (DuckDB writes
 its WAL into the file when it closes), copy, then `SET GLOBAL duckdb_enable
 = ON` (the applier resumes from the applied position, which is inside the
@@ -289,20 +289,32 @@ meanwhile; FULL scope queries fail.
 
 ### Upgrade from a DuckLake lake (before 2026-11-25)
 
+The repository file was named `lake.duckdb` on 2026-11-25 and is
+`repository.duckdb` since 2026-11-26 ("lake" read as DuckLake): a
+`lake.duckdb` and its WAL are renamed at startup (error log: "DuckDB
+repository: ... renamed to ..."). The variable names (`duckdb_data_path`,
+`duckdb_lake_relocate`, status `duckdb_lake_path`) are unchanged.
+
+After checking the migrated repository, `catalog.ducklake.migrated` (and
+its `.wal`) and the old `data/` directory can be deleted: they are kept
+only to go back to a version before 2026-11-25 (rename the catalog back to
+`catalog.ducklake`).
+
+
 Earlier versions stored the lake as DuckLake (`catalog.ducklake` and Parquet
-files under `data/`). At the first start of this version, if `lake.duckdb`
+files under `data/`). At the first start of this version, if `repository.duckdb`
 does not exist and `catalog.ducklake` does, the plugin copies the old lake
-into `lake.duckdb.migrating`, compares every table's row count, then renames
-it to `lake.duckdb` and the old catalog to `catalog.ducklake.migrated` (and
-its `.wal`). The error log shows an info line `DuckDB lake: migrating the
-DuckLake lake ...` and a warning `DuckDB lake migrated from DuckLake to ...: N
+into `repository.duckdb.migrating`, compares every table's row count, then renames
+it to `repository.duckdb` and the old catalog to `catalog.ducklake.migrated` (and
+its `.wal`). The error log shows an info line `DuckDB repository: migrating the
+DuckLake lake ...` and a warning `DuckDB repository migrated from DuckLake to ...: N
 tables, M rows checked ...`. The old `data/` directory is left in place:
 remove it after a check. A crash during the copy leaves only
-`lake.duckdb.migrating`, removed at the next start, which migrates again;
+`repository.duckdb.migrating`, removed at the next start, which migrates again;
 nothing old is deleted. If the old catalog stores another data path (the lake
 was moved or restored), `duckdb_lake_relocate = ON` (default) reads its files
 from `duckdb_data_path`; OFF refuses and the plugin is not loaded. If both
-`lake.duckdb` and `catalog.ducklake` are missing but `data/` contains files,
+`repository.duckdb` and `catalog.ducklake` are missing but `data/` contains files,
 the catalog was lost: the plugin refuses to open the lake until it is
 restored.
 
@@ -378,7 +390,7 @@ How string comparisons follow the MySQL collation in DuckDB:
 | MySQL collation | In DuckDB | Behaviour |
 |---|---|---|
 | binary strings (`BINARY`, `VARBINARY`, `BLOB`), NO PAD binary (`utf8mb4_0900_bin`) | the bytes | Exact. |
-| PAD SPACE binary (`utf8mb4_bin`, `utf8mb3_bin`) | the value without trailing spaces (`rtrim`), a padded key to sort | `'a' = 'a '` as MySQL. |
+| PAD SPACE binary (`utf8mb4_bin`, `utf8mb3_bin`) | CHAR columns: the value itself (stored without trailing spaces, since 2026-11-26); VARCHAR and expressions: the value without trailing spaces (`rtrim`); a padded key to sort | `'a' = 'a '` as MySQL. |
 | `latin1_bin`, `ascii_bin` | the hidden weight column; for expressions (no weight column) the value, as the bytes and their order match | Exact. |
 | every other collation: `_ci`, `_ai_ci`, `_as_cs`, `utf8mb4_general_ci`, `utf8mb4_unicode_ci`, `latin1_swedish_ci` and other non-UTF-8 ones | the hidden weight column `__w_<col>`: MySQL's own sort weight of each value, computed at load and by the applier | Comparisons, GROUP BY, ORDER BY, joins and DISTINCT counts exactly as InnoDB, including accents and non-ASCII text. Not supported on such columns: LIKE and most string functions (refused); an expression has no weight column, so comparing or grouping it is refused. |
 
@@ -516,7 +528,7 @@ duckdb`, it is simply not loaded afterwards. Until a stale copy is
 discarded, a new table with the same name and `retain_history` reattaches it
 on its first SECONDARY_LOAD (if the structure is the same).
 
-Disk space: DuckDB reuses freed space in `lake.duckdb` at checkpoints; the
+Disk space: DuckDB reuses freed space in `repository.duckdb` at checkpoints; the
 file does not shrink by itself.
 
 ---
@@ -1069,7 +1081,7 @@ the lake is closed (`duckdb_enable=OFF`) and for accounts without the
 
 ### Reading the lake while MySQL is down
 
-The copies are a native DuckDB database file, `lake.duckdb`, in
+The copies are a native DuckDB database file, `repository.duckdb`, in
 `duckdb_data_path` (default `<datadir>/duckdb_data`). With MySQL stopped,
 DuckDB itself can read it. Use `duckq` (`project_duckdb/tools/duckq.c`),
 built from the same DuckDB libraries as the plugin, so the versions match
@@ -1088,7 +1100,7 @@ tab-separated:
 
 ```bash
 LAKE=/path/to/datadir/duckdb_data
-A="ATTACH '$LAKE/lake.duckdb' AS lake (READ_ONLY)"
+A="ATTACH '$LAKE/repository.duckdb' AS lake (READ_ONLY)"
 ~/duckq :memory: "$A" \
   "SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'lake' ORDER BY 1, 2" \
   "SELECT db, tbl, state, retain_history FROM lake.__mysql.tables"
@@ -1301,7 +1313,7 @@ such a CHAR value then misses them).
   deleted rows at checkpoints.
 - A refresh after DDL reloads the whole table and pauses the applier for all
   tables while it runs.
-- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 37 tests) covers the
+- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 39 tests) covers the
   features; restarts with special options, replica, semi-sync, relocation
   and performance stay in `manual-test-plan.md`.
 - Replicas: tested with a source without the plugin (section 2, Replicas).

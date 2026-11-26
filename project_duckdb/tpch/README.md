@@ -113,6 +113,9 @@ item 22. (2026-11-23: 22 of 22.)
    (`use_secondary_engine = OFF`) and with the plugin, same results, compare
    the times. `autocommit = 1` in HammerDB's MySQL OLAP script.
    (2026-11-24: TPROC-H at scale factor 100 runs offloaded on the release
-   build with `mysql_tproch_run.tcl`; the timing comparison at scale factor 1
-   and 10 is still to do.)
+   build with `mysql_tproch_run.tcl`. 2026-11-26: done at scale factor 100,
+   1 to 16 VUsers, against the AliSQL and MariaDB DuckDB engines on the same
+   workload: within 1.04x of AliSQL's total at 1-8 VUsers, ahead of MariaDB,
+   the only engine completing 16 VUsers; per-query tables in the README,
+   "Performance".)
 3. Record the runs in `project_duckdb/perf/` as the other performance runs.

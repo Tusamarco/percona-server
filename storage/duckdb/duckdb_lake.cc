@@ -59,8 +59,11 @@ constexpr const char *kDefaultDirName = "duckdb_data";
 // one DuckDB database file (WAL next to it). DuckLake (catalog + Parquet
 // files) was measured 2-3x slower on scans, and its own features
 // (snapshots, open Parquet files) were not used.
-constexpr const char *kLakeFile = "lake.duckdb";
-constexpr const char *kMigratingFile = "lake.duckdb.migrating";
+// Named repository.duckdb since 2026-11-26 ("lake" read as DuckLake).
+constexpr const char *kLakeFile = "repository.duckdb";
+constexpr const char *kMigratingFile = "repository.duckdb.migrating";
+// The file's name on 2026-11-25: renamed at startup.
+constexpr const char *kOldLakeFile = "lake.duckdb";
 // A DuckLake lake of an earlier version: migrated once at startup.
 constexpr const char *kLegacyCatalog = "catalog.ducklake";
 constexpr const char *kLegacyDataDir = "data";
@@ -115,10 +118,11 @@ bool check_location(const fs::path &lake, std::string *err) {
     std::error_code ec;
     if (fs::is_directory(lake, ec) && !dir_is_empty(lake) &&
         !fs::exists(lake / kLakeFile, ec) &&
+        !fs::exists(lake / kOldLakeFile, ec) &&
         !fs::exists(lake / kLegacyCatalog, ec) &&
         !fs::exists(lake / kLegacyDataDir, ec)) {
       *err = "directory " + lake.string() +
-             " exists in the datadir and is not a DuckDB lake (it may be a "
+             " exists in the datadir and is not a DuckDB repository (it may be a "
              "database directory)";
       return true;
     }
@@ -151,18 +155,18 @@ bool check_permissions(const fs::path &lake, std::string *err) {
     return true;
   }
   if (st.st_mode & S_IWOTH) {
-    *err = "the DuckDB lake directory " + lake.string() + " is world-writable";
+    *err = "the DuckDB repository directory " + lake.string() + " is world-writable";
     return true;
   }
   if (st.st_mode & S_IROTH)
-    DUCKDB_LOG_WARNING("DuckDB lake directory %s is world-readable",
+    DUCKDB_LOG_WARNING("DuckDB repository directory %s is world-readable",
                        lake.c_str());
   if (st.st_mode & S_IWGRP)
-    DUCKDB_LOG_WARNING("DuckDB lake directory %s is group-writable",
+    DUCKDB_LOG_WARNING("DuckDB repository directory %s is group-writable",
                        lake.c_str());
   if (st.st_uid != geteuid())
     DUCKDB_LOG_WARNING(
-        "DuckDB lake directory %s is not owned by the mysqld user",
+        "DuckDB repository directory %s is not owned by the mysqld user",
         lake.c_str());
 
   // secure_file_priv: "NULL" disables file import and export, "" allows any
@@ -172,14 +176,14 @@ bool check_permissions(const fs::path &lake, std::string *err) {
     if (*opt_secure_file_priv == '\0') {
       DUCKDB_LOG_WARNING(
           "secure_file_priv is empty: users with the FILE privilege can read "
-          "and write the DuckDB lake files in %s",
+          "and write the DuckDB repository files in %s",
           lake.c_str());
     } else {
       std::error_code ec;
       const fs::path sfp = fs::weakly_canonical(opt_secure_file_priv, ec);
       if (!ec && (lake == sfp || is_inside(lake, sfp)))
         DUCKDB_LOG_WARNING(
-            "DuckDB lake directory %s is inside secure_file_priv (%s): users "
+            "DuckDB repository directory %s is inside secure_file_priv (%s): users "
             "with the FILE privilege can read and write its files",
             lake.c_str(), sfp.c_str());
     }
@@ -258,6 +262,21 @@ bool Lake::open(const LakeSettings &s, std::string *err) {
   if (check_location(lake, err)) return true;
 
   std::error_code ec;
+  // lake.duckdb (the name on 2026-11-25) becomes repository.duckdb, with
+  // its WAL.
+  if (!fs::exists(lake / kLakeFile, ec) && fs::exists(lake / kOldLakeFile, ec)) {
+    const fs::path old_wal = lake / (std::string(kOldLakeFile) + ".wal");
+    if (fs::exists(old_wal, ec))
+      fs::rename(old_wal, lake / (std::string(kLakeFile) + ".wal"), ec);
+    if (!ec) fs::rename(lake / kOldLakeFile, lake / kLakeFile, ec);
+    if (ec) {
+      *err = "cannot rename " + (lake / kOldLakeFile).string() + " to " +
+             kLakeFile + ": " + ec.message();
+      return true;
+    }
+    DUCKDB_LOG_INFO("DuckDB repository: %s renamed to %s",
+                    (lake / kOldLakeFile).c_str(), (lake / kLakeFile).c_str());
+  }
   const bool lake_existed = fs::exists(lake / kLakeFile, ec);
   const bool migrate = !lake_existed && fs::exists(lake / kLegacyCatalog, ec);
   if (make_dir(lake, err) || make_dir(lake / kTmpDir, err)) return true;
@@ -266,7 +285,7 @@ bool Lake::open(const LakeSettings &s, std::string *err) {
   // DuckLake data files without their catalog: the catalog was lost. A new
   // empty lake would hide the only copy of archived rows.
   if (!lake_existed && !migrate && !dir_is_empty(lake / kLegacyDataDir)) {
-    *err = "the DuckDB lake " + (lake / kLakeFile).string() +
+    *err = "the DuckDB repository " + (lake / kLakeFile).string() +
            " does not exist and the DuckLake catalog " +
            (lake / kLegacyCatalog).string() + " is missing, but " +
            (lake / kLegacyDataDir).string() +
@@ -297,7 +316,7 @@ bool Lake::open(const LakeSettings &s, std::string *err) {
 
   m_path = lake.string();
   DUCKDB_LOG_INFO(
-      "DuckDB lake: file=%s, created=%s, executor threads=%u",
+      "DuckDB repository: file=%s, created=%s, executor threads=%u",
       (lake / kLakeFile).c_str(),
       lake_existed ? "no" : (migrate ? "migrated from DuckLake" : "yes"),
       s.executor_threads);
@@ -350,7 +369,7 @@ bool Lake::open_duckdb(const std::string &lake, const LakeSettings &s,
   }
   // A native DuckDB file stores no path: a moved lake opens as it is.
   if (run("ATTACH '" + file + "' AS lake", &msg)) {
-    *err = "cannot attach the DuckDB lake " + file + ": " + msg;
+    *err = "cannot attach the DuckDB repository " + file + ": " + msg;
     close_duckdb();
     return true;
   }
@@ -361,14 +380,14 @@ bool Lake::open_duckdb(const std::string &lake, const LakeSettings &s,
       run(applied_position_create_sql(), &msg) ||
       // From now on DuckDB can read and write files only inside the lake
       // directory and cannot reach the network. The lake directory holds
-      // everything DuckDB needs: lake.duckdb and its WAL, and tmp/
+      // everything DuckDB needs: repository.duckdb and its WAL, and tmp/
       // (spills). Extensions are linked statically, so no
       // extension directory is needed. The allowed directory must be set
       // before external access is disabled; DuckDB refuses it afterwards.
       run("SET allowed_directories = ['" + lake + "/']", &msg) ||
       run("SET enable_external_access = false", &msg) ||
       Registry::instance().reload(m_admin, &msg)) {
-    *err = "cannot prepare the DuckDB lake: " + msg;
+    *err = "cannot prepare the DuckDB repository: " + msg;
     close_duckdb();
     return true;
   }
@@ -378,8 +397,9 @@ bool Lake::open_duckdb(const std::string &lake, const LakeSettings &s,
 
 // A DuckLake lake of an earlier version (catalog.ducklake + data/): copied
 // once into the native file (2026-11-25). The copy goes to
-// lake.duckdb.migrating, every table's row count is compared, and only then
-// is it renamed to lake.duckdb and the catalog to catalog.ducklake.migrated;
+// repository.duckdb.migrating, every table's row count is compared, and only
+// then is it renamed to repository.duckdb and the catalog to
+// catalog.ducklake.migrated;
 // data/ is left for the DBA to remove. A crash before the rename leaves only
 // the .migrating file, removed at the next start, which migrates again.
 // A DuckLake lake moved to another path (its catalog stores the old data
@@ -389,7 +409,7 @@ bool Lake::migrate_from_ducklake(const std::string &lake,
   const std::string catalog = lake + "/" + kLegacyCatalog;
   const std::string data = lake + "/" + kLegacyDataDir + "/";
   const std::string target = lake + "/" + kMigratingFile;
-  DUCKDB_LOG_INFO("DuckDB lake: migrating the DuckLake lake %s to %s/%s",
+  DUCKDB_LOG_INFO("DuckDB repository: migrating the DuckLake lake %s to %s/%s",
                   catalog.c_str(), lake.c_str(), kLakeFile);
   std::string msg;
   const std::string attach = "ATTACH 'ducklake:" + catalog +
@@ -466,7 +486,7 @@ bool Lake::migrate_from_ducklake(const std::string &lake,
   if (fs::exists(catalog + ".wal"))
     fs::rename(catalog + ".wal", catalog + ".migrated.wal", ec);
   DUCKDB_LOG_WARNING(
-      "DuckDB lake migrated from DuckLake to %s/%s: %zu tables, %llu rows "
+      "DuckDB repository migrated from DuckLake to %s/%s: %zu tables, %llu rows "
       "checked. The old catalog is now %s.migrated; the old data files in %s "
       "are no longer used and can be removed after a check",
       lake.c_str(), kLakeFile, tables.size(), rows, catalog.c_str(),

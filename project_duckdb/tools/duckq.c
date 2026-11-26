@@ -16,8 +16,8 @@
 /*
   duckq: runs SQL statements on a DuckDB database with the extensions the
   plugin uses (JSON, ICU, core functions; DuckLake and Parquet for lakes of
-  versions before 2026-11-25) registered, to inspect the lake file while the
-  server is stopped (DuckDB locks lake.duckdb).
+  versions before 2026-11-25) registered, to inspect the repository file while the
+  server is stopped (DuckDB locks repository.duckdb).
 
   Build (release or debug build directory B):
     L=$B/extra/duckdb/install/lib
@@ -26,7 +26,7 @@
 
   Example (read only):
     ./duckq :memory: \
-      "ATTACH '<lake>/lake.duckdb' AS lake (READ_ONLY)" \
+      "ATTACH '<dir>/repository.duckdb' AS lake (READ_ONLY)" \
       "SELECT column_name FROM duckdb_columns() WHERE database_name = 'lake' AND table_name = 'dim'"
 */
 #include <stdio.h>

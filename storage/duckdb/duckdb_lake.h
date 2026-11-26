@@ -50,7 +50,8 @@ struct LakeSettings {
 
 /**
   The DuckDB instance of this server, in memory, with the lake attached as
-  "lake": a native DuckDB database file, lake.duckdb (2026-11-25; DuckLake
+  "lake": a native DuckDB database file, repository.duckdb (2026-11-25,
+  named lake.duckdb until 2026-11-26; DuckLake
   before, migrated at the first start). There is one per process. Callers hold mutex() around open(), close()
   and the setters. Every DuckDB call runs on an executor thread. All functions
   follow the server convention: true means error, with the message in *err.

@@ -213,8 +213,8 @@ The three plugins in the library:
 | `DUCKDB_TABLES` | The table `INFORMATION_SCHEMA.DUCKDB_TABLES` (section 11). |
 
 The lake (where DuckDB keeps the copies) is the directory
-`duckdb_data_path`: one native DuckDB database file, `lake.duckdb` (with its
-WAL `lake.duckdb.wal`), and `tmp/` for spills.
+`duckdb_data_path`: one native DuckDB database file, `repository.duckdb` (with its
+WAL `repository.duckdb.wal`), and `tmp/` for spills.
 
 Create the tutorial database:
 
@@ -1197,7 +1197,7 @@ replica.
 
 ## 13. Read the lake when MySQL is down
 
-The copies are an ordinary DuckDB database file, `lake.duckdb`: with MySQL
+The copies are an ordinary DuckDB database file, `repository.duckdb`: with MySQL
 stopped, DuckDB reads it directly, for example to get data out while the
 server cannot start. The tool `duckq` (`project_duckdb/tools/duckq.c`) is
 built from the same DuckDB libraries as the plugin, so the versions match.
@@ -1219,7 +1219,7 @@ While mysqld runs it holds a lock on the lake file, and the attach fails with
 ```bash
 "$BASE/stop"
 LAKE="$BASE/duckdb_data"
-A="ATTACH '$LAKE/lake.duckdb' AS lake (READ_ONLY)"
+A="ATTACH '$LAKE/repository.duckdb' AS lake (READ_ONLY)"
 
 # the tables in the lake and their state
 "$BASE/duckq" :memory: "$A" \

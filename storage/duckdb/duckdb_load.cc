@@ -1092,7 +1092,7 @@ bool unload_table_from_lake(THD *thd, const char *db, const char *table,
   }
 
   // Classic copy, or a history copy with the confirmation: we drop it.
-  // DuckDB reuses its space in lake.duckdb after the next checkpoint.
+  // DuckDB reuses its space in repository.duckdb after the next checkpoint.
   if (drop_copy(*con, db, table, &err)) return report(err);
   if (drop_history) {
     DUCKDB_LOG_WARNING(

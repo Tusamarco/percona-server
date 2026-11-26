@@ -13,7 +13,7 @@ no DuckDB writes), 4b row decoder and collapse, 4c-1 batches, committer,
 applied position, recovery, gap handling and repoint, 4c-2 large
 transactions in pieces, 4d DDL, compressed payloads, MTR.
 
-(2026-11-25: storage moved to a native DuckDB file, `lake.duckdb`; design
+(2026-11-25: storage moved to a native DuckDB file, `repository.duckdb`; design
 document, Storage. Each "DuckLake transaction" below is now a DuckDB
 transaction on that file; catalog snapshots, inlining and Parquet files no
 longer apply.)

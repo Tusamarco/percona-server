@@ -61,7 +61,7 @@ DEALLOCATE PREPARE s;
 SET GLOBAL duckdb_enable = OFF;
 SET SESSION duckdb_history_scope = FULL;
 SELECT COUNT(*) FROM hist;
-ERROR HY000: duckdb_history_scope=FULL: the DuckDB lake is not open (duckdb_enable=OFF?): test.hist cannot be read with its archived rows
+ERROR HY000: duckdb_history_scope=FULL: the DuckDB repository is not open (duckdb_enable=OFF?): test.hist cannot be read with its archived rows
 SET SESSION duckdb_history_scope = LIVE;
 SET GLOBAL duckdb_enable = ON;
 REVOKE DUCKDB_HISTORY_READER ON *.* FROM root@localhost;

@@ -462,7 +462,7 @@ MYSQL_SYSVAR_BOOL(lake_relocate, srv_lake_relocate, PLUGIN_VAR_OPCMDARG,
 MYSQL_SYSVAR_STR(data_path, srv_data_path,
                  PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG |
                      PLUGIN_VAR_MEMALLOC,
-                 "Directory of the DuckDB lake. Empty means "
+                 "Directory of the DuckDB repository. Empty means "
                  "<datadir>/duckdb_data; a relative path is resolved against "
                  "the datadir.",
                  nullptr, nullptr, "");
@@ -479,7 +479,7 @@ MYSQL_SYSVAR_UINT(threads, srv_threads, PLUGIN_VAR_RQCMDARG,
 
 MYSQL_SYSVAR_BOOL(encryption, srv_encryption,
                   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
-                  "Encrypt the DuckDB lake. Not supported in this version.",
+                  "Encrypt the DuckDB repository. Not supported in this version.",
                   nullptr, nullptr, false);
 
 // The update callback is cheap: it only sets a flag of the reader.
@@ -1405,7 +1405,7 @@ mysql_declare_plugin(duckdb){
         &duckdb_se::i_s_tables_descriptor,
         "DUCKDB_TABLES",
         "Marco Tusa",
-        "INFORMATION_SCHEMA.DUCKDB_TABLES: the tables in the DuckDB lake",
+        "INFORMATION_SCHEMA.DUCKDB_TABLES: the tables in the DuckDB repository",
         PLUGIN_LICENSE_GPL,
         duckdb_se::i_s_tables_init,
         nullptr,
