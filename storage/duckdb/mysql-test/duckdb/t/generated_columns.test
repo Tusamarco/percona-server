@@ -1,0 +1,55 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# Generated columns and expression defaults (2026-11-26, T4): the copy holds
+# the values InnoDB computed (the load reads them, the row images in the
+# binary log carry them, virtual ones too). The engine declares
+# HA_GENERATED_COLUMNS / HA_SUPPORTS_DEFAULT_EXPRESSION; before, the server
+# could not open the secondary table and every query on it failed (3106).
+--source ../include/have_duckdb.inc
+CREATE TABLE gc (id INT PRIMARY KEY, a INT, b DECIMAL(10,2) DEFAULT (a * 1.5),
+  v INT AS (a * 2) VIRTUAL, s INT AS (a + 1) STORED,
+  j JSON, jv VARCHAR(10) AS (j->>'$.k') VIRTUAL,
+  KEY kv (v)) SECONDARY_ENGINE = duckdb;
+INSERT INTO gc (id, a, j) VALUES (1, 10, '{"k": "x"}'), (2, 20, NULL), (3, NULL, '{"k": "y"}');
+ALTER TABLE gc SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+--let $query= SELECT * FROM gc ORDER BY id
+--source ../include/duckdb_compare.inc
+
+--echo # DML: the applier writes the values from the row images
+UPDATE gc SET a = 11 WHERE id = 1;
+INSERT INTO gc (id, a, j) VALUES (4, 40, '{"k": "z"}');
+DELETE FROM gc WHERE id = 2;
+UPDATE gc SET j = '{"k": "w"}' WHERE id = 3;
+--source ../include/wait_applier.inc
+--let $query= SELECT * FROM gc ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id, v + s, jv FROM gc WHERE v > 20 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM gc WHERE a * 2 = 22 ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT jv, COUNT(*), SUM(b) FROM gc GROUP BY jv ORDER BY jv
+--source ../include/duckdb_compare.inc
+
+--echo # A DDL adding a generated column: the copy is refreshed
+ALTER TABLE gc ADD COLUMN w INT AS (s * 10) VIRTUAL;
+--source ../include/wait_applier.inc
+--let $query= SELECT id, w FROM gc ORDER BY id
+--source ../include/duckdb_compare.inc
+SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES WHERE TABLE_NAME = 'gc';
+
+DROP TABLE gc;
+--source ../include/cleanup.inc

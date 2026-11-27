@@ -699,6 +699,34 @@ TEST(DuckdbDdl, AlterWithoutChangeToTheCopy) {
   }
 }
 
+// DML logged as a statement (binlog_format STATEMENT / MIXED): the tables it
+// writes, so their copies are marked stale (2026-11-26).
+std::string dml(const char *q) {
+  std::string out;
+  for (const TableName &t : parse_dml_targets(q, "w", false))
+    out += (out.empty() ? "" : ",") + t.db + "." + t.table;
+  return out;
+}
+
+TEST(DuckdbDdl, DmlTargets) {
+  EXPECT_EQ(dml("INSERT INTO t VALUES (1)"), "w.t");
+  EXPECT_EQ(dml("insert low_priority ignore into `d`.`t` (a) select 1"),
+            "d.t");
+  EXPECT_EQ(dml("REPLACE t SET a = 1"), "w.t");
+  EXPECT_EQ(dml("UPDATE t SET a = 1 WHERE b = 2"), "w.t");
+  EXPECT_EQ(dml("UPDATE IGNORE t1 JOIN d.t2 ON t1.a = t2.a SET t1.b = 1"),
+            "w.t1,d.t2");
+  EXPECT_EQ(dml("DELETE FROM t WHERE a = 1"), "w.t");
+  EXPECT_EQ(dml("DELETE t1 FROM t1 JOIN t2 ON t1.a = t2.a WHERE t2.b = 1"),
+            "w.t1,w.t1,w.t2");
+  EXPECT_EQ(dml("LOAD DATA INFILE 'f' INTO TABLE d.t"), "d.t");
+  EXPECT_EQ(dml("/* c */ DELETE QUICK FROM t"), "w.t");
+  // Not DML: nothing.
+  EXPECT_EQ(dml("ALTER TABLE t ADD COLUMN c INT"), "");
+  EXPECT_EQ(dml("CREATE TABLE t (a INT)"), "");
+  EXPECT_EQ(dml("SAVEPOINT s"), "");
+}
+
 TEST(DuckdbDdl, ColumnRenames) {
   DdlStatement d = parse_ddl(
       "ALTER TABLE t RENAME COLUMN note TO remark, CHANGE COLUMN qty quantity "

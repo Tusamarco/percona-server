@@ -75,7 +75,7 @@ bool srv_lake_relocate = true;
 unsigned long long srv_memory_limit = 0;  // 0: not set
 unsigned int srv_threads = 0;             // 0: not set
 bool srv_encryption = false;
-unsigned int srv_executor_threads = 4;
+unsigned int srv_executor_threads = 0;  // 0: one per core
 unsigned long long srv_executor_stack_size = 8ULL << 20;
 bool srv_apply_debug_log = false;
 unsigned long long srv_apply_batch_max_trx = 1000;
@@ -119,9 +119,21 @@ unsigned int max_threads() {
   return std::max(1U, std::thread::hardware_concurrency());
 }
 
+// duckdb_executor_threads = 0 (the default since 2026-11-26): one per core.
+// The pool runs every DuckDB call, an offloaded query holds a thread while
+// DuckDB computes its first rows: with 4 (the old default) a fifth
+// concurrent query waited.
+unsigned int executor_threads_value(unsigned int v) {
+  return v == 0 ? max_threads() : v;
+}
+
 LakeSettings lake_settings() {
-  return {srv_data_path,        srv_memory_limit,        srv_threads,
-          srv_executor_threads, srv_executor_stack_size, srv_lake_relocate};
+  return {srv_data_path,
+          srv_memory_limit,
+          srv_threads,
+          executor_threads_value(srv_executor_threads),
+          srv_executor_stack_size,
+          srv_lake_relocate};
 }
 
 // The server calls our entry points (handler methods, variable callbacks,
@@ -287,7 +299,7 @@ int check_executor_threads_impl(MYSQL_THD, SYS_VAR *, void *save,
                            st_mysql_value *value) {
   long long v;
   if (value->val_int(value, &v) != 0) return 1;
-  if (v < 1 || v > static_cast<long long>(max_threads())) {
+  if (v < 0 || v > static_cast<long long>(max_threads())) {
     my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "duckdb_executor_threads",
              std::to_string(v).c_str());
     return 1;
@@ -296,7 +308,8 @@ int check_executor_threads_impl(MYSQL_THD, SYS_VAR *, void *save,
   std::string err;
   // When the lake is closed the pool is stopped: the value is used at the next
   // open.
-  if (Executor::instance().resize(static_cast<unsigned int>(v), &err)) {
+  if (Executor::instance().resize(
+          executor_threads_value(static_cast<unsigned int>(v)), &err)) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
     return 1;
   }
@@ -669,8 +682,10 @@ MYSQL_SYSVAR_ENUM(apply_gap_action, srv_apply_gap_action, PLUGIN_VAR_RQCMDARG,
 
 MYSQL_SYSVAR_UINT(executor_threads, srv_executor_threads, PLUGIN_VAR_RQCMDARG,
                   "Threads that run DuckDB calls, from 1 to the number of "
-                  "cores. DuckDB never runs on MySQL connection threads.",
-                  check_executor_threads, nullptr, 4, 1, 65536, 0);
+                  "cores; 0 (default) is one per core. An offloaded query "
+                  "holds one while DuckDB computes its first rows. DuckDB "
+                  "never runs on MySQL connection threads.",
+                  check_executor_threads, nullptr, 0, 0, 65536, 0);
 
 MYSQL_SYSVAR_ULONGLONG(executor_stack_size, srv_executor_stack_size,
                        PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
@@ -903,6 +918,24 @@ int show_applied_gtid(THD *, SHOW_VAR *var, char *buff) {
   return show_text(var, buff, safe_status().applied_gtid);
 }
 
+int show_executor_queue_waits(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->scope = SHOW_SCOPE_GLOBAL;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) =
+      static_cast<longlong>(Executor::instance().queue_waits());
+  return 0;
+}
+
+int show_executor_queue_wait_us(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->scope = SHOW_SCOPE_GLOBAL;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) =
+      static_cast<longlong>(Executor::instance().queue_wait_us());
+  return 0;
+}
+
 int show_executor_tasks(THD *, SHOW_VAR *var, char *buff) {
   var->type = SHOW_LONGLONG;
   var->scope = SHOW_SCOPE_GLOBAL;
@@ -926,6 +959,12 @@ SHOW_VAR duckdb_status_variables[] = {
      SHOW_SCOPE_GLOBAL},
     {"duckdb_executor_tasks", reinterpret_cast<char *>(&show_executor_tasks),
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_executor_queue_waits",
+     reinterpret_cast<char *>(&show_executor_queue_waits), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_executor_queue_wait_us",
+     reinterpret_cast<char *>(&show_executor_queue_wait_us), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"duckdb_apply_reader_state", reinterpret_cast<char *>(&show_reader_state),
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_apply_reader_file", reinterpret_cast<char *>(&show_reader_file),
@@ -1097,8 +1136,8 @@ int duckdb_init_impl(MYSQL_PLUGIN p) {
     return fail();
   }
   if (srv_executor_threads > max_threads()) {
-    // The default (4) can exceed the cores of a small machine: we lower it
-    // instead of refusing to load.
+    // A configured value can exceed the cores of a smaller machine: we
+    // lower it instead of refusing to load.
     DUCKDB_LOG_WARNING(
         "duckdb_executor_threads=%u is above the number of cores; using %u",
         srv_executor_threads, max_threads());
@@ -1304,7 +1343,13 @@ int ha_duckdb::info(unsigned int flags) {
 
 handler::Table_flags ha_duckdb::table_flags() const {
   // No index access; indexes are only used for cost estimates.
-  return HA_NO_INDEX_ACCESS;
+  // Generated columns and expression defaults (2026-11-26): the copy holds
+  // the values InnoDB computed (the load reads them, the binary log row
+  // image carries them, virtual ones too); without these flags the server
+  // cannot open the secondary table (sql/table.cc, open_table_from_share)
+  // and every query on such a table failed with error 3106 / 3774.
+  return HA_NO_INDEX_ACCESS | HA_GENERATED_COLUMNS |
+         HA_SUPPORTS_DEFAULT_EXPRESSION;
 }
 
 unsigned long ha_duckdb::index_flags(unsigned int idx, unsigned int part,

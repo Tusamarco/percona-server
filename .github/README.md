@@ -106,11 +106,12 @@ The function-by-function version of both paths is in the
 | Performance work against AliSQL and MariaDB: native DuckDB storage (`repository.duckdb`), correlated subqueries as LATERAL, NOT EXISTS / EXISTS inside OR as anti / semi joins, fewer casts, CHAR compared without rtrim | done (2026-11-25/26) — see [Performance](#performance) |
 | FULL scope guard (DWL-07) | done |
 | TPC-H, 22 queries (correctness check at scale factor 0.01) | **22 of 22 offloaded with identical results**, none wrong — [details](/project_duckdb/tpch/README.md); all 22 also run offloaded in HammerDB TPROC-H at scale factor 100 on a release build |
-| Tests | 39 MTR tests, each offloaded query run with offload OFF and FORCED and the results compared; 41 unit tests |
+| Tests | 44 MTR tests, each offloaded query run with offload OFF and FORCED and the results compared; 42 unit tests |
 
 Not yet supported:
 - Window functions, ROLLUP, GROUP_CONCAT.
-- Functions on TIMESTAMP columns (they depend on the session time zone).
+- Functions on TIMESTAMP columns when the session time zone has daylight
+  saving (UTC and fixed offsets are translated).
 - Functions and comparisons on JSON and spatial columns (the columns
   themselves are loaded and can be selected).
 - VECTOR columns, DECIMAL columns above precision 38, tables without a
@@ -202,6 +203,11 @@ queries duckdb_SE is the fastest of the three:
 | 16 | **283.8** | failed | failed | — | — | all |
 
 Notes:
+- **Pending verification of the AliSQL and MariaDB runs** (2026-11-26): with
+  `mysql_raise_query_error false`, HammerDB logs a query that failed as
+  completed in a few milliseconds. The AliSQL and MariaDB logs are being
+  checked for errors and their runs repeated with the corrected engine
+  detection; their numbers may change.
 - Q15 at 0.006 s on AliSQL and MariaDB is not a real execution at this
   scale (it aggregates three months of LINEITEM twice); it is left out of
   the sums, the ratios and the fastest-engine counts.

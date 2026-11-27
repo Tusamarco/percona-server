@@ -20,7 +20,7 @@ MTR_SHUTDOWN_TIMEOUT=120 ./mtr --suite=<source>/storage/duckdb/mysql-test/duckdb
 (`$MTR_BINDIR`, set by the build's `mtr` wrapper); `my.cnf` sets the binlog
 options the engine needs and a small DuckDB (512M, 2 threads). A debug build
 needs about 1.5 hours for the suite with `--parallel=2` (an HDD machine),
-mostly loads and DuckLake commits. On a busy machine a test can exceed MTR's
+mostly loads and DuckDB commits. On a busy machine a test can exceed MTR's
 default 15-minute limit: add `--testcase-timeout=45`.
 
 ## Layout
@@ -29,11 +29,12 @@ default 15-minute limit: add `--testcase-timeout=45`.
 |---|---|
 | `my.cnf`, `t/suite.opt` | server options, plugin |
 | `include/have_duckdb.inc` | skips without the plugin; suppressions for the plugin's expected warnings |
-| `include/wait_applier.inc` | waits until the applier is idle at the binary log end (a debug build's DuckLake commit can exceed the freshness wait) |
+| `include/wait_applier.inc` | waits until the applier is idle at the binary log end (a debug build's DuckDB commit can exceed the freshness wait) |
 | `include/duckdb_compare.inc` | `$query` with OFF and FORCED: results compared (`--diff_files`), the FORCED run must have run in DuckDB |
 | `include/duckdb_refused.inc` | `$query` refused with FORCED (reason recorded), ON gives the InnoDB rows |
 | `include/tables_*.inc` | test tables (as `project_duckdb/offload_queries/duckdb_offload_setup.sql`) |
 | `include/cleanup.inc` | drops the test tables, discards stale history copies |
+| `include/duckdb_plan_shape.inc` | the shape of the DuckDB statement for `$query` (EXPLAIN notes): cross product, DISTINCT derived table, NOT EXISTS, LATERAL |
 
 ## Tests
 
@@ -59,6 +60,22 @@ default 15-minute limit: add `--testcase-timeout=45`.
 | `offload_yb` | YEAR and BIT: load, applier, results (YEAR columns zero-filled, BIT as bytes), unsigned arithmetic, refusals (36) |
 | `offload_refusals` | the refusal lists `project_duckdb/offload_queries/duckdb_offload_*_refusals.sql` |
 | `offload_counters` | SUM / AVG of FLOAT and DOUBLE (`duckdb_offload_float_aggregates`), FLOAT sent as FLOAT, the offload counters (runs, EXPLAIN, waits), `duckdb_offload_wait_timeout_ms`, the user's `optimizer_switch` kept around offload |
+
+| `binlog_safety` | writes the binary log would not carry in full refused on tables with a copy (sql_log_bin = 0, binlog_format STATEMENT / MIXED, binlog_row_image MINIMAL / NOBLOB); with the guard skipped (debug point) the applier marks the copy stale; binlog_order_commits switched OFF stops the applier (2026-11-26) |
+| `binlog_reset` | RESET BINARY LOGS AND GTIDS while copies are loaded; repoint to FIRST |
+| `ddl_wait` | T0: the statement after a DDL waits for the copy refresh, with progress; timeout and KILL |
+| `json_geometry` | JSON and spatial columns: load, applier (binary JSON as text), select / IS NULL / COUNT offloaded, functions refused |
+| `offload_params` | T1: prepared statement parameters, stored program and user variables |
+| `offload_exec_errors` | T2: a DuckDB error at the first chunk falls back to InnoDB (debug point) |
+| `offload_now`, `offload_cast`, `offload_date_format` | T3: NOW() family, CAST / CONVERT, DATE_FORMAT |
+| `offload_join_distinct`, `offload_group_expr` | grouped strings in joins and grouped string expressions, checked per group |
+| `offload_exists_pair` | EXISTS and NOT EXISTS on the same column (TPC-H Q21), NOT IN; the DuckDB plan checked (no cross product, anti join) |
+| `offload_lateral` | correlated scalar / ALL / ANY subqueries as LATERAL; uncorrelated IN with GROUP BY left as it is |
+| `offload_char_or` | CHAR compared without rtrim (load under PAD_CHAR_TO_FULL_LENGTH), constant SUBSTRING, EXISTS / IN / NOT EXISTS inside OR |
+| `offload_timestamp_fn` | functions, DATE_FORMAT, arithmetic and CAST on TIMESTAMP columns under UTC and fixed-offset session zones; a zone with daylight saving refused (2026-11-26) |
+| `offload_edge_strings` | D1: edge strings (combining marks, emoji modifiers, ß, Turkish i, trailing spaces vs tabs) under 8 collations: equality, ordering, grouping, distinct, MIN / MAX, joins |
+| `generated_columns` | VIRTUAL and STORED generated columns, expression defaults: load, applier, queries, DDL refresh |
+| `client_charsets` | results to clients with latin1, utf8mb3, cp1251 and no conversion |
 
 Not in MTR (manual-test-plan.md): restarts with special options and long
 runs: startup failures (11), binlog gaps (15), replica with a source (18), the applier

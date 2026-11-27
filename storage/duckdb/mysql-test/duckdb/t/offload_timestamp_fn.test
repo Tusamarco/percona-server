@@ -1,0 +1,87 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# Functions on TIMESTAMP columns (T3 step 4, 2026-11-26): DuckDB stores
+# TIMESTAMP in UTC, MySQL's date functions use the value in the session
+# time zone. With UTC or a fixed offset ('+05:30') the column is shifted by
+# the offset; zones with daylight saving (named zones) run on InnoDB.
+--source ../include/have_duckdb.inc
+SET SESSION time_zone = '+00:00';
+CREATE TABLE tz (id INT PRIMARY KEY, ts TIMESTAMP(3) NULL, t0 TIMESTAMP NULL, d DATE) SECONDARY_ENGINE = duckdb;
+INSERT INTO tz VALUES (1, '2024-01-01 00:30:00.125', '2024-01-01 00:30:00', '2024-01-01'),
+  (2, '2023-12-31 23:30:00.500', '2023-12-31 23:30:00', '2023-12-31'),
+  (3, '2024-02-29 18:45:59.999', '2024-02-29 18:45:59', '2024-03-01'),
+  (4, '2024-06-30 05:00:00', '2024-06-30 05:00:00', '2024-06-30'),
+  (5, NULL, NULL, NULL);
+ALTER TABLE tz SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+--let $q1= SELECT id, DATE(ts), YEAR(ts), MONTH(ts), DAYOFMONTH(ts), HOUR(ts), MINUTE(ts), EXTRACT(MICROSECOND FROM ts) FROM tz ORDER BY id
+--let $q2= SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(t0, '%W %d %M %Y') FROM tz ORDER BY id
+--let $q3= SELECT id, ts + INTERVAL 1 DAY, DATE_SUB(t0, INTERVAL 2 HOUR), DATEDIFF(ts, d), LAST_DAY(ts) FROM tz ORDER BY id
+--let $q4= SELECT id, CAST(ts AS DATE), CAST(ts AS DATETIME(3)), CAST(t0 AS CHAR) FROM tz ORDER BY id
+--let $q5= SELECT DATE(ts) AS day, COUNT(*) FROM tz GROUP BY day ORDER BY day
+--let $q6= SELECT id FROM tz WHERE DATE(ts) = '2024-01-01' OR YEAR(t0) = 2023 ORDER BY id
+
+--echo # UTC
+--let $query= $q1
+--source ../include/duckdb_compare.inc
+--let $query= $q2
+--source ../include/duckdb_compare.inc
+--let $query= $q3
+--source ../include/duckdb_compare.inc
+--let $query= $q4
+--source ../include/duckdb_compare.inc
+--let $query= $q5
+--source ../include/duckdb_compare.inc
+--let $query= $q6
+--source ../include/duckdb_compare.inc
+--echo # +05:30 (dates move forward across midnight)
+SET SESSION time_zone = '+05:30';
+--let $query= $q1
+--source ../include/duckdb_compare.inc
+--let $query= $q2
+--source ../include/duckdb_compare.inc
+--let $query= $q3
+--source ../include/duckdb_compare.inc
+--let $query= $q4
+--source ../include/duckdb_compare.inc
+--let $query= $q5
+--source ../include/duckdb_compare.inc
+--let $query= $q6
+--source ../include/duckdb_compare.inc
+--echo # -08:00 (dates move back, across the year end)
+SET SESSION time_zone = '-08:00';
+--let $query= $q1
+--source ../include/duckdb_compare.inc
+--let $query= $q3
+--source ../include/duckdb_compare.inc
+--let $query= $q5
+--source ../include/duckdb_compare.inc
+--let $query= $q6
+--source ../include/duckdb_compare.inc
+--echo # A zone with daylight saving: refused (InnoDB answers with ON)
+SET SESSION time_zone = 'MET';
+--let $query= SELECT id, DATE(ts) FROM tz ORDER BY id
+--source ../include/duckdb_refused.inc
+--echo # SYSTEM: translated only when the system zone really is UTC (MTR runs
+--echo # with TZ=GMT-3: named GMT, three hours east): refused here
+SET SESSION time_zone = 'SYSTEM';
+--let $query= SELECT id, DATE(ts) FROM tz ORDER BY id
+--source ../include/duckdb_refused.inc
+SET SESSION time_zone = DEFAULT;
+
+DROP TABLE tz;
+--source ../include/cleanup.inc

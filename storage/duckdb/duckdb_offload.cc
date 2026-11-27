@@ -65,6 +65,7 @@
 #include "sql/table.h"
 #include "sql/item_timefunc.h"  // Item_extract, Item_func_add_interval
 #include "sql/sql_locale.h"     // MY_LOCALE (lc_time_names)
+#include "sql/mysqld.h"  // system_time_zone_dst_on / _off
 #include "sql/tztime.h"
 #include "storage/duckdb/duckdb_binlog_reader.h"
 #include "storage/duckdb/duckdb_collation.h"
@@ -624,6 +625,7 @@ class Generator {
   bool exact_division(const std::string &a, int f1, const std::string &b,
                       int f2, int round_to, int a_digits, std::string *out);
   bool temporal_arg(Item *item, std::string *out);
+  bool local_timestamp(Item *a, std::string *out);
   bool cast(Item_func *fn, std::string *out);
   bool order_key(Item *item, std::string *out);
   bool enum_index(Item *item, std::string *out);
@@ -1297,10 +1299,65 @@ bool Generator::unsigned_arith(Item *left, Item *right, char op,
   return false;
 }
 
-// The argument of a date function: a DATE or DATETIME column or expression.
-// TIMESTAMP (UTC in DuckDB) and strings are refused.
+// The session time zone as a fixed offset from UTC, in seconds: UTC, an
+// offset ('+02:00'), or SYSTEM when the server's system zone is UTC.
+// false for zones with daylight saving (named zones, other system zones).
+bool session_fixed_offset(THD *thd, long *seconds) {
+  const Time_zone *tz = thd->variables.time_zone;
+  if (tz == nullptr) return false;
+  switch (tz->get_timezone_type()) {
+    case Time_zone::TZ_UTC:
+      *seconds = 0;
+      return true;
+    case Time_zone::TZ_OFFSET:
+      *seconds = tz->get_timezone_offset();
+      return true;
+    case Time_zone::TZ_SYSTEM: {
+      // The name alone is not enough: TZ=GMT-3 is named "GMT" and is three
+      // hours east of UTC (MTR runs with it). The system zone must also be
+      // at offset 0 in January and July (no daylight saving).
+      if ((strcmp(system_time_zone_dst_off, "UTC") != 0 &&
+           strcmp(system_time_zone_dst_off, "GMT") != 0) ||
+          strcmp(system_time_zone_dst_on, system_time_zone_dst_off) != 0)
+        return false;
+      for (const time_t t : {static_cast<time_t>(1704067200),    // 2024-01-01
+                             static_cast<time_t>(1719792000)}) {  // 2024-07-01
+        struct tm local;
+        if (localtime_r(&t, &local) == nullptr || local.tm_gmtoff != 0)
+          return false;
+      }
+      *seconds = 0;
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+// A TIMESTAMP column or expression (stored in UTC in DuckDB) as the value
+// in the session time zone, which MySQL's date functions use: the UTC
+// value plus the zone's fixed offset (T3 step 4, 2026-11-26). Zones with
+// daylight saving are refused (the offset changes with the date; MySQL's
+// zone tables and DuckDB's ICU data could also differ).
+bool Generator::local_timestamp(Item *a, std::string *out) {
+  long offset = 0;
+  if (!session_fixed_offset(m_thd, &offset))
+    return refuse("timestamp_function_time_zone");
+  std::string e;
+  if (expr(a, &e)) return true;
+  *out = offset == 0 ? e
+                     : "(" + e + " + INTERVAL (" + std::to_string(offset) +
+                           ") SECOND)";
+  return false;
+}
+
+// The argument of a date function: a DATE or DATETIME column or expression,
+// or a TIMESTAMP one in the session time zone (local_timestamp()). Strings
+// are refused.
 bool Generator::temporal_arg(Item *item, std::string *out) {
   Item *a = item->real_item();
+  if (a->data_type() == MYSQL_TYPE_TIMESTAMP && !is_constant(a))
+    return local_timestamp(a, out);
   if (!is_date_or_datetime(a->data_type()))
     return refuse("date_function_argument");
   // A constant of DATE / DATETIME type (NOW(), CURDATE(), a parameter): its
@@ -2533,9 +2590,12 @@ bool Generator::cast(Item_func *fn, std::string *out) {
   const std::string name = fn->func_name();
   Item *a = fn->arguments()[0]->real_item();
   if (special_column(a) != SpecialColumn::NONE || is_string(a) ||
-      a->data_type() == MYSQL_TYPE_TIMESTAMP ||
+      (a->data_type() == MYSQL_TYPE_TIMESTAMP && is_constant(a)) ||
       a->data_type() == MYSQL_TYPE_TIME || a->data_type() == MYSQL_TYPE_JSON)
     return refuse("cast_source:" + name);
+  // A TIMESTAMP column casts as its value in the session time zone
+  // (temporal_arg(), as a DATETIME of the same precision).
+  const bool ts = a->data_type() == MYSQL_TYPE_TIMESTAMP;
   const bool integer = a->result_type() == INT_RESULT && !a->is_temporal();
   const bool decimal = a->result_type() == DECIMAL_RESULT && !a->is_temporal();
   const enum_field_types t = a->data_type();
@@ -2597,7 +2657,7 @@ bool Generator::cast(Item_func *fn, std::string *out) {
   }
   if (name == "cast_as_datetime") {
     if (t != MYSQL_TYPE_DATE &&
-        !(t == MYSQL_TYPE_DATETIME && a->decimals <= fn->decimals))
+        !((t == MYSQL_TYPE_DATETIME || ts) && a->decimals <= fn->decimals))
       return refuse("cast_source:" + name);
     if (temporal_arg(a, &e)) return true;
     *out = "CAST(" + e + " AS TIMESTAMP)";
@@ -2609,7 +2669,7 @@ bool Generator::cast(Item_func *fn, std::string *out) {
   if (integer || decimal) {
     if (source(&e)) return true;
   } else if (t == MYSQL_TYPE_DATE ||
-             (t == MYSQL_TYPE_DATETIME && a->decimals == 0)) {
+             ((t == MYSQL_TYPE_DATETIME || ts) && a->decimals == 0)) {
     if (temporal_arg(a, &e)) return true;
   } else {
     return refuse("cast_source:" + name);
@@ -4765,6 +4825,11 @@ bool optimize(THD *thd, LEX *lex) {
       "grouped_string_value_in_join: a group holds values that are equal "
       "under the collation but stored differently ('a' and 'a ', or 'A' and "
       "'a'); InnoDB shows one of them by its join order";
+  // From here DuckDB may run the statement (first run, first chunk): the
+  // session shows it (stage/duckdb/running query in DuckDB).
+  std::unique_ptr<RunningStage> running;
+  if (reason.empty() && !lex->is_explain())
+    running = std::make_unique<RunningStage>(thd);
   if (reason.empty() && (grouped_check || (wide && mode != DecimalOverflow::ERROR)) &&
       !lex->is_explain()) {
     std::string err;

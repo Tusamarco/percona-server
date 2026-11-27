@@ -2,6 +2,13 @@
 
 Affects: Percona Server 9.7 — Status: 4a verified (2026-11-10); 4b implemented, under test; 4c-1 implemented, under test (2026-11-10); 4c-2 implemented, under test (2026-11-11); 4d implemented, verified on a throwaway instance and on the reference instance (2026-11-11, after the deferred-refresh fix); MTR `applier`, `super_read_only`, `binlog_reset`, `ddl_wait`, `json_geometry` in the suite
 
+(2026-11-26, external review: a row event without every column in its
+images (binlog_row_image MINIMAL / NOBLOB in the writing session) and a DML
+logged as a statement on a loaded table mark that copy stale instead of
+applying NULLs or losing the change; `binlog_order_commits` switched OFF
+stops the applier. The guard refuses such writes at the source: DWL-07.
+MTR `binlog_safety`.)
+
 Step 4b: `duckdb_row_decoder.*` (packed row images to typed values, no THD,
 links with mysys and strings only), `duckdb_changes.*` (collapse per primary
 key, per transaction; per batch in 4c), status `duckdb_apply_rows_decoded` and

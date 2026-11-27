@@ -875,6 +875,29 @@ bool BinlogReader::handle_event(const unsigned char *data, const BinlogPos &at,
         const DdlStatement ddl =
             parse_ddl(query, db, lower_case_table_names != 0);
         if (!ddl.empty() && handle_ddl(ddl, at, err)) return true;
+        if (ddl.empty()) {
+          // DML logged as text (binlog_format STATEMENT or MIXED in the
+          // writing session; the guard refuses it on this server, a source
+          // may still send it): the change cannot be applied, so a copy it
+          // writes becomes stale. It belongs to its transaction: the
+          // transaction goes on (2026-11-26, external review).
+          const std::vector<TableName> targets =
+              parse_dml_targets(query, db, lower_case_table_names != 0);
+          if (!targets.empty()) {
+            for (const TableName &t : targets) {
+              TableState state;
+              if (Registry::instance().snapshot(t.db, t.table, &state))
+                ddl_failed(t,
+                           "a change logged as a statement (binlog_format = "
+                           "STATEMENT or MIXED in the writing session, GTID " +
+                               m_trx.gtid +
+                               "): only row events can be applied; write to "
+                               "tables with a DuckDB copy with binlog_format "
+                               "= ROW");
+            }
+            return false;
+          }
+        }
       }
       // COMMIT ends a transaction on non-XID engines; ROLLBACK discards it; a
       // DDL statement is a transaction of its own.
@@ -1007,6 +1030,31 @@ bool BinlogReader::handle_rows(const char *buf,
                "(binlog_row_value_options = PARTIAL_JSON); keep "
                "binlog_row_value_options empty for tables with a DuckDB copy");
     return false;
+  }
+  // Every column in each row image: a partial image (binlog_row_image =
+  // MINIMAL or NOBLOB in the writing session) leaves the other columns
+  // unknown, and applying it would set them to NULL. That copy becomes
+  // stale instead (2026-11-26, external review).
+  {
+    const size_t ncols = info.columns.size();
+    auto complete = [&](const std::vector<uint8_t> &bits) {
+      for (size_t i = 0; i < ncols; i++)
+        if (i / 8 >= bits.size() || ((bits[i / 8] >> (i % 8)) & 1) == 0)
+          return false;
+      return true;
+    };
+    const bool needs_before = ev.type() != bev::WRITE_ROWS_EVENT;
+    const bool needs_after = ev.type() != bev::DELETE_ROWS_EVENT;
+    if ((needs_before && !complete(ev.before_columns())) ||
+        (needs_after && !complete(ev.after_columns()))) {
+      ddl_failed(TableName{info.db, info.table},
+                 "partial row image in the binary log (binlog_row_image = "
+                 "MINIMAL or NOBLOB in the writing session, GTID " +
+                     m_trx.gtid +
+                     "); write to tables with a DuckDB copy with "
+                     "binlog_row_image = FULL");
+      return false;
+    }
   }
   const TableKey key{info.db, info.table};
   auto changes_it = m_trx.changes.find(key);
@@ -1388,6 +1436,36 @@ bool BinlogReader::maybe_commit(bool force, std::string *err) {
 
 bool BinlogReader::commit_pending(std::string *err) {
   if (!m_batch.pending) return false;
+  // Settings SECONDARY_LOAD required that are dynamic: changed later, the
+  // guarantees they give stop holding, so the applier stops with the
+  // reason rather than apply under them (2026-11-26, external review).
+  // binlog_format / binlog_row_image: the guard refuses such writes and the
+  // row events are checked (handle_rows()).
+  // (binlog_row_metadata: each Table_map event without column names
+  // already stops the applier, table_info().)
+  if (!opt_binlog_order_commits) {
+    *err = "binlog_order_commits is OFF: DuckDB could show a transaction "
+           "before InnoDB commits it. Set it back to ON, then SET GLOBAL "
+           "duckdb_enable = OFF and ON: the applier resumes from its applied "
+           "position";
+    return true;
+  }
+  {
+    // sync_binlog: a crash can then lose binary log transactions InnoDB
+    // committed, and history copies their archived rows; nothing to stop,
+    // so a warning when it changes.
+    static ulong warned_for = 1;
+    if (sync_binlog_period != warned_for) {
+      warned_for = sync_binlog_period;
+      if (sync_binlog_period != 1)
+        DUCKDB_LOG_WARNING(
+            "sync_binlog is %lu: after a crash the binary log can miss "
+            "transactions InnoDB committed, and DuckDB copies (history "
+            "copies: their archived rows) would miss them too; "
+            "SECONDARY_LOAD of history tables requires sync_binlog = 1",
+            sync_binlog_period);
+    }
+  }
   CommitStats stats;
   if (commit_batch(*m_con, m_batch, m_debug_log, &stats, err)) return true;
   {

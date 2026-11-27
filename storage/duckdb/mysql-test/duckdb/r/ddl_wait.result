@@ -3,6 +3,7 @@ SET NAMES utf8mb4;
 SELECT NAME, ENABLED FROM performance_schema.setup_instruments WHERE NAME LIKE 'stage/duckdb/%' ORDER BY NAME;
 NAME	ENABLED
 stage/duckdb/copy load	YES
+stage/duckdb/running query in DuckDB	YES
 stage/duckdb/waiting for applier	YES
 stage/duckdb/waiting for copy refresh	YES
 SELECT @@duckdb_ddl_wait_refresh, @@duckdb_ddl_wait_refresh_timeout;

@@ -40,6 +40,24 @@ namespace duckdb_se {
 /** Registers the Performance Schema stages (plugin init). */
 void register_progress_stages();
 
+/**
+  While it lives, the session shows the Performance Schema stage
+  stage/duckdb/running query in DuckDB and SHOW PROCESSLIST "DuckDB:
+  running the query (until its first rows)": the offloaded query runs in
+  DuckDB during optimization. The previous stage comes back at the end.
+*/
+class RunningStage {
+ public:
+  explicit RunningStage(THD *thd);
+  ~RunningStage();
+  RunningStage(const RunningStage &) = delete;
+  RunningStage &operator=(const RunningStage &) = delete;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> m_impl;
+};
+
 /** One copy being loaded or refreshed. */
 struct LoadProgress {
   std::string db;

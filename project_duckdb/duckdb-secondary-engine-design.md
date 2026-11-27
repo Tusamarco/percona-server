@@ -13,9 +13,10 @@ Changes from v0.4 (2026-11-18 to 2026-11-26):
 - T1: prepared statement parameters, stored program and user variables translated. T2: DuckDB errors at the start of execution (out of memory, temporary disk full) send the query to InnoDB.
 - T3 (part): NOW() and the other clock functions, CAST / CONVERT of numbers and dates, DATE_FORMAT.
 - Monitoring: lag, state, memory, spill and query time status variables, PMM / Grafana dashboard (`monitoring/`); plugin version and commit in `INFORMATION_SCHEMA.PLUGINS` and `duckdb_version`; binary log reset handled.
-- Diagrams of the write and query paths ("Paths through the code"); data type mapping section; TODO list T0-T5 ("TODO from 2026-11-18"). MTR suite: 39 tests; 41 unit tests.
+- Diagrams of the write and query paths ("Paths through the code"); data type mapping section; TODO list T0-T5 ("TODO from 2026-11-18"). MTR suite: 44 tests; 42 unit tests.
 - Storage moved from DuckLake to a native DuckDB database file, `repository.duckdb` (2026-11-25, Storage; named `lake.duckdb` for one day, renamed at startup); a DuckLake lake of an earlier version is migrated at the first start.
-- Performance review against AliSQL and MariaDB (HammerDB TPROC-H SF100, 2026-11-25/26, DWL-06): correlated scalar / ALL / ANY subqueries printed as LATERAL, EXISTS / IN / NOT EXISTS inside OR as [NOT] EXISTS, DECIMAL arithmetic without redundant casts, CHAR columns compared without rtrim(), SUBSTRING with constant positions. Result: within 1.04x of AliSQL's total at 1-8 VUsers, ahead of MariaDB, the only engine completing 16 VUsers (README, Performance).
+- External review (2026-11-26): writes that the binary log would not carry in full (`sql_log_bin = 0`, `binlog_format` STATEMENT / MIXED, `binlog_row_image` MINIMAL / NOBLOB) are refused by the guard on tables with a copy; the applier marks a copy stale when a partial row image or a statement-logged change reaches it anyway; `binlog_order_commits` switched OFF after the load stops the applier (MTR `binlog_safety`).
+- Performance review against AliSQL and MariaDB (HammerDB TPROC-H SF100, 2026-11-25/26, DWL-06): correlated scalar / ALL / ANY subqueries printed as LATERAL, EXISTS / IN / NOT EXISTS inside OR as [NOT] EXISTS, DECIMAL arithmetic without redundant casts, CHAR columns compared without rtrim(), SUBSTRING with constant positions. Result: within 1.04x of AliSQL's total at 1-8 VUsers, ahead of MariaDB, the only engine completing 16 VUsers (`.github/README.md`, Performance).
 
 Changes from v0.3 (what the implementation added or changed, 2026-11-07 to 2026-11-17):
 
@@ -355,7 +356,7 @@ All variables are plugin variables of the `duckdb` plugin, so the server adds th
 | `duckdb_memory_limit` | size | none, mandatory | global | yes | Plugin init fails if not set; minimum 256 MiB |
 | `duckdb_threads` | int | none, mandatory | global | yes | Plugin init fails if not set; range 1 to the number of cores |
 | `duckdb_encryption` | BOOL | OFF | global | no | Fixed when the lake file is created; not in the POC |
-| `duckdb_executor_threads` | int | 4 | global | yes | Threads that run DuckDB calls; 1 to the number of cores; above the cores at startup it is lowered with a warning |
+| `duckdb_executor_threads` | int | 0 = one per core (since 2026-11-26; was 4) | global | yes | Threads that run DuckDB calls; 0, or 1 to the number of cores; above the cores at startup it is lowered with a warning. An offloaded query holds one while DuckDB computes its first rows |
 | `duckdb_executor_stack_size` | size | 8 MiB | global | no | Stack of the executor threads; 2 to 64 MiB |
 | `duckdb_history_scope` | enum LIVE, FULL | LIVE | global, session, SET_VAR hint | yes | Affects only tables with retain_history |
 | `duckdb_lake_relocate` | BOOL | ON | global | yes | Only when a DuckLake lake of an earlier version is migrated and its catalog stores another data path: ON reads its files from `duckdb_data_path`, OFF refuses (2026-11-25: the native lake file stores no path, a moved lake always opens) |
@@ -485,10 +486,11 @@ Because core code must not change, the plugin reads the binary log. It uses only
 - Parsing: the in-tree event library (`libs/mysql/binlog/event`): `Gtid` events (transaction id and tag), `Table_map`, `Write_rows`, `Update_rows`, `Delete_rows`. Compressed transaction payloads are decoded by the same library. Events for tables that are not loaded are ignored.
 
 ```
-binlog files ──► [reader] ──► [prepare worker 1..N] ──► [committer] ──► lake
-                 decode,       convert to DuckDB         one DuckDB  
-                 filter,       vectors, collapse         transaction per batch
-                 detect tag    per primary key           + applied GTID
+binlog files ──► [reader thread] ──► repository.duckdb
+                 read, decode, filter loaded tables, detect the purge tag,
+                 check the row images, collapse per primary key, commit one
+                 DuckDB transaction per batch with the applied position
+(designed in v0.3, deferred: prepare workers between reader and committer)
 ```
 
 - As implemented: one reader thread reads and decodes the binlog, filters loaded tables, detects the purge tag, converts values, collapses changes per primary key and commits once per batch, in GTID order. Cross-table source transactions stay atomic in DuckDB, there is a single applied position, and DuckDB parallelizes the commit work with its own `duckdb_threads`. The prepare workers below were designed but not needed so far:
@@ -707,6 +709,7 @@ with the reason).
 | `BINARY`, `VARBINARY`, `TINYBLOB` ... `LONGBLOB` | `BLOB` | The bytes as they are. |
 | `JSON` | `JSON` (DuckDB's JSON type: text, validated) | The text MySQL prints for the value, the same from the load and from the binary log (the applier turns MySQL's binary JSON into it with the server's code). Selecting the column, `IS [NOT] NULL` and `COUNT(j)` run in DuckDB; comparisons, `->` / `->>`, JSON functions, GROUP BY, ORDER BY, DISTINCT, other aggregates and set operations on it are refused. Partial JSON updates (`binlog_row_value_options = PARTIAL_JSON`) make the copy stale: keep that variable empty. |
 | Spatial types (`GEOMETRY`, `POINT`, `POLYGON` ...) | `BLOB` (SRID + WKB, MySQL's bytes) | Selecting the column, `IS [NOT] NULL` and `COUNT(g)` run in DuckDB; spatial functions and comparisons are refused. |
+| Generated columns (VIRTUAL, STORED), expression defaults | the column's own type | The values InnoDB computed (load and binary log row images carry them, virtual ones too); queries on them run in DuckDB (2026-11-26). |
 | `VECTOR` | not supported | The table cannot be loaded. |
 
 Hidden columns (`__w_`, `__n_`, and `__archived_at` in history copies) are
@@ -815,7 +818,7 @@ DATE_FORMAT; NOT EXISTS as anti join; TPC-H 22/22, `tpch/README.md`).
 | NOW() / CURRENT_TIMESTAMP, CURDATE() / CURRENT_DATE, CURTIME(), UTC_TIMESTAMP / UTC_DATE / UTC_TIME, UNIX_TIMESTAMP() | done | 2026-11-24 (T3): the value MySQL fixed at the start of the statement, sent as a typed literal (so `SET TIMESTAMP` and the session time zone apply); a DATE column compared with NOW() compares as DATETIME as in MySQL; SYSDATE() refused (it changes during the statement); MTR `offload_now` |
 | DATE_FORMAT | partial | 2026-11-24 (T3): built code by code from DuckDB date parts (English names, `lc_time_names = en_US`); week codes `%U %u %V %v %X %x` refused; DATE / DATETIME arguments (TIMESTAMP: step 4). GROUP BY and DISTINCT on any translated format, ORDER BY on fixed-width numeric formats (`%Y-%m-%d`), on the text directly: one format gives one spelling of each value, so the collation compares them as their bytes. Comparisons with constants still refused (collation). MTR `offload_date_format` |
 | STR_TO_DATE | missing | |
-| Functions on TIMESTAMP columns (session time zone) | missing | |
+| Functions on TIMESTAMP columns (session time zone) | partial | 2026-11-26: date functions, DATE_FORMAT, date arithmetic and CAST on a TIMESTAMP column, in the session time zone when it is UTC, a fixed offset (`'+05:30'`) or SYSTEM with a UTC system zone; zones with daylight saving refused (`timestamp_function_time_zone`). MTR `offload_timestamp_fn` |
 | Bit operators (& | ^ ~ << >>) | missing | |
 | JSON functions | missing | |
 
@@ -1002,8 +1005,10 @@ archived rows)
       CURRENT_TIMESTAMP(n), CURDATE, CURTIME, UTC_*, UNIX_TIMESTAMP(), as
       the statement's fixed value; SYSDATE refused); CAST / CONVERT from
       numbers and dates (2026-11-24, MTR `offload_cast`); DATE_FORMAT
-      (2026-11-24, MTR `offload_date_format`). Next: functions on TIMESTAMP
-      columns.
+      (2026-11-24, MTR `offload_date_format`); functions on TIMESTAMP
+      columns (2026-11-26, MTR `offload_timestamp_fn`): the column shifted
+      to the session time zone when it is UTC, a fixed offset, or SYSTEM
+      with a UTC system zone; zones with daylight saving run on InnoDB.
 - [ ] Applier: XA transactions on loaded tables, `binlog_encryption=ON`.
 
 **T4. Loadability** (a table that cannot be loaded has no offload and no
@@ -1025,19 +1030,32 @@ history)
       lost). Not taken: their collation mapping (`NOCASE`), TIME as DuckDB
       `TIME`, ENUM / SET as plain `VARCHAR`, BIT as `BLOB` (results would
       differ from InnoDB).
-- [ ] Generated columns: check load and applier (virtual columns in the
-      binary log row image) and document.
+- [x] Generated columns: checked 2026-11-26. The copy holds the values InnoDB
+      computed (the load reads them, the binary log row image carries them,
+      virtual ones too); the engine now declares `HA_GENERATED_COLUMNS` and
+      `HA_SUPPORTS_DEFAULT_EXPRESSION`, without which the server could not
+      open the secondary table (every query failed with 3106). MTR
+      `generated_columns`.
 
 **T5. Concurrency** (with the HammerDB run, next step 4)
-- [ ] More concurrent offloaded statements than `duckdb_executor_threads`:
-      queueing, wait time, behaviour.
-- [ ] Client character sets other than utf8mb4 (`character_set_results`).
+- [x] More concurrent offloaded statements than `duckdb_executor_threads`
+      (2026-11-26): an offloaded query holds an executor thread while DuckDB
+      computes its first rows; the default is now one per core
+      (`duckdb_executor_threads = 0`), waits are counted
+      (`duckdb_executor_queue_waits`, `duckdb_executor_queue_wait_us`), and
+      the session shows `stage/duckdb/running query in DuckDB` while DuckDB
+      runs it. A cap on concurrent offloaded queries: beta plan.
+- [x] Client character sets other than utf8mb4 (2026-11-26): latin1,
+      utf8mb3, cp1251 and `character_set_results = NULL` get InnoDB's bytes
+      (MySQL converts both on the way out). MTR `client_charsets`.
 
 **Leftovers of the 2026-11-18 review**
 - [ ] B1: the DECIMAL first run materializes the whole result (memory);
       policy: run first only grouped / LIMIT statements, or bound by
       `duckdb_memory_limit` and fall back (decide).
-- [ ] D1: more edge data in the shared test tables (combining marks, emoji
+- [x] D1 (2026-11-26, MTR `offload_edge_strings`: 8 collations, equality,
+      ordering, grouping, distinct counts, MIN / MAX, joins; all identical to
+      InnoDB): more edge data in the shared test tables (combining marks, emoji
       modifiers, 'ß', Turkish 'İ' / 'ı', trailing spaces vs tabs,
       `_ai_ci`-equal strings, 39-digit literals); a difference is a bug or a
       refusal, never a re-recorded result.
@@ -1073,7 +1091,7 @@ Needed for general availability:
 | Packaging | One tarball; plugin size (about 1.5 GB with debug info, stripped release); ICU symbol clash between the server (ICU 77) and DuckDB's icu extension (hidden visibility, to test) | missing |
 | Security and compliance | Encryption (designed, keyring component), erasure requests against history copies (a purge keeps the personal data), privileges reviewed | designed |
 | Upgrade policy | DuckDB version upgrades and the storage format of the lake file (the one-time DuckLake migration exists since 2026-11-25) | missing |
-| CI | MTR suite in CI, Clang build, ASAN / UBSAN runs of the applier and the offload | missing (MTR suite exists, 39 tests; 41 unit tests) |
+| CI | MTR suite in CI, Clang build, ASAN / UBSAN runs of the applier and the offload | missing (MTR suite exists, 44 tests; 42 unit tests) |
 | Documentation | Operations guide (sizing, monitoring, failure scenarios), beyond HOWTO and TUTORIAL | partial |
 
 ### SQL gaps by priority
@@ -1088,7 +1106,7 @@ reporting and BI queries. Each one today sends the query to InnoDB.
 | Done / partial | CAST / CONVERT | 2026-11-24: numbers and dates; string, DOUBLE and TIMESTAMP sources still refused | medium (MySQL conversion rules, truncation) |
 | Done / partial | DATE_FORMAT, NOW() / CURRENT_DATE in expressions | 2026-11-24: done (week codes, TIMESTAMP arguments refused) | medium |
 | High | TIMESTAMPDIFF, STR_TO_DATE | Reports compute intervals and parse dates | medium |
-| High | Functions on TIMESTAMP columns | Every TIMESTAMP column is cut off from date functions | medium (session time zone, as for constants) |
+| Done / partial | Functions on TIMESTAMP columns | 2026-11-26: UTC and fixed-offset session zones; named zones still refused | medium (session time zone, as for constants) |
 | Medium | LIKE and string functions on `_ci` / non-binary collations | Most schemas use `utf8mb4_0900_ai_ci` | large, may stay partial |
 | Medium | ROLLUP / GROUPING SETS / GROUPING() | Report subtotals | medium |
 | Medium | STDDEV / VARIANCE, BIT_AND / OR / XOR, GROUP_CONCAT | Statistics; GROUP_CONCAT is very common in MySQL | small; medium for GROUP_CONCAT (separator, ORDER BY, `group_concat_max_len`) |

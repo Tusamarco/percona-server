@@ -116,6 +116,7 @@ item 22. (2026-11-23: 22 of 22.)
    build with `mysql_tproch_run.tcl`. 2026-11-26: done at scale factor 100,
    1 to 16 VUsers, against the AliSQL and MariaDB DuckDB engines on the same
    workload: within 1.04x of AliSQL's total at 1-8 VUsers, ahead of MariaDB,
-   the only engine completing 16 VUsers; per-query tables in the README,
-   "Performance".)
+   the only engine completing 16 VUsers (the AliSQL and MariaDB runs are
+   being re-checked for failed queries logged as fast ones); per-query tables in
+   [`.github/README.md`, Performance](../../.github/README.md#performance).)
 3. Record the runs in `project_duckdb/perf/` as the other performance runs.

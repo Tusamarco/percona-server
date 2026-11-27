@@ -17,6 +17,7 @@
 #define STORAGE_DUCKDB_DUCKDB_EXECUTOR_H_
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -64,12 +65,18 @@ class Executor {
   unsigned long busy();
   unsigned long queue_length();
   unsigned long long tasks() const { return m_tasks.load(); }
+  /** Calls that waited for a free executor thread (more than 1 ms), and
+      their total wait in microseconds (2026-11-26). */
+  unsigned long long queue_waits() const { return m_queue_waits.load(); }
+  unsigned long long queue_wait_us() const { return m_queue_wait_us.load(); }
 
  private:
   enum class State { QUEUED, RUNNING, DONE, CANCELLED };
   struct Task {
     const std::function<void()> *fn{nullptr};
     State state{State::QUEUED};
+    std::chrono::steady_clock::time_point queued_at{
+        std::chrono::steady_clock::now()};
     std::condition_variable done;
   };
   struct Worker {
@@ -94,6 +101,8 @@ class Executor {
   size_t m_stack_size{0};
   bool m_running{false};
   std::atomic<unsigned long long> m_tasks{0};
+  std::atomic<unsigned long long> m_queue_waits{0};
+  std::atomic<unsigned long long> m_queue_wait_us{0};
 };
 
 }  // namespace duckdb_se

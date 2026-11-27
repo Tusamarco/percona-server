@@ -199,6 +199,86 @@ class Parser {
     return true;
   }
 
+ public:
+  // The tables a DML statement logged as text writes (binlog_format =
+  // STATEMENT or MIXED in the writing session): INSERT / REPLACE [INTO] t,
+  // UPDATE t [, t2 | JOIN t2 ...] SET, DELETE [t1, t2] FROM t [JOIN ...],
+  // LOAD DATA ... INTO TABLE t. A table only read in a multi-table UPDATE or
+  // DELETE may be listed too: the caller marks the copies stale, and an
+  // extra one is safe, a missed one is not.
+  std::vector<TableName> dml_targets() {
+    std::vector<TableName> out;
+    auto skip = [&](std::initializer_list<const char *> words) {
+      for (bool again = true; again && !at_end();) {
+        again = false;
+        for (const char *w : words)
+          if (kw(w)) {
+            m_i++;
+            again = true;
+          }
+      }
+    };
+    // Every table name of a list or join until one of the stop words: a
+    // name is expected at the start, after a comma, FROM or a join keyword;
+    // aliases are skipped, ON conditions too.
+    auto names_until = [&](std::initializer_list<const char *> stops) {
+      auto stop = [&] {
+        for (const char *w : stops)
+          if (kw(w)) return true;
+        return false;
+      };
+      auto join_kw = [&] {
+        return kw("JOIN") || kw("INNER") || kw("LEFT") || kw("RIGHT") ||
+               kw("OUTER") || kw("CROSS") || kw("STRAIGHT_JOIN") ||
+               kw("NATURAL");
+      };
+      bool expect = true;
+      while (!at_end() && !stop()) {
+        if (kw("FROM") || join_kw() || punct(',', m_i)) {
+          m_i++;
+          expect = true;
+        } else if (kw("ON")) {
+          m_i++;
+          while (!at_end() && !stop() && !join_kw()) m_i++;
+        } else if (expect) {
+          TableName t;
+          const size_t before = m_i;
+          if (name(&t)) {
+            out.push_back(t);
+          } else {
+            m_i = before + 1;
+          }
+          expect = false;
+        } else {
+          m_i++;  // an alias
+        }
+      }
+    };
+    if (kw("INSERT") || kw("REPLACE")) {
+      m_i++;
+      skip({"LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE", "INTO"});
+      TableName t;
+      if (name(&t)) out.push_back(t);
+    } else if (kw("UPDATE")) {
+      m_i++;
+      skip({"LOW_PRIORITY", "IGNORE"});
+      names_until({"SET"});
+    } else if (kw("DELETE")) {
+      m_i++;
+      skip({"LOW_PRIORITY", "QUICK", "IGNORE"});
+      names_until({"WHERE", "USING", "ORDER", "LIMIT"});
+    } else if (kw("LOAD")) {
+      while (!at_end() && !(kw("INTO") && kw("TABLE", m_i + 1))) m_i++;
+      if (!at_end()) {
+        m_i += 2;
+        TableName t;
+        if (name(&t)) out.push_back(t);
+      }
+    }
+    return out;
+  }
+
+ private:
   void rename_tables(DdlStatement *ddl) {
     while (!at_end()) {
       TableName from, to;
@@ -396,6 +476,12 @@ ColumnRenames decode_renames(std::string_view text) {
 DdlStatement parse_ddl(std::string_view query, const std::string &default_db,
                        bool lower_case_names) {
   return Parser(tokenize(query), default_db, lower_case_names).parse();
+}
+
+std::vector<TableName> parse_dml_targets(std::string_view query,
+                                         const std::string &default_db,
+                                         bool lower_case_names) {
+  return Parser(tokenize(query), default_db, lower_case_names).dml_targets();
 }
 
 }  // namespace duckdb_se

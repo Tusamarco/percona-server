@@ -1,0 +1,110 @@
+call mtr.add_suppression("binlog applier: test.bs[12]: .*The DuckDB copy is stale");
+call mtr.add_suppression("Unsafe statement written to the binary log");
+call mtr.add_suppression("binlog_order_commits is OFF");
+CREATE TABLE bs1 (id INT PRIMARY KEY, a INT, b VARCHAR(10)) SECONDARY_ENGINE = duckdb;
+CREATE TABLE bs2 (id INT PRIMARY KEY, a INT, b VARCHAR(10)) SECONDARY_ENGINE = duckdb;
+CREATE TABLE plain (id INT PRIMARY KEY, a INT);
+INSERT INTO bs1 VALUES (1, 10, 'x'), (2, 20, 'y');
+INSERT INTO bs2 VALUES (1, 10, 'x'), (2, 20, 'y');
+INSERT INTO plain VALUES (1, 1);
+ALTER TABLE bs1 SECONDARY_LOAD;
+ALTER TABLE bs2 SECONDARY_LOAD;
+# sql_log_bin = 0: every write to a table with a copy is refused
+SET SESSION sql_log_bin = 0;
+INSERT INTO bs1 VALUES (3, 30, 'z');
+ERROR HY000: sql_log_bin = 0: this change to test.bs1 would not be written to the binary log: the DuckDB copy of test.bs1 follows the binary log and would silently differ from InnoDB. Change it with the session default, or unload the copy first
+UPDATE bs1 SET a = 11 WHERE id = 1;
+ERROR HY000: sql_log_bin = 0: this change to test.bs1 would not be written to the binary log: the DuckDB copy of test.bs1 follows the binary log and would silently differ from InnoDB. Change it with the session default, or unload the copy first
+DELETE FROM bs1 WHERE id = 2;
+ERROR HY000: sql_log_bin = 0: this change to test.bs1 would not be written to the binary log: the DuckDB copy of test.bs1 follows the binary log and would silently differ from InnoDB. Change it with the session default, or unload the copy first
+REPLACE INTO bs1 VALUES (1, 12, 'w');
+ERROR HY000: sql_log_bin = 0: this change to test.bs1 would not be written to the binary log: the DuckDB copy of test.bs1 follows the binary log and would silently differ from InnoDB. Change it with the session default, or unload the copy first
+TRUNCATE TABLE bs1;
+ERROR HY000: sql_log_bin = 0: this change to test.bs1 would not be written to the binary log: the DuckDB copy of test.bs1 follows the binary log and would silently differ from InnoDB. Change it with the session default, or unload the copy first
+# ... but a table without a copy, and a copy only read, are fine
+INSERT INTO plain VALUES (2, 2);
+DELETE FROM plain WHERE id IN (SELECT id FROM bs1 WHERE a = 999);
+SET SESSION sql_log_bin = 1;
+# binlog_format STATEMENT and MIXED
+SET SESSION binlog_format = 'STATEMENT';
+Warnings:
+Warning	1287	'@@binlog_format' is deprecated and will be removed in a future release.
+INSERT INTO bs1 VALUES (3, 30, 'z');
+ERROR HY000: binlog_format is not ROW: this change to test.bs1 would be logged as a statement: the DuckDB copy of test.bs1 follows the binary log and would silently differ from InnoDB. Change it with the session default, or unload the copy first
+INSERT INTO plain VALUES (3, 3);
+SET SESSION binlog_format = 'MIXED';
+Warnings:
+Warning	1287	'@@binlog_format' is deprecated and will be removed in a future release.
+UPDATE bs1 SET a = 11 WHERE id = 1;
+ERROR HY000: binlog_format is not ROW: this change to test.bs1 would be logged as a statement: the DuckDB copy of test.bs1 follows the binary log and would silently differ from InnoDB. Change it with the session default, or unload the copy first
+SET SESSION binlog_format = 'ROW';
+Warnings:
+Warning	1287	'@@binlog_format' is deprecated and will be removed in a future release.
+# binlog_row_image MINIMAL and NOBLOB
+SET SESSION binlog_row_image = 'MINIMAL';
+UPDATE bs1 SET a = 11 WHERE id = 1;
+ERROR HY000: binlog_row_image is not FULL: this change to test.bs1 would be logged without all its columns: the DuckDB copy of test.bs1 follows the binary log and would silently differ from InnoDB. Change it with the session default, or unload the copy first
+SET SESSION binlog_row_image = 'NOBLOB';
+DELETE FROM bs1 WHERE id = 2;
+ERROR HY000: binlog_row_image is not FULL: this change to test.bs1 would be logged without all its columns: the DuckDB copy of test.bs1 follows the binary log and would silently differ from InnoDB. Change it with the session default, or unload the copy first
+SET SESSION binlog_row_image = 'FULL';
+# Nothing was changed: InnoDB and the copy still agree
+SELECT * FROM bs1 ORDER BY id;
+id	a	b
+1	10	x
+2	20	y
+SET SESSION use_secondary_engine = FORCED;
+SELECT * FROM bs1 ORDER BY id;
+id	a	b
+1	10	x
+2	20	y
+SET SESSION use_secondary_engine = DEFAULT;
+SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES WHERE TABLE_NAME LIKE 'bs%' ORDER BY 1;
+TABLE_NAME	STATE
+bs1	LOADED
+bs2	LOADED
+# The applier's own checks, with the guard's check skipped:
+# a partial row image marks bs1 stale, a statement-logged change bs2
+SET SESSION debug = '+d,duckdb_guard_skip_write_check';
+SET SESSION binlog_row_image = 'MINIMAL';
+UPDATE bs1 SET a = 11 WHERE id = 1;
+SET SESSION binlog_row_image = 'FULL';
+SET SESSION binlog_format = 'STATEMENT';
+Warnings:
+Warning	1287	'@@binlog_format' is deprecated and will be removed in a future release.
+INSERT INTO bs2 VALUES (3, 30, 'z');
+SET SESSION binlog_format = 'ROW';
+Warnings:
+Warning	1287	'@@binlog_format' is deprecated and will be removed in a future release.
+SET SESSION debug = '-d,duckdb_guard_skip_write_check';
+SELECT TABLE_NAME, STATE FROM information_schema.DUCKDB_TABLES WHERE TABLE_NAME LIKE 'bs%' ORDER BY 1;
+TABLE_NAME	STATE
+bs1	STALE
+bs2	STALE
+# A stale copy is not read: InnoDB answers (with ON)
+SELECT a FROM bs1 WHERE id = 1;
+a
+11
+# binlog_order_commits switched OFF after the load: the applier stops
+# with the reason; back ON and duckdb_enable OFF / ON, it resumes from
+# its applied position and the change arrives
+CREATE TABLE bs3 (id INT PRIMARY KEY, a INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO bs3 VALUES (1, 1);
+ALTER TABLE bs3 SECONDARY_LOAD;
+SET GLOBAL binlog_order_commits = OFF;
+INSERT INTO bs3 VALUES (2, 2);
+Timeout in wait_condition.inc for SELECT VARIABLE_VALUE = 'error' FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_apply_reader_state'
+SET GLOBAL binlog_order_commits = ON;
+SET GLOBAL duckdb_enable = OFF;
+SET GLOBAL duckdb_enable = ON;
+SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_apply_reader_state';
+VARIABLE_VALUE
+idle
+SET SESSION use_secondary_engine = FORCED;
+SET SESSION secondary_engine_cost_threshold = 0;
+SELECT COUNT(*) FROM bs3;
+COUNT(*)
+2
+SET SESSION secondary_engine_cost_threshold = DEFAULT;
+SET SESSION use_secondary_engine = DEFAULT;
+DROP TABLE bs1, bs2, bs3, plain;

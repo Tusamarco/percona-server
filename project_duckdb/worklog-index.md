@@ -61,7 +61,7 @@ MariaDB"): correlated subqueries as LATERAL, EXISTS / IN / NOT EXISTS inside
 OR, fewer DECIMAL casts, CHAR without rtrim(), constant SUBSTRING; the file
 renamed `repository.duckdb`. HammerDB TPROC-H SF100: within 1.04x of
 AliSQL's total at 1-8 VUsers, ahead of MariaDB, the only engine completing
-16 VUsers (README, Performance). MTR suite: 39 tests; unit tests: 41.
+16 VUsers (`.github/README.md`, Performance). MTR suite: 44 tests; unit tests: 42.
 
 Development order follows the table. DWL#6 must not be enabled before DWL#4:
 without the applier, DML on InnoDB does not reach DuckDB and offloaded queries

@@ -43,6 +43,11 @@ PSI_stage_info stage_wait_refresh = {0, "waiting for copy refresh",
                                      PSI_FLAG_STAGE_PROGRESS, PSI_DOCUMENT_ME};
 PSI_stage_info stage_wait_applier = {0, "waiting for applier",
                                      PSI_FLAG_STAGE_PROGRESS, PSI_DOCUMENT_ME};
+// While an offloaded query runs in DuckDB during optimization (the first
+// chunk, the DECIMAL or grouped-value first run): until then MySQL showed
+// its last own stage ("Creating tmp table"), 2026-11-26.
+PSI_stage_info stage_running = {0, "running query in DuckDB", 0,
+                                PSI_DOCUMENT_ME};
 
 struct Entry {
   std::string db, table;
@@ -149,10 +154,21 @@ std::string seconds_text(double s) {
 
 void register_progress_stages() {
   PSI_stage_info *stages[] = {&stage_copy_load, &stage_wait_refresh,
-                              &stage_wait_applier};
+                              &stage_wait_applier, &stage_running};
   mysql_stage_register("duckdb", stages,
                        static_cast<int>(sizeof(stages) / sizeof(stages[0])));
 }
+
+struct RunningStage::Impl {
+  ThreadDisplay display;
+  explicit Impl(THD *thd) : display(thd, &stage_running) {
+    display.show("DuckDB: running the query (until its first rows)", 0, 0);
+  }
+};
+
+RunningStage::RunningStage(THD *thd)
+    : m_impl(thd != nullptr ? std::make_unique<Impl>(thd) : nullptr) {}
+RunningStage::~RunningStage() = default;
 
 struct LoadTracker::Impl {
   std::shared_ptr<Entry> entry;

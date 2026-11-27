@@ -1,0 +1,105 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# D1 (2026-11-26): edge strings under every kind of collation, InnoDB and
+# DuckDB compared: combining marks against precomposed letters, emoji and
+# skin tone modifiers, German sharp s, Turkish dotted / dotless i, trailing
+# spaces against tabs, accent- and case-equal strings. A difference is a
+# bug or a refusal, never a re-recorded result.
+--source ../include/have_duckdb.inc
+CREATE TABLE es (id INT PRIMARY KEY,
+  ai VARCHAR(30) COLLATE utf8mb4_0900_ai_ci, ascs VARCHAR(30) COLLATE utf8mb4_0900_as_cs,
+  gen VARCHAR(30) COLLATE utf8mb4_general_ci, uni VARCHAR(30) COLLATE utf8mb4_unicode_ci,
+  tr VARCHAR(30) COLLATE utf8mb4_tr_0900_ai_ci, bn VARCHAR(30) COLLATE utf8mb4_bin,
+  nb VARCHAR(30) COLLATE utf8mb4_0900_bin, sw VARCHAR(30) CHARACTER SET latin1 COLLATE latin1_swedish_ci)
+  SECONDARY_ENGINE = duckdb;
+INSERT INTO es VALUES
+ (1, 'é', 'é', 'é', 'é', 'é', 'é', 'é', 'é'),
+ (2, 'é', 'é', 'é', 'é', 'é', 'é', 'é', 'e'),
+ (3, 'E', 'E', 'E', 'E', 'E', 'E', 'E', 'E'),
+ (4, 'straße', 'straße', 'straße', 'straße', 'straße', 'straße', 'straße', 'straße'),
+ (5, 'strasse', 'strasse', 'strasse', 'strasse', 'strasse', 'strasse', 'strasse', 'strasse'),
+ (6, 'İstanbul', 'İstanbul', 'İstanbul', 'İstanbul', 'İstanbul', 'İstanbul', 'İstanbul', 'Istanbul'),
+ (7, 'istanbul', 'istanbul', 'istanbul', 'istanbul', 'istanbul', 'istanbul', 'istanbul', 'istanbul'),
+ (8, 'ıstanbul', 'ıstanbul', 'ıstanbul', 'ıstanbul', 'ıstanbul', 'ıstanbul', 'ıstanbul', 'Istanbul'),
+ (9, '👍', '👍', '👍', '👍', '👍', '👍', '👍', 'x'),
+ (10, '👍🏽', '👍🏽', '👍🏽', '👍🏽', '👍🏽', '👍🏽', '👍🏽', 'x'),
+ (11, 'a ', 'a ', 'a ', 'a ', 'a ', 'a ', 'a ', 'a '),
+ (12, 'a\t', 'a\t', 'a\t', 'a\t', 'a\t', 'a\t', 'a\t', 'a\t'),
+ (13, 'a', 'a', 'a', 'a', 'a', 'a', 'a', 'a'),
+ (14, 'Å', 'Å', 'Å', 'Å', 'Å', 'Å', 'Å', 'Å'),
+ (15, 'AA', 'AA', 'AA', 'AA', 'AA', 'AA', 'AA', 'AA'),
+ (16, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+ALTER TABLE es SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+--echo # Equality with constants (each column under its collation)
+--let $query= SELECT id FROM es WHERE ai = 'e' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es WHERE ascs = 'é' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es WHERE gen = 'strasse' OR uni = 'strasse' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es WHERE tr = 'istanbul' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es WHERE ai = 'istanbul' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es WHERE bn = 'a' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es WHERE nb = 'a' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es WHERE ai = '👍' ORDER BY id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es WHERE sw = 'å' OR sw = 'aa' ORDER BY id
+--source ../include/duckdb_compare.inc
+
+--echo # Ordering (ties broken by id)
+--let $query= SELECT id FROM es ORDER BY ai, id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es ORDER BY ascs, id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es ORDER BY tr, id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es ORDER BY bn, id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es ORDER BY nb, id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es ORDER BY sw, id
+--source ../include/duckdb_compare.inc
+--let $query= SELECT id FROM es ORDER BY gen, id
+--source ../include/duckdb_compare.inc
+
+--echo # Grouping, distinct counts, MIN / MAX
+--let $query= SELECT COUNT(DISTINCT ai), COUNT(DISTINCT ascs), COUNT(DISTINCT gen), COUNT(DISTINCT uni), COUNT(DISTINCT tr), COUNT(DISTINCT bn), COUNT(DISTINCT nb), COUNT(DISTINCT sw) FROM es
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(id), MAX(id), COUNT(*) FROM es GROUP BY tr ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(id), COUNT(*) FROM es GROUP BY ai ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(id), COUNT(*) FROM es GROUP BY bn ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(id), COUNT(*) FROM es GROUP BY sw ORDER BY 1
+--source ../include/duckdb_compare.inc
+--let $query= SELECT MIN(ai), MAX(ai), MIN(ascs), MAX(ascs), MIN(tr), MAX(tr), MIN(bn), MAX(nb), MIN(sw), MAX(sw) FROM es
+--source ../include/duckdb_compare.inc
+
+--echo # Joins on equal-under-the-collation values
+--let $query= SELECT x.id, y.id FROM es x JOIN es y ON x.ai = y.ai WHERE x.id < y.id ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+--let $query= SELECT x.id, y.id FROM es x JOIN es y ON x.tr = y.tr WHERE x.id < y.id ORDER BY 1, 2
+--source ../include/duckdb_compare.inc
+
+DROP TABLE es;
+--source ../include/cleanup.inc

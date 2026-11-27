@@ -1,0 +1,46 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# Client character sets other than utf8mb4 (2026-11-26, T5): results sent
+# from DuckDB are converted to character_set_results exactly as InnoDB's
+# (MySQL converts both on the way to the client); characters the client
+# set cannot hold become '?' in both.
+--source ../include/have_duckdb.inc
+CREATE TABLE cs (id INT PRIMARY KEY, u VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+  l VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_bin, c CHAR(5) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO cs VALUES (1, 'José', 'José', 'ä'), (2, 'Straße', 'Straße', 'ß'), (3, 'Привет', 'abc', 'я'),
+  (4, '😀 emoji', 'x', NULL), (5, NULL, NULL, 'é');
+ALTER TABLE cs SECONDARY_LOAD;
+--source ../include/wait_applier.inc
+
+--let $query= SELECT id, u, l, c, CONCAT(u, '-', c), LENGTH(u), CHAR_LENGTH(l) FROM cs ORDER BY id
+SET NAMES latin1;
+--source ../include/duckdb_compare.inc
+SET NAMES utf8mb3;
+--source ../include/duckdb_compare.inc
+SET NAMES cp1251;
+--source ../include/duckdb_compare.inc
+SET NAMES utf8mb4;
+SET SESSION character_set_results = NULL;
+--source ../include/duckdb_compare.inc
+SET NAMES utf8mb4;
+--echo # A constant in the query in the connection's character set
+SET NAMES latin1;
+--let $query= SELECT id FROM cs WHERE l = 'José' ORDER BY id
+--source ../include/duckdb_compare.inc
+SET NAMES utf8mb4;
+
+DROP TABLE cs;
+--source ../include/cleanup.inc

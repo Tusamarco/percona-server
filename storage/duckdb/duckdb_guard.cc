@@ -22,6 +22,9 @@
 
 #include "mysql/plugin_audit.h"
 #include "mysqld_error.h"
+#include "sql/mysqld.h"  // opt_bin_log
+#include "sql/query_options.h"  // OPTION_BIN_LOG
+#include "sql/system_variables.h"  // binlog_format, binlog_row_image
 #include "sql/sql_class.h"
 #include "sql/sql_alter.h"  // Alter_info
 #include "sql/sql_lex.h"
@@ -214,6 +217,56 @@ void wait_for_ddl_refresh(THD *thd) {
                                  : "the binlog applier is not running");
 }
 
+// A write to a table with a DuckDB copy that the binary log would not carry
+// in full: the copy follows the binary log only (2026-11-26, external
+// review). sql_log_bin = 0: not logged at all; binlog_format STATEMENT or
+// MIXED: logged as text, which the applier cannot apply; binlog_row_image
+// MINIMAL or NOBLOB: rows without all their columns. Refused before
+// anything changes, so the copy never silently differs from InnoDB.
+// TRUNCATE is logged as a statement in any format: only sql_log_bin
+// matters. The replication applier, other system threads and the plugin's
+// own sessions are not checked.
+int check_logged_write(THD *thd, const mysql_event_table_access *ev) {
+  if (thd->system_thread != NON_SYSTEM_THREAD || is_internal_session(thd) ||
+      !opt_bin_log)
+    return 0;
+  // MTR: lets a write through so the applier's own checks are tested.
+  DBUG_EXECUTE_IF("duckdb_guard_skip_write_check", return 0;);
+  const std::string db(ev->table_database.str, ev->table_database.length);
+  const std::string table(ev->table_name.str, ev->table_name.length);
+  TableState state;
+  if (!Registry::instance().snapshot(db, table, &state)) return 0;
+  LEX *lex = thd->lex;
+  const bool truncate = lex != nullptr && lex->sql_command == SQLCOM_TRUNCATE;
+  // DELETE events are raised for every table of the statement, also the
+  // ones it only reads: we check the tables it writes.
+  bool written = truncate;
+  for (Table_ref *t = lex != nullptr ? lex->query_tables : nullptr;
+       t != nullptr && !written; t = t->next_global) {
+    if (t->db == nullptr || t->table_name == nullptr) continue;
+    if (db == t->db && table == t->table_name &&
+        t->lock_descriptor().type >= TL_WRITE_ALLOW_WRITE)
+      written = true;
+  }
+  if (!written) return 0;
+  const std::string full = db + "." + table;
+  const std::string tail =
+      ": the DuckDB copy of " + full +
+      " follows the binary log and would silently differ from InnoDB. Change "
+      "it with the session default, or unload the copy first";
+  if ((thd->variables.option_bits & OPTION_BIN_LOG) == 0)
+    return stop(thd, "sql_log_bin = 0: this change to " + full +
+                         " would not be written to the binary log" + tail);
+  if (truncate) return 0;
+  if (thd->variables.binlog_format != BINLOG_FORMAT_ROW)
+    return stop(thd, "binlog_format is not ROW: this change to " + full +
+                         " would be logged as a statement" + tail);
+  if (thd->variables.binlog_row_image != BINLOG_ROW_IMAGE_FULL)
+    return stop(thd, "binlog_row_image is not FULL: this change to " + full +
+                         " would be logged without all its columns" + tail);
+  return 0;
+}
+
 int guard_notify(MYSQL_THD thd, mysql_event_class_t event_class,
                  const void *event) {
   if (thd == nullptr) return 0;
@@ -247,10 +300,15 @@ int guard_notify(MYSQL_THD thd, mysql_event_class_t event_class,
   if (event_class != MYSQL_AUDIT_TABLE_ACCESS_CLASS) return 0;
   const auto *ev = static_cast<const mysql_event_table_access *>(event);
   if (ev->event_subclass != MYSQL_AUDIT_TABLE_ACCESS_READ &&
+      ev->event_subclass != MYSQL_AUDIT_TABLE_ACCESS_INSERT &&
       ev->event_subclass != MYSQL_AUDIT_TABLE_ACCESS_UPDATE &&
       ev->event_subclass != MYSQL_AUDIT_TABLE_ACCESS_DELETE)
     return 0;
   try {
+    if (ev->event_subclass != MYSQL_AUDIT_TABLE_ACCESS_READ &&
+        check_logged_write(thd, ev))
+      return 1;
+    if (ev->event_subclass == MYSQL_AUDIT_TABLE_ACCESS_INSERT) return 0;
     return on_table_access(thd, ev);
   } catch (...) {
     // Never let an exception reach the server; refuse the statement.
@@ -268,6 +326,7 @@ st_mysql_audit guard_descriptor = {
     guard_notify,
     {0, 0, static_cast<unsigned long>(MYSQL_AUDIT_PARSE_PREPARSE), 0,
      static_cast<unsigned long>(MYSQL_AUDIT_TABLE_ACCESS_READ |
+                                MYSQL_AUDIT_TABLE_ACCESS_INSERT |
                                 MYSQL_AUDIT_TABLE_ACCESS_UPDATE |
                                 MYSQL_AUDIT_TABLE_ACCESS_DELETE),
      0, 0, 0, 0, static_cast<unsigned long>(MYSQL_AUDIT_QUERY_STATUS_END), 0,

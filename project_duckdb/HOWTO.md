@@ -69,14 +69,14 @@ cd ../percona-server-9.7-build/mysql-test
 MTR_SHUTDOWN_TIMEOUT=120 ./mtr --suite=/opt/mysql_source/percona-server/storage/duckdb/mysql-test/duckdb --parallel=2
 ```
 
-39 tests (about 1.5 hours with a debug build); see
+44 tests (about 1.5 hours with a debug build); see
 `storage/duckdb/mysql-test/duckdb/README.md`.
 
 ### Results and checks
 
 ```bash
 ls -l plugin_output_directory/ha_duckdb.so          # the plugin
-./runtime_output_directory/duckdb_apply-t | tail -1  # [  PASSED  ] 41 tests.
+./runtime_output_directory/duckdb_apply-t | tail -1  # [  PASSED  ] 42 tests.
 ctest -R duckdb_build_smoke --output-on-failure      # DuckDB libraries alone
 ```
 
@@ -379,6 +379,7 @@ with the reason).
 | `BINARY`, `VARBINARY`, `TINYBLOB` ... `LONGBLOB` | `BLOB` | The bytes as they are. |
 | `JSON` | `JSON` (DuckDB's JSON type: text, validated) | The text MySQL prints for the value, the same from the load and from the binary log (the applier turns MySQL's binary JSON into it with the server's code). Selecting the column, `IS [NOT] NULL` and `COUNT(j)` run in DuckDB; comparisons, `->` / `->>`, JSON functions, GROUP BY, ORDER BY, DISTINCT, other aggregates and set operations on it are refused. Partial JSON updates (`binlog_row_value_options = PARTIAL_JSON`) make the copy stale: keep that variable empty. |
 | Spatial types (`GEOMETRY`, `POINT`, `POLYGON` ...) | `BLOB` (SRID + WKB, MySQL's bytes) | Selecting the column, `IS [NOT] NULL` and `COUNT(g)` run in DuckDB; spatial functions and comparisons are refused. |
+| Generated columns (VIRTUAL, STORED), expression defaults | the column's own type | The values InnoDB computed (load and binary log row images carry them, virtual ones too); queries on them run in DuckDB (2026-11-26). |
 | `VECTOR` | not supported | The table cannot be loaded. |
 
 Hidden columns (`__w_`, `__n_`, and `__archived_at` in history copies) are
@@ -690,7 +691,9 @@ otherwise it runs on InnoDB:
   leave 0..2^64-1 (subtraction, possible overflow), functions outside
   the reviewed list above (UPPER / LOWER, STR_TO_DATE, CAST of a string
   ...),
-  date functions on TIMESTAMP columns, comparing a string column with a
+  date functions on TIMESTAMP columns when the session time zone has
+  daylight saving (UTC and fixed offsets are translated, 2026-11-26),
+  comparing a string column with a
   number;
 - it is not inside a multi-statement transaction (`autocommit = 0`, or
   after BEGIN / START TRANSACTION): MySQL never offloads those (with
@@ -1139,6 +1142,15 @@ What to know when reading the tables:
   submodules). A different version may refuse the file or, worse, upgrade
   it.
 
+### A query running in DuckDB
+
+While DuckDB computes an offloaded query's first rows (during MySQL's
+optimization: the joins, aggregations and sorts happen there), SHOW
+PROCESSLIST shows "DuckDB: running the query (until its first rows)" and
+the Performance Schema stage `stage/duckdb/running query in DuckDB`
+(2026-11-26; before, MySQL's last own stage stayed, for example "Creating
+tmp table"). KILL QUERY stops DuckDB.
+
 ### Status variables
 
 For PMM / Grafana: a dashboard and custom queries for these numbers, the
@@ -1214,8 +1226,8 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | `duckdb_data_path` | global | no | `""` | path | Lake directory. Empty: `<datadir>/duckdb_data`; a relative path is resolved against the datadir. Must not be the datadir or inside a schema directory, must not be world-writable. |
 | `duckdb_memory_limit` | global | yes | none (mandatory) | ≥ 256 MiB | Memory limit of DuckDB, applied at once. |
 | `duckdb_threads` | global | yes | none (mandatory) | 1 .. cores | DuckDB worker threads, applied at once. |
-| `duckdb_executor_threads` | global | yes | 4 | 1 .. cores | Threads that run DuckDB calls (DuckDB never runs on connection threads). Above the number of cores it is lowered with a warning. |
-| `duckdb_executor_stack_size` | global | no | 8 MiB | 2 .. 64 MiB | Stack size of the executor threads. |
+| `duckdb_executor_threads` | global | yes | 0 (one per core) | 0, 1 .. cores | Threads that run DuckDB calls (DuckDB never runs on connection threads). An offloaded query holds one while DuckDB computes its first rows: with fewer threads than concurrent offloaded queries, queries wait (`duckdb_executor_queue_waits`). Above the number of cores it is lowered with a warning. |
+| `duckdb_executor_stack_size` | global | no | 8 MiB | 2 .. 64 MiB | Stack size of the executor threads. Each thread reserves it as address space (40 threads x 64 MiB = 2.5 GiB), used memory only as needed: not part of `duckdb_memory_limit`. |
 | `duckdb_encryption` | global | no | OFF | ON, OFF | Not supported: ON prevents the plugin from loading. |
 | `duckdb_apply_batch_max_trx` | global | yes | 1000 | 1 .. 1,000,000 | The applier commits a batch after this many source transactions that change loaded tables. |
 | `duckdb_apply_batch_max_rows` | global | yes | 100000 | 1000 .. 100,000,000 | The applier commits a batch after this many changed rows. A larger transaction is applied in pieces of this size inside one DuckDB transaction. |
@@ -1246,12 +1258,27 @@ all), `innodb_flush_log_at_trx_commit=1` (recommended), `binlog_encryption=OFF`,
 `use_secondary_engine`, `secondary_engine_cost_threshold`,
 `log_error_verbosity` (3 to see the plugin's notes).
 
+They stay required after SECONDARY_LOAD (2026-11-26). A session cannot
+write to a table with a copy with `sql_log_bin = 0`, `binlog_format`
+STATEMENT or MIXED, or `binlog_row_image` MINIMAL or NOBLOB: the statement
+fails ("... the DuckDB copy of db.t follows the binary log and would
+silently differ from InnoDB"); the binary log is the only way changes reach
+the copy. Tables without a copy are not affected, nor statements that only
+read a copy. If such a change reaches the applier anyway (a source with
+other settings, on a replica), the copy is marked stale (error log; STATE
+`STALE` in `DUCKDB_TABLES`). `binlog_order_commits` set to OFF stops the
+applier with the reason: set it back to ON, then `SET GLOBAL duckdb_enable
+= OFF` and `ON` (it resumes from its applied position). `sync_binlog` other
+than 1 gives an error-log warning. `binlog_row_metadata` other than FULL
+stops the applier at the first change it cannot decode.
+
 ### Status variables
 
 | Variable | Meaning |
 |---|---|
 | `duckdb_enabled` | The lake is open. |
 | `duckdb_lake_path` | Lake directory in use. |
+| `duckdb_executor_queue_waits` / `duckdb_executor_queue_wait_us` | Calls that waited for a free executor thread (more than 1 ms), and their total wait in microseconds (since 2026-11-26). |
 | `duckdb_executor_threads_busy` / `duckdb_executor_queue_length` / `duckdb_executor_tasks` | Executor pool: busy threads, queued calls, calls run. |
 | `duckdb_apply_reader_state` | Applier state (section 10). |
 | `duckdb_apply_reader_file` / `duckdb_apply_reader_position` | Next binary log position to read. |
@@ -1295,7 +1322,8 @@ such a CHAR value then misses them).
   to 6d, T1 to T3 step 3, weight strings, the types of section 6, the
   reviewed date, number and string functions); everything else runs on
   InnoDB: window functions, ROLLUP, UPPER / LOWER, STR_TO_DATE, functions on
-  TIMESTAMP columns, CAST of strings, GROUP_CONCAT, LIKE and string functions
+  TIMESTAMP columns under a time zone with daylight saving, CAST of
+  strings, GROUP_CONCAT, LIKE and string functions
   on non-binary collations, a grouped string in a join whose groups mix
   values equal under the collation ('a' / 'a ' / 'A').
 - MySQL never offloads a query inside a multi-statement transaction
@@ -1313,7 +1341,7 @@ such a CHAR value then misses them).
   deleted rows at checkpoints.
 - A refresh after DDL reloads the whole table and pauses the applier for all
   tables while it runs.
-- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 39 tests) covers the
+- The MTR suite (`storage/duckdb/mysql-test/duckdb`, 44 tests) covers the
   features; restarts with special options, replica, semi-sync, relocation
   and performance stay in `manual-test-plan.md`.
 - Replicas: tested with a source without the plugin (section 2, Replicas).

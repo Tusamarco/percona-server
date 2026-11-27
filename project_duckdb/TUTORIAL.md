@@ -105,7 +105,7 @@ cmake --build . --target duckdb duckdb_apply-t -j "$(nproc)"
 ```bash
 cd "$BUILD"
 ls -l plugin_output_directory/ha_duckdb.so            # the plugin library
-./runtime_output_directory/duckdb_apply-t | tail -1   # [  PASSED  ] 41 tests.
+./runtime_output_directory/duckdb_apply-t | tail -1   # [  PASSED  ] 42 tests.
 ```
 
 The test suite (optional, long): see `storage/duckdb/mysql-test/duckdb/README.md`.
@@ -1303,7 +1303,7 @@ the table. To read while MySQL runs, query through MySQL, or copy the whole
 - Offload everything: window functions, UPPER / LOWER, CAST of strings,
   DATE_FORMAT week codes (%U %u %V %v %X %x), SYSDATE(),
   LIKE and string functions on non-binary collations, functions on
-  TIMESTAMP columns, a grouped string in a join whose groups mix 'a' and
+  TIMESTAMP columns under a time zone with daylight saving, a grouped string in a join whose groups mix 'a' and
   'a ' (or 'A' and 'a'), GROUP_CONCAT, JSON
   functions, recursive CTEs, LATERAL. They run on InnoDB.
 - Column type VECTOR, DECIMAL above 38 digits: the table cannot be loaded.

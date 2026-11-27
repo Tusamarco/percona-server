@@ -64,6 +64,16 @@ DdlStatement parse_ddl(std::string_view query, const std::string &default_db,
                        bool lower_case_names);
 
 /**
+  The tables a DML statement written to the binary log as text writes
+  (INSERT, REPLACE, UPDATE, DELETE, LOAD DATA; binlog_format STATEMENT or
+  MIXED in the writing session). Empty for anything else. May include a
+  table a multi-table statement only reads (safe for marking copies stale).
+*/
+std::vector<TableName> parse_dml_targets(std::string_view query,
+                                         const std::string &default_db,
+                                         bool lower_case_names);
+
+/**
   The renames of `first` followed by those of `then`, as one mapping from the
   names before `first` (a->b then b->c gives a->c). A refresh that waits for a
   later RENAME collects the column renames of every DDL until then.

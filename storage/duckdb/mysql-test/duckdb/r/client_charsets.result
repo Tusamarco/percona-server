@@ -1,0 +1,22 @@
+CREATE TABLE cs (id INT PRIMARY KEY, u VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+l VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_bin, c CHAR(5) COLLATE utf8mb4_bin) SECONDARY_ENGINE = duckdb;
+INSERT INTO cs VALUES (1, 'José', 'José', 'ä'), (2, 'Straße', 'Straße', 'ß'), (3, 'Привет', 'abc', 'я'),
+(4, '😀 emoji', 'x', NULL), (5, NULL, NULL, 'é');
+ALTER TABLE cs SECONDARY_LOAD;
+SET NAMES latin1;
+# SELECT id, u, l, c, CONCAT(u, '-', c), LENGTH(u), CHAR_LENGTH(l) FROM cs ORDER BY id
+SET NAMES utf8mb3;
+Warnings:
+Warning	1287	'utf8mb3' is deprecated and will be removed in a future release. Please use utf8mb4 instead
+# SELECT id, u, l, c, CONCAT(u, '-', c), LENGTH(u), CHAR_LENGTH(l) FROM cs ORDER BY id
+SET NAMES cp1251;
+# SELECT id, u, l, c, CONCAT(u, '-', c), LENGTH(u), CHAR_LENGTH(l) FROM cs ORDER BY id
+SET NAMES utf8mb4;
+SET SESSION character_set_results = NULL;
+# SELECT id, u, l, c, CONCAT(u, '-', c), LENGTH(u), CHAR_LENGTH(l) FROM cs ORDER BY id
+SET NAMES utf8mb4;
+# A constant in the query in the connection's character set
+SET NAMES latin1;
+# SELECT id FROM cs WHERE l = 'José' ORDER BY id
+SET NAMES utf8mb4;
+DROP TABLE cs;

@@ -2,6 +2,14 @@
 
 Affects: Percona Server 9.7 — Status: implemented, verified on a throwaway instance (2026-11-15); MTR `guard` in the suite
 
+(2026-11-26, external review: the guard also refuses INSERT / UPDATE /
+DELETE / REPLACE / TRUNCATE of a table with a DuckDB copy when the session
+has `sql_log_bin = 0`, `binlog_format` other than ROW or `binlog_row_image`
+other than FULL: the copy follows the binary log only, and such a change
+would never reach it, or reach it incomplete. Tables only read, tables
+without a copy, the replication applier and the plugin's own sessions are
+not checked. MTR `binlog_safety`.)
+
 ## Implementation (2026-11-15)
 
 The open points were verified in the 9.7 source: table access events still

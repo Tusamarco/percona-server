@@ -66,6 +66,13 @@ void Executor::worker_loop(Worker *self) {
     std::shared_ptr<Task> task = m_queue.front();
     m_queue.pop_front();
     task->state = State::RUNNING;
+    const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - task->queued_at)
+                            .count();
+    if (waited > 1000) {
+      m_queue_waits++;
+      m_queue_wait_us += static_cast<unsigned long long>(waited);
+    }
     m_busy++;
     lk.unlock();
     // An exception must not leave the thread: std::terminate would stop

@@ -1,0 +1,44 @@
+SET SESSION time_zone = '+00:00';
+CREATE TABLE tz (id INT PRIMARY KEY, ts TIMESTAMP(3) NULL, t0 TIMESTAMP NULL, d DATE) SECONDARY_ENGINE = duckdb;
+INSERT INTO tz VALUES (1, '2024-01-01 00:30:00.125', '2024-01-01 00:30:00', '2024-01-01'),
+(2, '2023-12-31 23:30:00.500', '2023-12-31 23:30:00', '2023-12-31'),
+(3, '2024-02-29 18:45:59.999', '2024-02-29 18:45:59', '2024-03-01'),
+(4, '2024-06-30 05:00:00', '2024-06-30 05:00:00', '2024-06-30'),
+(5, NULL, NULL, NULL);
+ALTER TABLE tz SECONDARY_LOAD;
+# UTC
+# SELECT id, DATE(ts), YEAR(ts), MONTH(ts), DAYOFMONTH(ts), HOUR(ts), MINUTE(ts), EXTRACT(MICROSECOND FROM ts) FROM tz ORDER BY id
+# SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(t0, '%W %d %M %Y') FROM tz ORDER BY id
+# SELECT id, ts + INTERVAL 1 DAY, DATE_SUB(t0, INTERVAL 2 HOUR), DATEDIFF(ts, d), LAST_DAY(ts) FROM tz ORDER BY id
+# SELECT id, CAST(ts AS DATE), CAST(ts AS DATETIME(3)), CAST(t0 AS CHAR) FROM tz ORDER BY id
+# SELECT DATE(ts) AS day, COUNT(*) FROM tz GROUP BY day ORDER BY day
+# SELECT id FROM tz WHERE DATE(ts) = '2024-01-01' OR YEAR(t0) = 2023 ORDER BY id
+# +05:30 (dates move forward across midnight)
+SET SESSION time_zone = '+05:30';
+# SELECT id, DATE(ts), YEAR(ts), MONTH(ts), DAYOFMONTH(ts), HOUR(ts), MINUTE(ts), EXTRACT(MICROSECOND FROM ts) FROM tz ORDER BY id
+# SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(t0, '%W %d %M %Y') FROM tz ORDER BY id
+# SELECT id, ts + INTERVAL 1 DAY, DATE_SUB(t0, INTERVAL 2 HOUR), DATEDIFF(ts, d), LAST_DAY(ts) FROM tz ORDER BY id
+# SELECT id, CAST(ts AS DATE), CAST(ts AS DATETIME(3)), CAST(t0 AS CHAR) FROM tz ORDER BY id
+# SELECT DATE(ts) AS day, COUNT(*) FROM tz GROUP BY day ORDER BY day
+# SELECT id FROM tz WHERE DATE(ts) = '2024-01-01' OR YEAR(t0) = 2023 ORDER BY id
+# -08:00 (dates move back, across the year end)
+SET SESSION time_zone = '-08:00';
+# SELECT id, DATE(ts), YEAR(ts), MONTH(ts), DAYOFMONTH(ts), HOUR(ts), MINUTE(ts), EXTRACT(MICROSECOND FROM ts) FROM tz ORDER BY id
+# SELECT id, ts + INTERVAL 1 DAY, DATE_SUB(t0, INTERVAL 2 HOUR), DATEDIFF(ts, d), LAST_DAY(ts) FROM tz ORDER BY id
+# SELECT DATE(ts) AS day, COUNT(*) FROM tz GROUP BY day ORDER BY day
+# SELECT id FROM tz WHERE DATE(ts) = '2024-01-01' OR YEAR(t0) = 2023 ORDER BY id
+# A zone with daylight saving: refused (InnoDB answers with ON)
+SET SESSION time_zone = 'MET';
+# SELECT id, DATE(ts) FROM tz ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, DATE(ts) FROM tz ORDER BY id;
+Got one of the listed errors
+# SYSTEM: translated only when the system zone really is UTC (MTR runs
+# with TZ=GMT-3: named GMT, three hours east): refused here
+SET SESSION time_zone = 'SYSTEM';
+# SELECT id, DATE(ts) FROM tz ORDER BY id
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, DATE(ts) FROM tz ORDER BY id;
+Got one of the listed errors
+SET SESSION time_zone = DEFAULT;
+DROP TABLE tz;
