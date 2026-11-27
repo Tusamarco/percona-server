@@ -221,7 +221,7 @@ sequenceDiagram
     participant G as duckdb_guard (audit)<br/>duckdb_guard.cc
     participant Q as MySQL optimizer<br/>Sql_cmd_dml
     participant H as Offload hooks<br/>duckdb_offload.cc
-    participant T as Generator (SQL translation)<br/>duckdb_offload.cc
+    participant T as Generator (SQL translation)<br/>duckdb_offload_*.cc
     participant R as BinlogReader
     participant X as Executor thread
     participant L as DuckDB lake<br/>repository.duckdb
@@ -999,7 +999,7 @@ coverage tracker updated.
 archived rows)
 - [ ] A stale history copy (DDL not followed, applier stopped): read it as
       of its last applied state with a warning instead of refusing.
-- [ ] Translate first what history reports use: CAST / CONVERT, NOW() /
+- [x] Translate first what history reports use: CAST / CONVERT, NOW() /
       CURRENT_DATE, DATE_FORMAT, functions on TIMESTAMP columns.
       Done: the NOW() family (2026-11-24, MTR `offload_now`: NOW,
       CURRENT_TIMESTAMP(n), CURDATE, CURTIME, UTC_*, UNIX_TIMESTAMP(), as
@@ -1050,18 +1050,42 @@ history)
       (MySQL converts both on the way out). MTR `client_charsets`.
 
 **Leftovers of the 2026-11-18 review**
-- [ ] B1: the DECIMAL first run materializes the whole result (memory);
-      policy: run first only grouped / LIMIT statements, or bound by
-      `duckdb_memory_limit` and fall back (decide).
+- [x] B1: the DECIMAL first run materializes the whole result. Decided
+      2026-11-27 (Marco): kept as is. The query runs once (the materialized
+      result is the one sent); DuckDB keeps it in buffer-managed memory
+      inside `duckdb_memory_limit` and spills to `tmp/` above it, so the
+      costs are a later first row and temp-disk use on large non-aggregated
+      results, never out of memory. Running first only grouped / LIMIT
+      statements would send the others to InnoDB (much slower, an error
+      under FULL).
 - [x] D1 (2026-11-26, MTR `offload_edge_strings`: 8 collations, equality,
       ordering, grouping, distinct counts, MIN / MAX, joins; all identical to
       InnoDB): more edge data in the shared test tables (combining marks, emoji
       modifiers, 'ß', Turkish 'İ' / 'ı', trailing spaces vs tabs,
       `_ai_ci`-equal strings, 39-digit literals); a difference is a bug or a
       refusal, never a re-recorded result.
-- [ ] E1: split `duckdb_offload.cc` (about 3.6k lines) into literals,
-      strings, temporal, aggregates, blocks, execution; no behaviour change.
-- [ ] Document `autocommit=0` / `BEGIN` (MySQL never offloads there) in the
+- [x] E1 (2026-11-27, pure refactor, code moved verbatim; generated DuckDB
+      SQL of the 22 TPC-H queries and 41 other queries byte-identical before
+      and after; unit tests and the MTR suite pass unchanged): `duckdb_offload.cc`
+      (5036 lines) split into
+      `duckdb_offload_internal.h` (namespace `duckdb_se::offload`: `Kind`,
+      `SpecialColumn`, `StrMode`, the shared error constants, the helpers used
+      by more than one file, class `Generator`),
+      `duckdb_offload_literals.cc` (`is_constant`, `literal`, `typed_literal`,
+      `value_literal`, `time_literal`),
+      `duckdb_offload_strings.cc` (`StrMode` of a collation, PAD SPACE keys,
+      `weight_expr`, `string_key`, `order_key`, `enum_index`,
+      `grouped_value`, `blob_literal`),
+      `duckdb_offload_functions.cc` (comparison operands, DECIMAL and
+      unsigned arithmetic, DATE_FORMAT, session time zone and temporal
+      arguments, `special_args`, `aggregate`, `function`, `cast`),
+      `duckdb_offload_blocks.cc` (`expr`, `output_kind`, `table_ref`,
+      `from_list`, semi / anti joins, `derived_marker`, `unique_match`,
+      `lateral_keys`, `conjuncts`, `multi_eq`, `block_sql`, subqueries, set
+      operations, `generate`) and `duckdb_offload.cc` (read-your-writes
+      observer, `OffloadContext`, status counters, result conversion,
+      `execute_offloaded`, the prepare / optimize hooks, the public API).
+- [x] Document `autocommit=0` / `BEGIN` (MySQL never offloads there) in the
       HOWTO limits, with the HammerDB note.
 
 ### Production readiness

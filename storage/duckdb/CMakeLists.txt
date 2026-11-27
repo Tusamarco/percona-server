@@ -42,6 +42,10 @@ MYSQL_ADD_PLUGIN(duckdb
   duckdb_lake.cc
   duckdb_load.cc
   duckdb_offload.cc
+  duckdb_offload_blocks.cc
+  duckdb_offload_functions.cc
+  duckdb_offload_literals.cc
+  duckdb_offload_strings.cc
   duckdb_progress.cc
   duckdb_registry.cc
   duckdb_row_decoder.cc
