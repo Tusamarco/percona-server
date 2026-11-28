@@ -2250,19 +2250,155 @@
     },
     {
       "id": 38,
+      "type": "timeseries",
+      "title": "Query slots",
+      "description": "Offloaded queries holding a slot against duckdb_max_concurrent_queries (0 means the default, max(2, cores / 4)).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 81,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mysql_global_status_duckdb_queries_running{service_name=~\"$service_name\"}",
+          "legendFormat": "running",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mysql_global_variables_duckdb_max_concurrent_queries{service_name=~\"$service_name\"}",
+          "legendFormat": "configured (0: max(2, cores / 4))",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Query slot waits",
+      "description": "Queries that waited for a slot. Many waits with little spill: raise duckdb_max_concurrent_queries; spill with waits: keep it or lower it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 81,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mysql_global_status_duckdb_query_slot_waits{service_name=~\"$service_name\"}[$__rate_interval]))",
+          "legendFormat": "waits",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mysql_global_status_duckdb_query_slot_wait_us{service_name=~\"$service_name\"}[$__rate_interval])) / 1000000",
+          "legendFormat": "seconds waited per second",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 40,
       "type": "row",
       "title": "Configuration",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 81,
+        "y": 89,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 39,
+      "id": 41,
       "type": "stat",
       "title": "Memory limit",
       "description": "duckdb_memory_limit (global value).",
@@ -2272,7 +2408,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 82,
+        "y": 90,
         "w": 3,
         "h": 3
       },
@@ -2322,7 +2458,7 @@
       }
     },
     {
-      "id": 40,
+      "id": 42,
       "type": "stat",
       "title": "DuckDB threads",
       "description": "duckdb_threads (global value).",
@@ -2332,7 +2468,7 @@
       },
       "gridPos": {
         "x": 3,
-        "y": 82,
+        "y": 90,
         "w": 3,
         "h": 3
       },
@@ -2382,7 +2518,7 @@
       }
     },
     {
-      "id": 41,
+      "id": 43,
       "type": "stat",
       "title": "Executor threads",
       "description": "duckdb_executor_threads (global value).",
@@ -2392,7 +2528,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 82,
+        "y": 90,
         "w": 3,
         "h": 3
       },
@@ -2442,7 +2578,67 @@
       }
     },
     {
-      "id": 42,
+      "id": 44,
+      "type": "stat",
+      "title": "Max concurrent queries",
+      "description": "duckdb_max_concurrent_queries (global value).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 9,
+        "y": 90,
+        "w": 3,
+        "h": 3
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mysql_global_variables_duckdb_max_concurrent_queries{service_name=~\"$service_name\"}",
+          "legendFormat": "{{service_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 45,
       "type": "stat",
       "title": "Batch max trx",
       "description": "duckdb_apply_batch_max_trx (global value).",
@@ -2451,8 +2647,8 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 9,
-        "y": 82,
+        "x": 12,
+        "y": 90,
         "w": 3,
         "h": 3
       },
@@ -2502,7 +2698,7 @@
       }
     },
     {
-      "id": 43,
+      "id": 46,
       "type": "stat",
       "title": "Batch max rows",
       "description": "duckdb_apply_batch_max_rows (global value).",
@@ -2511,8 +2707,8 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 12,
-        "y": 82,
+        "x": 15,
+        "y": 90,
         "w": 3,
         "h": 3
       },
@@ -2562,7 +2758,7 @@
       }
     },
     {
-      "id": 44,
+      "id": 47,
       "type": "stat",
       "title": "Batch max delay",
       "description": "duckdb_apply_batch_max_delay_ms (global value).",
@@ -2571,8 +2767,8 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 15,
-        "y": 82,
+        "x": 18,
+        "y": 90,
         "w": 3,
         "h": 3
       },
@@ -2622,7 +2818,7 @@
       }
     },
     {
-      "id": 45,
+      "id": 48,
       "type": "stat",
       "title": "Offload min rows",
       "description": "duckdb_offload_min_rows (global value).",
@@ -2631,8 +2827,8 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 18,
-        "y": 82,
+        "x": 21,
+        "y": 90,
         "w": 3,
         "h": 3
       },
@@ -2682,7 +2878,7 @@
       }
     },
     {
-      "id": 46,
+      "id": 49,
       "type": "stat",
       "title": "Wait timeout",
       "description": "duckdb_offload_wait_timeout_ms (global value).",
@@ -2691,8 +2887,8 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 21,
-        "y": 82,
+        "x": 0,
+        "y": 93,
         "w": 3,
         "h": 3
       },

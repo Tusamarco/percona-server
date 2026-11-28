@@ -98,7 +98,7 @@ PMM's `Metrics`; in another Grafana choose your Prometheus source.
 | History and DDL | archived rows, purge transactions, DDL refreshes / renames / deferred / failures | `duckdb_apply_archived_rows`, `_purge_transactions`, `_ddl_*` |
 | Copies and progress | table of every copy (state colored), progress bars of refreshes and of loads / DDL waits by stage | `mysql_duckdb_tables_*`, `mysql_duckdb_stages_*` |
 | DuckDB engine | memory used against `duckdb_memory_limit`, spill to disk | `duckdb_memory_used_bytes`, `duckdb_temp_spill_bytes` |
-| Executor | busy threads against `duckdb_executor_threads`, queued tasks, tasks per second | `duckdb_executor_*` |
+| Executor | busy threads against `duckdb_executor_threads`, queued tasks, tasks per second; offloaded queries holding a slot against `duckdb_max_concurrent_queries`, slot waits | `duckdb_executor_*`, `duckdb_queries_running`, `duckdb_query_slot_*` |
 | Configuration | memory limit, threads, batch settings, offload thresholds | `mysql_global_variables_duckdb_*` |
 
 Alert ideas (Grafana alerting / PMM alert rules):
@@ -112,6 +112,7 @@ Alert ideas (Grafana alerting / PMM alert rules):
 | DuckDB spills | `mysql_global_status_duckdb_temp_spill_bytes > 0` for 10 min |
 | DuckDB memory near the limit | `mysql_global_status_duckdb_memory_used_bytes / mysql_global_variables_duckdb_memory_limit > 0.9` |
 | Executor saturated | `mysql_global_status_duckdb_executor_queue_length > 0` for 5 min |
+| Queries wait for a slot | `rate(mysql_global_status_duckdb_query_slot_wait_us[5m]) / 1e6 > 1` for 10 min |
 
 ## Not covered yet
 

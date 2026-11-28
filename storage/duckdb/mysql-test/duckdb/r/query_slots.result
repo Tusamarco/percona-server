@@ -1,0 +1,46 @@
+CREATE TABLE qs (id INT PRIMARY KEY, g INT, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO qs VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40);
+ALTER TABLE qs SECONDARY_LOAD;
+SET @old_max = @@GLOBAL.duckdb_max_concurrent_queries;
+SET GLOBAL duckdb_max_concurrent_queries = 1;
+SELECT VARIABLE_VALUE INTO @waits0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_query_slot_waits';
+# c1 takes the only slot and keeps it (debug sync point)
+SET DEBUG_SYNC = 'duckdb_query_slot_acquired SIGNAL held WAIT_FOR release';
+SET SESSION use_secondary_engine = FORCED;
+SELECT g, SUM(v) FROM qs GROUP BY g ORDER BY g;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+# c2 (use_secondary_engine = ON) waits for a slot ...
+SET SESSION use_secondary_engine = ON;
+SET SESSION secondary_engine_cost_threshold = 0;
+SELECT g, SUM(v) FROM qs GROUP BY g ORDER BY g;
+# SHOW PROCESSLIST (and I_S) show the text, Performance Schema the stage
+SELECT STATE FROM performance_schema.processlist WHERE ID = C2_ID;
+STATE
+waiting for query slot
+SELECT STATE FROM information_schema.PROCESSLIST WHERE ID = C2_ID;
+STATE
+Waiting for a DuckDB query slot (1 of 1 running, duckdb_max_conc
+# ... and KILL QUERY interrupts it: no InnoDB answer
+ERROR 70100: Query execution was interrupted
+# c3 waits, then runs in DuckDB when c1 frees the slot
+SET SESSION use_secondary_engine = FORCED;
+SELECT g, SUM(v) FROM qs GROUP BY g ORDER BY g;
+SET DEBUG_SYNC = 'now SIGNAL release';
+g	SUM(v)
+1	30
+2	70
+g	SUM(v)
+1	30
+2	70
+SET DEBUG_SYNC = 'RESET';
+SELECT VARIABLE_VALUE - @waits0 AS waits_counted FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_query_slot_waits';
+waits_counted
+2
+SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_queries_running';
+VARIABLE_VALUE
+0
+SELECT NAME FROM performance_schema.setup_instruments WHERE NAME = 'stage/duckdb/waiting for query slot';
+NAME
+stage/duckdb/waiting for query slot
+SET GLOBAL duckdb_max_concurrent_queries = @old_max;
+DROP TABLE qs;

@@ -1454,12 +1454,12 @@ bool BinlogReader::commit_pending(std::string *err) {
     // sync_binlog: a crash can then lose binary log transactions InnoDB
     // committed, and history copies their archived rows; nothing to stop,
     // so a warning when it changes.
-    static ulong warned_for = 1;
+    static uint warned_for = 1;
     if (sync_binlog_period != warned_for) {
       warned_for = sync_binlog_period;
       if (sync_binlog_period != 1)
         DUCKDB_LOG_WARNING(
-            "sync_binlog is %lu: after a crash the binary log can miss "
+            "sync_binlog is %u: after a crash the binary log can miss "
             "transactions InnoDB committed, and DuckDB copies (history "
             "copies: their archived rows) would miss them too; "
             "SECONDARY_LOAD of history tables requires sync_binlog = 1",

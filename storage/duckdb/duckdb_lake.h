@@ -46,6 +46,9 @@ struct LakeSettings {
       elsewhere), read its files from duckdb_data_path. The native lake
       file stores no path: a moved lake always opens. */
   bool relocate;
+  /** duckdb_tmp_path: where DuckDB spills (empty: <data_path>/tmp; a
+      relative path against the datadir). */
+  const char *tmp_path;
 };
 
 /**
@@ -138,8 +141,9 @@ class Lake {
   /** Runs a nullptr-terminated list of statements; executor thread only. */
   bool run_all(const char *const *statements, std::string *err);
   /** DuckDB part of open(): runs on an executor thread. */
-  bool open_duckdb(const std::string &lake, const LakeSettings &settings,
-                   bool migrate, std::string *err);
+  bool open_duckdb(const std::string &lake, const std::string &tmp,
+                   const LakeSettings &settings, bool migrate,
+                   std::string *err);
   /** Closes DuckDB: runs on an executor thread. */
   void close_duckdb();
   /** Drops build tables left by a load interrupted before its swap. */

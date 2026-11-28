@@ -18,6 +18,7 @@ MySQL WL numbers.
 | [DWL#5](DWL-05-history-retention.md) | History retention: purge marker and archive marks | Implemented (fixed purge tag, counters, `duckdb_history_scope` and `DUCKDB_HISTORY_READER`), verified on a throwaway instance; MTR `history` | DWL#4 |
 | [DWL#6](DWL-06-query-offload.md) | Query offload through the external executor | 6a (single table, external executor, read your own writes) and 6b (expressions, PAD SPACE collations, TIMESTAMP constants) verified on the reference instance; 6c-1 (joins, semi/anti joins, derived tables, views, CTEs) and 6c-2 (UNION, INTERSECT, EXCEPT) verified on the reference instance; 6c-3 (subqueries) implemented, verified on a throwaway instance; types, DECIMAL overflow, LIKE, grouped CHAR, function review implemented, MTR tests; T1 parameters and variables, T2 DuckDB errors at the start of execution, JSON and spatial columns (2026-11-23); NOW() family, CAST / CONVERT, DATE_FORMAT, NOT EXISTS as anti join (2026-11-24), MTR tests; TPC-H 22 of 22 | DWL#3, DWL#4, DWL#5 |
 | [DWL#7](DWL-07-full-scope-guard.md) | FULL scope guard plugin | Implemented (duckdb_guard audit plugin), verified on a throwaway instance; MTR `guard` | DWL#6 |
+| [DWL#8](DWL-08-history-maintenance.md) | History maintenance: `duckdb_delete` and `duckdb_update` (binary-logged requests run by the applier) | Design, to review (2026-11-27) | DWL#4, DWL#5, DWL#6, DWL#7 |
 
 Done 2026-11-15/16: replica test (test plan section 18, with the guard and
 super_read_only fixes), `INFORMATION_SCHEMA.DUCKDB_TABLES` (the registry as a

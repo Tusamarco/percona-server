@@ -71,11 +71,13 @@ namespace {
 // System variables; the server adds the duckdb_ prefix.
 bool srv_enable = true;
 char *srv_data_path = nullptr;
+char *srv_tmp_path = nullptr;
 bool srv_lake_relocate = true;
 unsigned long long srv_memory_limit = 0;  // 0: not set
 unsigned int srv_threads = 0;             // 0: not set
 bool srv_encryption = false;
 unsigned int srv_executor_threads = 0;  // 0: one per core
+unsigned int srv_max_concurrent_queries = 0;  // 0: max(2, cores / 4)
 unsigned long long srv_executor_stack_size = 8ULL << 20;
 bool srv_apply_debug_log = false;
 unsigned long long srv_apply_batch_max_trx = 1000;
@@ -133,7 +135,8 @@ LakeSettings lake_settings() {
           srv_threads,
           executor_threads_value(srv_executor_threads),
           srv_executor_stack_size,
-          srv_lake_relocate};
+          srv_lake_relocate,
+          srv_tmp_path};
 }
 
 // The server calls our entry points (handler methods, variable callbacks,
@@ -480,6 +483,17 @@ MYSQL_SYSVAR_STR(data_path, srv_data_path,
                  "the datadir.",
                  nullptr, nullptr, "");
 
+MYSQL_SYSVAR_STR(tmp_path, srv_tmp_path,
+                 PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG |
+                     PLUGIN_VAR_MEMALLOC,
+                 "Directory where DuckDB writes temporary data (spills of "
+                 "large joins, aggregations and sorts). Empty means "
+                 "<duckdb_data_path>/tmp; a relative path is resolved "
+                 "against the datadir. Another disk than the repository's "
+                 "keeps spills from slowing its reads. DuckDB's leftover "
+                 "temporary files there are removed at startup.",
+                 nullptr, nullptr, "");
+
 MYSQL_SYSVAR_ULONGLONG(memory_limit, srv_memory_limit, PLUGIN_VAR_RQCMDARG,
                        "Memory limit of DuckDB in bytes, at least 256 MiB. "
                        "Mandatory: the plugin does not load without it.",
@@ -680,6 +694,16 @@ MYSQL_SYSVAR_ENUM(apply_gap_action, srv_apply_gap_action, PLUGIN_VAR_RQCMDARG,
                   "at the first available binary log).",
                   nullptr, update_apply_gap_action, 0, &gap_action_typelib);
 
+MYSQL_SYSVAR_UINT(max_concurrent_queries, srv_max_concurrent_queries,
+                  PLUGIN_VAR_RQCMDARG,
+                  "Offloaded queries that compute in DuckDB at the same time; "
+                  "the others wait for a slot (SHOW PROCESSLIST \"Waiting "
+                  "for a DuckDB query slot\"; KILL QUERY and "
+                  "max_execution_time stop the wait). Too many memory-heavy "
+                  "queries at once exceed duckdb_memory_limit and make "
+                  "DuckDB spill. 0 (default): max(2, cores / 4).",
+                  nullptr, nullptr, 0, 0, 65536, 0);
+
 MYSQL_SYSVAR_UINT(executor_threads, srv_executor_threads, PLUGIN_VAR_RQCMDARG,
                   "Threads that run DuckDB calls, from 1 to the number of "
                   "cores; 0 (default) is one per core. An offloaded query "
@@ -700,6 +724,8 @@ SYS_VAR *duckdb_system_variables[] = {MYSQL_SYSVAR(enable),
                                       MYSQL_SYSVAR(threads),
                                       MYSQL_SYSVAR(encryption),
                                       MYSQL_SYSVAR(executor_threads),
+                                      MYSQL_SYSVAR(max_concurrent_queries),
+                                      MYSQL_SYSVAR(tmp_path),
                                       MYSQL_SYSVAR(executor_stack_size),
                                       MYSQL_SYSVAR(apply_debug_log),
                                       MYSQL_SYSVAR(apply_batch_max_trx),
@@ -918,6 +944,33 @@ int show_applied_gtid(THD *, SHOW_VAR *var, char *buff) {
   return show_text(var, buff, safe_status().applied_gtid);
 }
 
+int show_queries_running(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->scope = SHOW_SCOPE_GLOBAL;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) =
+      static_cast<longlong>(QuerySlot::running());
+  return 0;
+}
+
+int show_query_slot_waits(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->scope = SHOW_SCOPE_GLOBAL;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) =
+      static_cast<longlong>(QuerySlot::waits());
+  return 0;
+}
+
+int show_query_slot_wait_us(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->scope = SHOW_SCOPE_GLOBAL;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) =
+      static_cast<longlong>(QuerySlot::wait_us());
+  return 0;
+}
+
 int show_executor_queue_waits(THD *, SHOW_VAR *var, char *buff) {
   var->type = SHOW_LONGLONG;
   var->scope = SHOW_SCOPE_GLOBAL;
@@ -959,6 +1012,14 @@ SHOW_VAR duckdb_status_variables[] = {
      SHOW_SCOPE_GLOBAL},
     {"duckdb_executor_tasks", reinterpret_cast<char *>(&show_executor_tasks),
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_queries_running", reinterpret_cast<char *>(&show_queries_running),
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_query_slot_waits",
+     reinterpret_cast<char *>(&show_query_slot_waits), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_query_slot_wait_us",
+     reinterpret_cast<char *>(&show_query_slot_wait_us), SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"duckdb_executor_queue_waits",
      reinterpret_cast<char *>(&show_executor_queue_waits), SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
@@ -1269,6 +1330,11 @@ DecimalOverflow decimal_overflow(THD *thd) {
 
 bool ddl_wait_refresh(THD *thd) {
   return thd != nullptr && THDVAR(thd, ddl_wait_refresh);
+}
+
+unsigned int max_concurrent_queries() {
+  return srv_max_concurrent_queries != 0 ? srv_max_concurrent_queries
+                                         : std::max(2U, max_threads() / 4);
 }
 
 unsigned long long ddl_wait_refresh_timeout(THD *thd) {

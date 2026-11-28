@@ -279,8 +279,51 @@ bool Lake::open(const LakeSettings &s, std::string *err) {
   }
   const bool lake_existed = fs::exists(lake / kLakeFile, ec);
   const bool migrate = !lake_existed && fs::exists(lake / kLegacyCatalog, ec);
-  if (make_dir(lake, err) || make_dir(lake / kTmpDir, err)) return true;
+  // Where DuckDB spills: duckdb_tmp_path, by default <lake>/tmp (2026-11-27:
+  // spills on the device of the data slowed its reads under load).
+  const fs::path tmp = (s.tmp_path != nullptr && *s.tmp_path != '\0')
+                           ? resolve_path(s.tmp_path)
+                           : lake / kTmpDir;
+  if (tmp.native().find('\'') != std::string::npos) {
+    *err = "duckdb_tmp_path must not contain a single quote";
+    return true;
+  }
+  {
+    const fs::path datadir = canonical_datadir();
+    if (tmp == datadir ||
+        (is_inside(tmp, datadir) && !is_inside(tmp, lake) &&
+         std::distance(tmp.lexically_relative(datadir).begin(),
+                       tmp.lexically_relative(datadir).end()) > 1)) {
+      *err = "duckdb_tmp_path " + tmp.string() +
+             " must not be the datadir or inside a directory of the datadir";
+      return true;
+    }
+  }
+  if (make_dir(lake, err) || make_dir(tmp, err)) return true;
   if (check_permissions(lake, err)) return true;
+  if (tmp != lake / kTmpDir && check_permissions(tmp, err)) return true;
+  // Spill files of an earlier run (a crash, a killed server): nothing uses
+  // them now, and they can be large. Only DuckDB's own temporary files
+  // (duckdb_temp_*) are removed.
+  {
+    unsigned long long freed = 0;
+    unsigned files = 0;
+    for (const auto &e : fs::directory_iterator(tmp, ec)) {
+      const std::string name = e.path().filename().string();
+      if (name.rfind("duckdb_temp_", 0) != 0 || !e.is_regular_file(ec))
+        continue;
+      const auto size = e.file_size(ec);
+      if (fs::remove(e.path(), ec)) {
+        files++;
+        freed += ec ? 0 : size;
+      }
+    }
+    if (files > 0)
+      DUCKDB_LOG_INFO(
+          "DuckDB repository: removed %u leftover spill file(s) in %s "
+          "(%llu MB)",
+          files, tmp.c_str(), freed >> 20);
+  }
 
   // DuckLake data files without their catalog: the catalog was lost. A new
   // empty lake would hide the only copy of archived rows.
@@ -305,7 +348,9 @@ bool Lake::open(const LakeSettings &s, std::string *err) {
   }
   bool failed = true;
   if (executor.run(
-          [&] { failed = open_duckdb(lake.string(), s, migrate, err); })) {
+          [&] {
+            failed = open_duckdb(lake.string(), tmp.string(), s, migrate, err);
+          })) {
     *err = "the DuckDB executor did not run the open task";
     failed = true;
   }
@@ -323,8 +368,8 @@ bool Lake::open(const LakeSettings &s, std::string *err) {
   return false;
 }
 
-bool Lake::open_duckdb(const std::string &lake, const LakeSettings &s,
-                       bool migrate, std::string *err) {
+bool Lake::open_duckdb(const std::string &lake, const std::string &tmp,
+                       const LakeSettings &s, bool migrate, std::string *err) {
   if (register_extensions(err)) return true;
 
   duckdb_config cfg;
@@ -361,7 +406,6 @@ bool Lake::open_duckdb(const std::string &lake, const LakeSettings &s,
   }
 
   const std::string file = lake + "/" + kLakeFile;
-  const std::string tmp = lake + "/" + kTmpDir;
   std::string msg;
   if (migrate && migrate_from_ducklake(lake, s, err)) {
     close_duckdb();
@@ -384,7 +428,11 @@ bool Lake::open_duckdb(const std::string &lake, const LakeSettings &s,
       // (spills). Extensions are linked statically, so no
       // extension directory is needed. The allowed directory must be set
       // before external access is disabled; DuckDB refuses it afterwards.
-      run("SET allowed_directories = ['" + lake + "/']", &msg) ||
+      run("SET allowed_directories = ['" + lake + "/'" +
+              (tmp.rfind(lake + "/", 0) == 0 ? std::string()
+                                             : ", '" + tmp + "/'") +
+              "]",
+          &msg) ||
       run("SET enable_external_access = false", &msg) ||
       Registry::instance().reload(m_admin, &msg)) {
     *err = "cannot prepare the DuckDB repository: " + msg;

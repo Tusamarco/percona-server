@@ -99,7 +99,9 @@ loose-duckdb_memory_limit       = 1G     # mandatory, at least 256M
 loose-duckdb_threads            = 2      # mandatory, 1 .. number of cores
 # optional (defaults shown)
 # loose-duckdb_data_path          =        # empty: <datadir>/duckdb_data
-# loose-duckdb_executor_threads   = 4
+# loose-duckdb_executor_threads   = 0      # 0: one per core
+# loose-duckdb_max_concurrent_queries = 0  # 0: max(2, cores / 4)
+# loose-duckdb_tmp_path           =        # empty: <duckdb_data_path>/tmp
 # loose-duckdb_executor_stack_size = 8M
 
 # required by SECONDARY_LOAD (the copies are kept current from the binary log)
@@ -266,7 +268,10 @@ threads=N` and `binlog reader started at ...`.
 The lake directory (`duckdb_data_path`) holds `repository.duckdb`, a native DuckDB
 database file with every copy, the hidden columns and the plugin's schema
 `__mysql` (registry, applied position), its WAL `repository.duckdb.wal`, and `tmp/`
-for spills.
+for spills (`duckdb_tmp_path` puts the spills elsewhere, for example on
+another disk than the repository's). Spill files left by a crash
+(`duckdb_temp_*`) are removed at startup; the error log says how many and
+how large.
 
 ### Move the lake (duckdb_data_path)
 
@@ -1211,6 +1216,18 @@ the first rows, so that covers the usual cases; an error after rows were
 sent still reaches the client. Many `duckdb_execution` refusals: raise
 `duckdb_memory_limit` or check the disk of the lake's `tmp/` directory.
 
+Many concurrent memory-heavy queries (large joins, aggregations, sorts)
+together exceed `duckdb_memory_limit` and spill, and then all of them
+slow down (TPC-H with 16 streams: 94 GB spilled, none with the queries
+alone). `duckdb_max_concurrent_queries` caps the offloaded queries that
+compute in DuckDB at the same time (default max(2, cores / 4)); the others
+wait, in `SHOW PROCESSLIST` as `Waiting for a DuckDB query slot (N of M
+running, duckdb_max_concurrent_queries)` and in Performance Schema as
+`stage/duckdb/waiting for query slot`. KILL QUERY and `max_execution_time`
+end the wait with the usual error, also with `use_secondary_engine = ON`
+(a killed query never goes on to InnoDB). Waits: `duckdb_query_slot_waits`
+and `duckdb_query_slot_wait_us`; many waits with little spill: raise it.
+
 Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 
 ---
@@ -1227,6 +1244,8 @@ Test helpers (progress you can watch, clean stop): `duckdb_test_helpers.sql`.
 | `duckdb_memory_limit` | global | yes | none (mandatory) | ≥ 256 MiB | Memory limit of DuckDB, applied at once. |
 | `duckdb_threads` | global | yes | none (mandatory) | 1 .. cores | DuckDB worker threads, applied at once. |
 | `duckdb_executor_threads` | global | yes | 0 (one per core) | 0, 1 .. cores | Threads that run DuckDB calls (DuckDB never runs on connection threads). An offloaded query holds one while DuckDB computes its first rows: with fewer threads than concurrent offloaded queries, queries wait (`duckdb_executor_queue_waits`). Above the number of cores it is lowered with a warning. |
+| `duckdb_max_concurrent_queries` | global | yes | 0 (max(2, cores / 4)) | 0 .. 65536 | Offloaded queries that compute in DuckDB at the same time; the others wait for a slot (processlist `Waiting for a DuckDB query slot`, `duckdb_query_slot_waits`). KILL QUERY and `max_execution_time` end the wait. Bounds memory use and spills of concurrent heavy queries (since 2026-11-27). EXPLAIN does not take a slot. |
+| `duckdb_tmp_path` | global | no | `""` | path | Directory of DuckDB's temporary data (spills). Empty: `<duckdb_data_path>/tmp`; a relative path is resolved against the datadir. Must not be the datadir or inside a schema directory, must not be world-writable. Leftover `duckdb_temp_*` files are removed at startup (since 2026-11-27). |
 | `duckdb_executor_stack_size` | global | no | 8 MiB | 2 .. 64 MiB | Stack size of the executor threads. Each thread reserves it as address space (40 threads x 64 MiB = 2.5 GiB), used memory only as needed: not part of `duckdb_memory_limit`. |
 | `duckdb_encryption` | global | no | OFF | ON, OFF | Not supported: ON prevents the plugin from loading. |
 | `duckdb_apply_batch_max_trx` | global | yes | 1000 | 1 .. 1,000,000 | The applier commits a batch after this many source transactions that change loaded tables. |
@@ -1278,6 +1297,8 @@ stops the applier at the first change it cannot decode.
 |---|---|
 | `duckdb_enabled` | The lake is open. |
 | `duckdb_lake_path` | Lake directory in use. |
+| `duckdb_queries_running` | Offloaded queries holding a query slot now (computing in DuckDB or sending rows), since 2026-11-27. |
+| `duckdb_query_slot_waits` / `duckdb_query_slot_wait_us` | Queries that waited for a slot (`duckdb_max_concurrent_queries`) and their total wait in microseconds (since 2026-11-27). |
 | `duckdb_executor_queue_waits` / `duckdb_executor_queue_wait_us` | Calls that waited for a free executor thread (more than 1 ms), and their total wait in microseconds (since 2026-11-26). |
 | `duckdb_executor_threads_busy` / `duckdb_executor_queue_length` / `duckdb_executor_tasks` | Executor pool: busy threads, queued calls, calls run. |
 | `duckdb_apply_reader_state` | Applier state (section 10). |

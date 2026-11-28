@@ -357,6 +357,8 @@ All variables are plugin variables of the `duckdb` plugin, so the server adds th
 | `duckdb_threads` | int | none, mandatory | global | yes | Plugin init fails if not set; range 1 to the number of cores |
 | `duckdb_encryption` | BOOL | OFF | global | no | Fixed when the lake file is created; not in the POC |
 | `duckdb_executor_threads` | int | 0 = one per core (since 2026-11-26; was 4) | global | yes | Threads that run DuckDB calls; 0, or 1 to the number of cores; above the cores at startup it is lowered with a warning. An offloaded query holds one while DuckDB computes its first rows |
+| `duckdb_max_concurrent_queries` | int | 0 = max(2, cores / 4) | global | yes | Offloaded queries computing in DuckDB at once; the others wait for a slot (stage `waiting for query slot`), KILL ends the wait (since 2026-11-27) |
+| `duckdb_tmp_path` | string | empty = `<duckdb_data_path>/tmp` | global | no | DuckDB `temp_directory` (spills); same checks as `duckdb_data_path`; leftover spill files removed at startup (since 2026-11-27) |
 | `duckdb_executor_stack_size` | size | 8 MiB | global | no | Stack of the executor threads; 2 to 64 MiB |
 | `duckdb_history_scope` | enum LIVE, FULL | LIVE | global, session, SET_VAR hint | yes | Affects only tables with retain_history |
 | `duckdb_lake_relocate` | BOOL | ON | global | yes | Only when a DuckLake lake of an earlier version is migrated and its catalog stores another data path: ON reads its files from `duckdb_data_path`, OFF refuses (2026-11-25: the native lake file stores no path, a moved lake always opens) |
@@ -409,7 +411,8 @@ DuckDB instance (in memory, one per mysqld)
        ├─ lake.__mysql.tables               registry: state, history flag, load position,
        │                                    primary key, weight columns
        └─ lake.__mysql.applied_position     applied GTID, same transaction as data
-  temp_directory = <path>/tmp/              spills from large queries
+  temp_directory = <path>/tmp/              spills from large queries (duckdb_tmp_path;
+                                            leftover duckdb_temp_* removed at startup)
 ```
 
 Decided 2026-11-25 (Marco; replaces the DuckLake decision of 2026-11-04): the lake is one native DuckDB database file. Measured on 30M LINEITEM-like rows, DuckLake (Parquet) scans were 2-3x slower than native storage (TPC-H Q6 shape: 61 ms native, 157-174 ms DuckLake; Q1 shape: 214 ms against 408 ms); Parquet codecs and DuckDB's file caches made no difference. DuckLake's own features (snapshots and time travel, open Parquet files for other tools) were not used. AliSQL's and MariaDB's DuckDB engines also use native storage. The SQL inside the plugin still names the attached database `lake` (`lake.<schema>.<table>`), so load, applier and offload are unchanged.
@@ -1044,7 +1047,22 @@ history)
       (`duckdb_executor_threads = 0`), waits are counted
       (`duckdb_executor_queue_waits`, `duckdb_executor_queue_wait_us`), and
       the session shows `stage/duckdb/running query in DuckDB` while DuckDB
-      runs it. A cap on concurrent offloaded queries: beta plan.
+      runs it.
+- [x] Cap on concurrent offloaded queries (2026-11-27): TPC-H at 16
+      streams spilled 94 GB (none with the queries alone) because the
+      memory-heavy queries (Q21, Q16, Q3) overlapped above
+      `duckdb_memory_limit`. `duckdb_max_concurrent_queries` (default
+      max(2, cores / 4)) admits that many; the others wait, visibly
+      (processlist, stage `waiting for query slot`, status
+      `duckdb_queries_running`, `duckdb_query_slot_waits`, `_wait_us`).
+      KILL QUERY / `max_execution_time` end the wait; a killed statement
+      is made fatal so that with `use_secondary_engine = ON` the server
+      does not retry it on InnoDB (the statement cleanup clears KILL QUERY
+      before the retry check; same for a kill while DuckDB computes the
+      first rows). `duckdb_tmp_path` moves spills to another disk; leftover
+      spill files are removed at startup. `tpch_spill_check.sh` measures
+      memory and spill per query, alone or with N streams. MTR
+      `query_slots`.
 - [x] Client character sets other than utf8mb4 (2026-11-26): latin1,
       utf8mb3, cp1251 and `character_set_results = NULL` get InnoDB's bytes
       (MySQL converts both on the way out). MTR `client_charsets`.
@@ -1102,7 +1120,7 @@ Must-have before any customer use:
 | Consistency check | An operator command (checksum per table or per range, InnoDB vs DuckDB, at the applied position) | Proof for operators and support; detects divergence after incidents | missing |
 | Disk space | Lake file size under continuous updates and after dropped copies (since 2026-11-25 native storage: DuckDB reuses freed space at checkpoints, the file does not shrink; DuckLake snapshot expiry and compaction no longer apply) | A lake that keeps growing is the risk most likely to hit a user within weeks | to measure |
 | Apply lag under write load | Sustained OLTP load (sysbench or HammerDB TPROC-C) next to the analytics; batch tuning; decide on the deferred parallel prepare workers | Freshness target and capacity planning | missing |
-| Resource governance | Memory and thread limit per offloaded query, a cap on concurrent offloaded queries, DuckDB out-of-memory becomes an error or an InnoDB fallback, never a crash | DuckDB runs inside mysqld: a runaway query affects OLTP | partial (`duckdb_memory_limit`, `duckdb_threads`, KILL, `max_execution_time`) |
+| Resource governance | Memory and thread limit per offloaded query, a cap on concurrent offloaded queries, DuckDB out-of-memory becomes an error or an InnoDB fallback, never a crash | DuckDB runs inside mysqld: a runaway query affects OLTP | partial (`duckdb_memory_limit`, `duckdb_threads`, `duckdb_max_concurrent_queries`, `duckdb_tmp_path`, KILL, `max_execution_time`); per-query memory limit missing |
 | Backup and restore | XtraBackup integration, or a documented procedure that keeps the lake, its applied position and the InnoDB backup consistent | For history tables the lake is the only copy of purged rows | missing |
 | Refresh after DDL | Incremental refresh (ALTER ADD / DROP COLUMN applied in place) or a refresh that does not stop the applier for other tables | Today DDL on a large table means minutes of lag for every table | missing |
 | Performance proof | HammerDB TPROC-H at scale factor 1 and 10 on the release build (next step 4) | The business case | planned |

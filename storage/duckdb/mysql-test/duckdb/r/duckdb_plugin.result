@@ -32,12 +32,14 @@ duckdb_executor_threads
 duckdb_history_check_only
 duckdb_history_scope
 duckdb_lake_relocate
+duckdb_max_concurrent_queries
 duckdb_memory_limit
 duckdb_offload_float_aggregates
 duckdb_offload_min_rows
 duckdb_offload_wait_applied
 duckdb_offload_wait_timeout_ms
 duckdb_threads
+duckdb_tmp_path
 duckdb_unload_history_confirm
 # Load and unload
 CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(10)) SECONDARY_ENGINE = duckdb;

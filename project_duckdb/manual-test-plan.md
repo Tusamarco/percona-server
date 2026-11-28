@@ -1449,10 +1449,26 @@ EXPECT=refused MYSQL="..." ./duckdb_offload_compare.sh offload_queries/duckdb_of
 
 TPC-H: 19 of 22 (22 of 22 since 2026-11-23; Q21 at SF100 fixed 2026-11-24).
 
+## 43. Spills: duckdb_tmp_path and leftover spill files (2026-11-27)
+
+Needs restarts, so not in MTR (the query slots are: MTR `query_slots`).
+
+1. Default: `duckdb_tmp_path` empty, spills go to `<duckdb_data_path>/tmp`.
+2. Stop mysqld, plant a file `duckdb_temp_999_1_storage.tmp` (a few MB) and a
+   file `keep_me.txt` in the spill directory, start: the error log says
+   `removed 1 leftover spill file(s) in <dir> (N MB)`, `keep_me.txt` stays.
+3. `loose-duckdb_tmp_path = <another directory>`: created at startup if
+   missing; a large query (memory limit small enough to spill) writes there,
+   `duckdb_temp_spill_bytes` grows, nothing in the lake's `tmp/`.
+4. Refused at startup (plugin not loaded, readable error): the datadir, a
+   schema directory of the datadir, a world-writable directory, a path with
+   a quote.
+
 ## Results log
 
 | Date | Build | Sections run | Result | Notes |
 |---|---|---|---|---|
+| 2026-11-27 | clang-21, C++23, debug | 43 steps 1-2 (throwaway instance); query slots by hand before MTR query_slots | pass after a fix | planted 5 MB duckdb_temp_999_1_storage.tmp removed at startup, keep_me.txt kept; with duckdb_max_concurrent_queries = 1 one query ran, two waited with the processlist text, KILL of a FORCED waiter gave the interrupted error, counters waits / wait_us right. Fixed (found by MTR query_slots): a query with use_secondary_engine = ON killed while waiting (or while DuckDB computed its first rows) was retried on InnoDB and answered, because the statement cleanup clears KILL QUERY before the server's retry check; now a fatal error, never retried |
 | 2026-11-17 | clang-21, C++23, debug | 42, function review against DuckDB (throwaway instance; MTR offload_functions, offload_refusals) | pass after fixes | fn 28/28 identical and offloaded, refusals 11/11; every earlier list unchanged (6b refusal TRUNCATE now translated, replaced by EXP); TPC-H 19 of 22 (Q7, Q8, Q9). Found by the edge values: DuckDB substring / left / right with 0 or negative values, lpad with an empty pad (error), greatest skipping NULL, sqrt / ln domain (NaN, -inf), extract(microsecond) including seconds, upper('ß'), ascii (code point): guarded or refused; MySQL computes dates down to year 0 (first guard said 1000); the parser builds LOCATE with the string first; constants inside these functions took the date type of an enclosing comparison; the binary-equality rule first also changed GROUP BY keys (TPC-H regression, caught, limited to comparisons) |
 | 2026-11-17 | clang-21, C++23, debug | 41, grouped CHAR in joins (throwaway instance; MTR offload_grouped_char) | pass | 3/3 identical (latin1_bin, utf8mb4_bin, trailing spaces from load and binary log), VARCHAR and _ci refused 2/2, PAD_CHAR_TO_FULL_LENGTH refused; every earlier list unchanged; TPC-H 16 of 22 (Q4, Q5, Q10, Q12 added). Found: PAD_CHAR_TO_FULL_LENGTH was not handled (CHAR results without padding), now refused |
 | 2026-11-17 | clang-21, C++23, debug | 40, LIKE on binary collations (throwaway instance; MTR offload_like, offload_refusals, offload_weights) | pass after a fix | like 19/19 identical and offloaded, refusal 1/1, NO_BACKSLASH_ESCAPES identical; every earlier list unchanged; TPC-H 12 of 22 (Q2, Q13, Q14, Q20 added). Fixed (older than this step, every collation): LIKE without ESCAPE used no escape in DuckDB, MySQL uses `\\` (Item_func_like::escape() now passed always) |

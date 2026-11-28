@@ -14,6 +14,7 @@ results of 2026-11-17.
 | `tpch_schema.sql` | The schema as HammerDB creates it for MySQL (`src/mysql/mysqlolap.tcl`): database `latin1`, every character column `BINARY` (so `latin1_bin`), the same primary keys, indexes and foreign keys; plus `SECONDARY_ENGINE = duckdb`. |
 | `tpch_data.sql` | About scale factor 0.01 (LINEITEM 60,000 rows), deterministic, with TPC-H value domains so every query finds rows; loads the copies; creates the view of Q15. Not a dbgen replacement. |
 | `tpch_queries.sql` | The 22 queries in HammerDB's MySQL syntax (`date '...' + interval '3' month`, `extract(year from ...)`, `substr(...)`), validation parameters, one per line. |
+| `tpch_spill_check.sh` | Memory and spill of the 22 queries in DuckDB (FORCED): each alone (`STREAMS=1`, saves each query's DuckDB SQL and plan), or N parallel streams like HammerDB virtual users (`STREAMS=N`, each stream in its own seeded order or the order of `ORDER_FILE`; `SOLO=1` adds the solo pass for the slowdown). Samples memory and spill every 0.2 s (`SPILL_DIR` measures the spill directory directly), prints progress, and reports per query mean / min / max and which queries were running while the spill grew. Usage in the script header. |
 | `mysql_tproch_run.tcl` | HammerDB CLI script for a TPROC-H run (`./hammerdbcli auto mysql_tproch_run.tcl`): patches HammerDB's MySQL driver so autocommit is on and sets `use_secondary_engine` (ON or FORCED) on its sessions. |
 
 ## Run

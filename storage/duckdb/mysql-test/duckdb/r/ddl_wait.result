@@ -6,6 +6,7 @@ stage/duckdb/copy load	YES
 stage/duckdb/running query in DuckDB	YES
 stage/duckdb/waiting for applier	YES
 stage/duckdb/waiting for copy refresh	YES
+stage/duckdb/waiting for query slot	YES
 SELECT @@duckdb_ddl_wait_refresh, @@duckdb_ddl_wait_refresh_timeout;
 @@duckdb_ddl_wait_refresh	@@duckdb_ddl_wait_refresh_timeout
 1	0

@@ -397,21 +397,40 @@ panels += [
         12, y, unit="ops", desc="DuckDB calls run by the executor."),
 ]
 y += 8
+panels += [
+    timeseries("Query slots", [
+        target(gs("duckdb_queries_running"), "running"),
+        target(gv("duckdb_max_concurrent_queries"), "configured (0: max(2, cores / 4))")],
+        0, y, unit="short",
+        desc="Offloaded queries holding a slot against "
+             "duckdb_max_concurrent_queries (0 means the default, "
+             "max(2, cores / 4))."),
+    timeseries("Query slot waits", [
+        target(f"sum({rate('duckdb_query_slot_waits')})", "waits"),
+        target(f"sum({rate('duckdb_query_slot_wait_us')}) / 1000000",
+               "seconds waited per second")],
+        12, y, unit="short",
+        desc="Queries that waited for a slot. Many waits with little spill: "
+             "raise duckdb_max_concurrent_queries; spill with waits: keep "
+             "it or lower it."),
+]
+y += 8
 
 # ------------------------------------------------------------ Configuration
 panels.append(row("Configuration", y)); y += 1
 cfg = [("Memory limit", "duckdb_memory_limit", "bytes"),
        ("DuckDB threads", "duckdb_threads", "short"),
        ("Executor threads", "duckdb_executor_threads", "short"),
+       ("Max concurrent queries", "duckdb_max_concurrent_queries", "short"),
        ("Batch max trx", "duckdb_apply_batch_max_trx", "short"),
        ("Batch max rows", "duckdb_apply_batch_max_rows", "short"),
        ("Batch max delay", "duckdb_apply_batch_max_delay_ms", "ms"),
        ("Offload min rows", "duckdb_offload_min_rows", "short"),
        ("Wait timeout", "duckdb_offload_wait_timeout_ms", "ms")]
 for i, (title, var, unit) in enumerate(cfg):
-    panels.append(stat(title, [target(gv(var))], (i % 8) * 3, y, w=3, h=3,
-                       unit=unit, desc=f"{var} (global value)."))
-y += 3
+    panels.append(stat(title, [target(gv(var))], (i % 8) * 3, y + (i // 8) * 3,
+                       w=3, h=3, unit=unit, desc=f"{var} (global value)."))
+y += 3 * ((len(cfg) + 7) // 8)
 
 dashboard = {
     "title": "MySQL DuckDB Secondary Engine",

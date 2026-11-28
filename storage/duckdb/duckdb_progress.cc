@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -48,6 +49,8 @@ PSI_stage_info stage_wait_applier = {0, "waiting for applier",
 // its last own stage ("Creating tmp table"), 2026-11-26.
 PSI_stage_info stage_running = {0, "running query in DuckDB", 0,
                                 PSI_DOCUMENT_ME};
+PSI_stage_info stage_slot_wait = {0, "waiting for query slot", 0,
+                                  PSI_DOCUMENT_ME};
 
 struct Entry {
   std::string db, table;
@@ -154,10 +157,70 @@ std::string seconds_text(double s) {
 
 void register_progress_stages() {
   PSI_stage_info *stages[] = {&stage_copy_load, &stage_wait_refresh,
-                              &stage_wait_applier, &stage_running};
+                              &stage_wait_applier, &stage_running,
+                              &stage_slot_wait};
   mysql_stage_register("duckdb", stages,
                        static_cast<int>(sizeof(stages) / sizeof(stages[0])));
 }
+
+namespace {
+std::mutex g_slot_mutex;
+std::condition_variable g_slot_free;
+unsigned long g_slots_used = 0;
+std::atomic<unsigned long long> g_slot_waits{0};
+std::atomic<unsigned long long> g_slot_wait_us{0};
+}  // namespace
+
+std::unique_ptr<QuerySlot> QuerySlot::acquire(THD *thd, unsigned limit) {
+  std::unique_lock<std::mutex> lk(g_slot_mutex);
+  if (limit == 0 || g_slots_used < limit) {
+    g_slots_used++;
+    return std::unique_ptr<QuerySlot>(new QuerySlot());
+  }
+  // Wait, visibly; KILL QUERY and max_execution_time stop the wait.
+  const auto start = Clock::now();
+  std::unique_ptr<ThreadDisplay> display;
+  lk.unlock();
+  display = std::make_unique<ThreadDisplay>(thd, &stage_slot_wait);
+  lk.lock();
+  bool killed = false;
+  while (g_slots_used >= limit) {
+    char text[160];
+    snprintf(text, sizeof(text),
+             "Waiting for a DuckDB query slot (%lu of %u running, "
+             "duckdb_max_concurrent_queries)",
+             g_slots_used, limit);
+    lk.unlock();
+    display->show(text, 0, 0);
+    killed = thd != nullptr && thd->is_killed();
+    lk.lock();
+    if (killed) break;
+    g_slot_free.wait_for(lk, std::chrono::milliseconds(100));
+  }
+  g_slot_waits++;
+  g_slot_wait_us += static_cast<unsigned long long>(
+      std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                            start)
+          .count());
+  if (killed) return nullptr;
+  g_slots_used++;
+  lk.unlock();
+  display.reset();  // the previous stage comes back
+  return std::unique_ptr<QuerySlot>(new QuerySlot());
+}
+
+QuerySlot::~QuerySlot() {
+  std::lock_guard<std::mutex> lk(g_slot_mutex);
+  if (g_slots_used > 0) g_slots_used--;
+  g_slot_free.notify_one();
+}
+
+unsigned long QuerySlot::running() {
+  std::lock_guard<std::mutex> lk(g_slot_mutex);
+  return g_slots_used;
+}
+unsigned long long QuerySlot::waits() { return g_slot_waits.load(); }
+unsigned long long QuerySlot::wait_us() { return g_slot_wait_us.load(); }
 
 struct RunningStage::Impl {
   ThreadDisplay display;

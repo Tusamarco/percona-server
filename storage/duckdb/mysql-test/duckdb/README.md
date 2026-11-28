@@ -76,6 +76,7 @@ default 15-minute limit: add `--testcase-timeout=45`.
 | `offload_edge_strings` | D1: edge strings (combining marks, emoji modifiers, ß, Turkish i, trailing spaces vs tabs) under 8 collations: equality, ordering, grouping, distinct, MIN / MAX, joins |
 | `generated_columns` | VIRTUAL and STORED generated columns, expression defaults: load, applier, queries, DDL refresh |
 | `client_charsets` | results to clients with latin1, utf8mb3, cp1251 and no conversion |
+| `query_slots` | `duckdb_max_concurrent_queries = 1`: a query held in its slot (debug sync), a second waits (processlist state) and KILL QUERY ends it with `use_secondary_engine = ON` (no InnoDB answer), a third runs when the slot frees; counters and stage (2026-11-27) |
 
 Not in MTR (manual-test-plan.md): restarts with special options and long
 runs: startup failures (11), binlog gaps (15), replica with a source (18), the applier

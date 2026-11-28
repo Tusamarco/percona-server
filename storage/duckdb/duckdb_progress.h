@@ -46,6 +46,31 @@ void register_progress_stages();
   running the query (until its first rows)": the offloaded query runs in
   DuckDB during optimization. The previous stage comes back at the end.
 */
+/**
+  Admission control of offloaded queries (2026-11-27): at most `limit`
+  statements compute in DuckDB at once (duckdb_max_concurrent_queries);
+  each holds a slot from just before DuckDB starts until the statement ends.
+  Too many memory-heavy queries at once (TPC-H Q21, Q16, Q3 at 16 streams)
+  filled duckdb_memory_limit and made DuckDB spill and stall everything.
+*/
+class QuerySlot {
+ public:
+  /** Waits for a slot (SHOW PROCESSLIST "Waiting for a DuckDB query slot",
+      stage stage/duckdb/waiting for query slot). nullptr when the session
+      was killed (KILL QUERY, max_execution_time) while waiting. */
+  static std::unique_ptr<QuerySlot> acquire(THD *thd, unsigned limit);
+  ~QuerySlot();
+  QuerySlot(const QuerySlot &) = delete;
+  QuerySlot &operator=(const QuerySlot &) = delete;
+
+  static unsigned long running();
+  static unsigned long long waits();
+  static unsigned long long wait_us();
+
+ private:
+  QuerySlot() = default;
+};
+
 class RunningStage {
  public:
   explicit RunningStage(THD *thd);

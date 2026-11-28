@@ -52,6 +52,7 @@
 #include "sql/item_sum.h"
 #include "sql/item_subselect.h"
 #include "include/mem_root_deque.h"
+#include "sql/debug_sync.h"  // DEBUG_SYNC (MTR)
 #include "sql/opt_trace.h"
 #include "sql/protocol.h"  // Protocol::store_short (YEAR holder)
 #include "sql/query_result.h"
@@ -194,6 +195,9 @@ class OffloadContext : public Secondary_engine_execution_context {
   std::string reason;
   bool executed{false};
   std::unique_ptr<Lake::Connection> con;
+  // A slot of duckdb_max_concurrent_queries, held until the statement ends
+  // (destroyed after the DuckDB result above is released).
+  std::unique_ptr<QuerySlot> slot;
   duckdb_prepared_statement stmt{nullptr};
   // A statement with DECIMAL values declared above 38 digits ran during
   // optimization (duckdb_decimal_overflow): its materialized result, sent by
@@ -535,6 +539,13 @@ void explain_notes(THD *thd, OffloadContext *ctx) {
 // A DuckDB error during execution. When MySQL has the same error, the client
 // gets MySQL's code with both messages (decided 2026-11-13); otherwise
 // ER_SECONDARY_ENGINE_PLUGIN with DuckDB's message.
+// A statement killed (KILL QUERY, max_execution_time) before it started
+// returning rows. With use_secondary_engine = ON the server would retry it
+// on InnoDB after the statement's cleanup has already cleared KILL QUERY,
+// so the killed query would run to the end. A fatal error is never retried
+// (check_secondary_engine_statement); the flag is reset for the next one.
+static void stop_killed(THD *thd) { thd->fatal_error(); }
+
 void report_duckdb_error(const std::string &msg) {
   const std::string text = msg.substr(0, 400);
   if (msg.find(kDuckDBMultipleRows) != std::string::npos ||
@@ -925,6 +936,20 @@ bool optimize(THD *thd, LEX *lex) {
       "'a'); InnoDB shows one of them by its join order";
   // From here DuckDB may run the statement (first run, first chunk): the
   // session shows it (stage/duckdb/running query in DuckDB).
+  // At most duckdb_max_concurrent_queries statements compute in DuckDB at
+  // once: wait for a slot first (2026-11-27).
+  if (reason.empty() && !lex->is_explain() && ctx->slot == nullptr) {
+    ctx->slot = QuerySlot::acquire(thd, max_concurrent_queries());
+    if (ctx->slot == nullptr) {
+      // KILL QUERY / max_execution_time while waiting: the statement ends
+      // here, never on InnoDB (see stop_killed).
+      thd->send_kill_message();
+      stop_killed(thd);
+      return true;
+    }
+    // MTR: holds the slot so that other queries must wait.
+    DEBUG_SYNC(thd, "duckdb_query_slot_acquired");
+  }
   std::unique_ptr<RunningStage> running;
   if (reason.empty() && !lex->is_explain())
     running = std::make_unique<RunningStage>(thd);
@@ -1031,6 +1056,7 @@ bool optimize(THD *thd, LEX *lex) {
               std::string::npos ||
           err.find(kDuckDBMultipleRows) != std::string::npos) {
         report_duckdb_error(err);
+        if (thd->is_killed()) stop_killed(thd);
         return true;
       }
       reason = "duckdb_execution: " + err.substr(0, 200);

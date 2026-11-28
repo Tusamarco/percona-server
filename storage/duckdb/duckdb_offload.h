@@ -61,6 +61,8 @@ bool session_commit_position(THD *thd, BinlogPos *pos);
     no limit) of the session (ha_duckdb.cc). */
 bool ddl_wait_refresh(THD *thd);
 unsigned long long ddl_wait_refresh_timeout(THD *thd);
+/** duckdb_max_concurrent_queries, 0 resolved to max(2, cores / 4). */
+unsigned int max_concurrent_queries();
 
 /** duckdb_offload_wait_timeout_ms of the session (ha_duckdb.cc). */
 unsigned long long offload_wait_timeout_ms(THD *thd);

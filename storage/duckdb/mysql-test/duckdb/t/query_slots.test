@@ -1,0 +1,92 @@
+# Copyright (c) 2026-present, Marco Tusa. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# duckdb_max_concurrent_queries (2026-11-27): at most N offloaded queries
+# compute in DuckDB at once; the others wait for a slot, visibly; KILL ends
+# the wait (with ON as with FORCED: the query is interrupted, it does not
+# run on InnoDB). A debug sync point holds the first query in its slot.
+--source include/have_debug_sync.inc
+--source include/count_sessions.inc
+--source ../include/have_duckdb.inc
+CREATE TABLE qs (id INT PRIMARY KEY, g INT, v INT) SECONDARY_ENGINE = duckdb;
+INSERT INTO qs VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40);
+ALTER TABLE qs SECONDARY_LOAD;
+SET @old_max = @@GLOBAL.duckdb_max_concurrent_queries;
+SET GLOBAL duckdb_max_concurrent_queries = 1;
+SELECT VARIABLE_VALUE INTO @waits0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_query_slot_waits';
+
+--connect (c1, localhost, root,,)
+--connect (c2, localhost, root,,)
+--connect (c3, localhost, root,,)
+
+--echo # c1 takes the only slot and keeps it (debug sync point)
+--connection c1
+SET DEBUG_SYNC = 'duckdb_query_slot_acquired SIGNAL held WAIT_FOR release';
+SET SESSION use_secondary_engine = FORCED;
+--send SELECT g, SUM(v) FROM qs GROUP BY g ORDER BY g
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+
+--echo # c2 (use_secondary_engine = ON) waits for a slot ...
+--connection c2
+let $c2_id= `SELECT CONNECTION_ID()`;
+SET SESSION use_secondary_engine = ON;
+SET SESSION secondary_engine_cost_threshold = 0;
+--send SELECT g, SUM(v) FROM qs GROUP BY g ORDER BY g
+
+--connection default
+let $wait_condition= SELECT COUNT(*) = 1 FROM performance_schema.processlist WHERE ID = $c2_id AND STATE = 'waiting for query slot';
+--source include/wait_condition.inc
+--echo # SHOW PROCESSLIST (and I_S) show the text, Performance Schema the stage
+--replace_result $c2_id C2_ID
+--eval SELECT STATE FROM performance_schema.processlist WHERE ID = $c2_id
+--disable_warnings
+--replace_result $c2_id C2_ID
+--eval SELECT STATE FROM information_schema.PROCESSLIST WHERE ID = $c2_id
+--enable_warnings
+--echo # ... and KILL QUERY interrupts it: no InnoDB answer
+--disable_query_log
+--eval KILL QUERY $c2_id
+--enable_query_log
+--connection c2
+--error ER_QUERY_INTERRUPTED
+--reap
+
+--echo # c3 waits, then runs in DuckDB when c1 frees the slot
+--connection c3
+SET SESSION use_secondary_engine = FORCED;
+--send SELECT g, SUM(v) FROM qs GROUP BY g ORDER BY g
+--connection default
+let $wait_condition= SELECT COUNT(*) = 1 FROM performance_schema.processlist WHERE STATE = 'waiting for query slot';
+--source include/wait_condition.inc
+SET DEBUG_SYNC = 'now SIGNAL release';
+--connection c1
+--reap
+--connection c3
+--reap
+
+--connection default
+SET DEBUG_SYNC = 'RESET';
+SELECT VARIABLE_VALUE - @waits0 AS waits_counted FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_query_slot_waits';
+SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'duckdb_queries_running';
+SELECT NAME FROM performance_schema.setup_instruments WHERE NAME = 'stage/duckdb/waiting for query slot';
+--disconnect c1
+--disconnect c2
+--disconnect c3
+SET GLOBAL duckdb_max_concurrent_queries = @old_max;
+DROP TABLE qs;
+--source include/wait_until_count_sessions.inc
+--source ../include/cleanup.inc
